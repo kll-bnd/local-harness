@@ -4,10 +4,14 @@ import { readNdjson } from '../lib/streams.mjs';
 import { backendFetch, guardStream } from '../lib/backend-http.mjs';
 import { newId } from '../lib/ids.mjs';
 
+/** The runner died while loading the model (seen as HTTP 500 "llama-server process has terminated: signal: abort trap"). */
+export const LOAD_FAILURE_RE = /(llama-server|runner) process (has )?terminated|process exited unexpectedly|error loading model|unable to load model|failed to load model|model requires more system memory/i;
+
 export function classifyOllamaError(status, message, providerId) {
   const msg = String(message || `HTTP ${status}`);
   let code = 'provider_error';
-  if (/does not support tools/i.test(msg)) code = 'tools_unsupported';
+  if (LOAD_FAILURE_RE.test(msg)) code = 'model_load_failed';
+  else if (/does not support tools/i.test(msg)) code = 'tools_unsupported';
   else if (/does not support thinking|think.*not supported/i.test(msg)) code = 'thinking_unsupported';
   else if (/does not support (chat|generate|completion)/i.test(msg)) code = 'not_chat_model';
   else if (status === 404 || /not found|try pulling/i.test(msg)) code = 'model_not_found';
@@ -51,10 +55,26 @@ export function normalizeKeepAlive(v) {
   return v;
 }
 
+/** Tool-call arguments as Ollama requires them in history: always a JSON object (a string there is an HTTP 400). */
+export function argsObject(a) {
+  const v = parseArgs(a);
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : { value: v };
+}
+
+/** The blob digests a model is built from, in order (first = the model layer, then projector / draft …). */
+export function modelfileBlobs(modelfile) {
+  const out = [];
+  for (const m of String(modelfile || '').matchAll(/^FROM\s+(\S+)/gim)) {
+    const d = m[1].match(/sha256[-:]([0-9a-f]{64})/i);
+    if (d) out.push(d[1].toLowerCase());
+  }
+  return out;
+}
+
 export function toOllamaMessage(m) {
   const out = { role: m.role, content: m.content ?? '' };
   if (m.images?.length) out.images = m.images.map((i) => i.base64);
-  if (m.toolCalls?.length) out.tool_calls = m.toolCalls.map((tc) => ({ function: { name: tc.name, arguments: tc.arguments || {} } }));
+  if (m.toolCalls?.length) out.tool_calls = m.toolCalls.map((tc) => ({ function: { name: tc.name, arguments: argsObject(tc.arguments) } }));
   if (m.role === 'tool' && m.toolName) out.tool_name = m.toolName;
   return out;
 }
@@ -109,6 +129,8 @@ export class OllamaProvider {
       parameterSize: m.details?.parameter_size || null,
       quantization: m.details?.quantization_level || null,
       format: m.details?.format || null,
+      contextLength: Number.isFinite(m.details?.context_length) ? m.details.context_length : null,
+      embeddingLength: Number.isFinite(m.details?.embedding_length) ? m.details.embedding_length : null,
     }));
   }
 
@@ -143,7 +165,10 @@ export class OllamaProvider {
           type: 'done',
           doneReason: obj.done_reason || 'stop',
           usage: {
+            // prompt_eval_count is the full prompt even when most of it came from the runner's prompt cache;
+            // prompt_eval_cached_count (Ollama ≥ 0.40) says how much was reused. Calibration uses the former.
             promptTokens: obj.prompt_eval_count ?? null,
+            cachedPromptTokens: Number.isFinite(obj.prompt_eval_cached_count) ? obj.prompt_eval_cached_count : null,
             completionTokens: obj.eval_count ?? null,
             totalMs: ns(obj.total_duration),
             loadMs: ns(obj.load_duration),
@@ -154,6 +179,18 @@ export class OllamaProvider {
         return;
       }
     }
+  }
+
+  /**
+   * POST /api/create with existing blobs (no download): `files` maps file names to "sha256:<digest>".
+   * @returns {Promise<{status: string}>}
+   */
+  async create({ model, files, template, parameters, system, signal }) {
+    const body = { model, files, stream: false };
+    if (template !== undefined) body.template = template;
+    if (parameters && Object.keys(parameters).length) body.parameters = parameters;
+    if (system) body.system = system;
+    return this.json('/api/create', { method: 'POST', body, signal, timeoutMs: 120000 });
   }
 
   async embed({ model, input, keepAlive, signal }) {

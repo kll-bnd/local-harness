@@ -98,7 +98,8 @@ Home-directory paths, user names in paths and anything that looks like a key or 
 
 `test/live-check.test.mjs` runs it against the fakes (it must exit 0) and against proxies that change one behaviour
 at a time (string tool arguments, `prompt_eval_count` missing on a cached repeat, no `context_length`, flat
-`/api/ps` size, rejected keep_alive, a different thinking error text, slow unload, A1111 grid placement, options
-404, no usage in OpenAI streams…), and asserts that exactly those checks flip. When `server/` changes an assumption,
+`/api/ps` size, rejected keep_alive, a different thinking error text, A1111 grid placement, options 404, no usage
+in OpenAI streams…), and asserts that exactly those checks flip (and that a slow unload is reported but passes,
+because Harness waits for `/api/ps`). When `server/` changes an assumption,
 update the matching check. When a source anchor no longer matches, `env.harness_sources` WARNs and names the entry
 to fix in the `SRC` table.

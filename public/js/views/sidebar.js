@@ -71,11 +71,13 @@ export class Sidebar {
   findChat(id) { return [...(store.get('chats') || []), ...(store.get('archived') || [])].find((c) => c.id === id); }
 
   focusSearch() {
-    const go = () => { if (document.activeElement !== this.search) { this.search.focus(); this.search.select(); } };
-    // Focus now, and again after layout settles (the sidebar may have just been revealed).
-    go();
-    requestAnimationFrame(go);
-    setTimeout(go, 60);
+    this.search.focus();
+    this.search.select();
+    // If the sidebar was just revealed the first focus() can be ignored; retry once layout settled, but
+    // never take focus away from something else the user (or another command) focused meanwhile.
+    const retry = () => { const a = document.activeElement; if (!a || a === document.body) { this.search.focus(); this.search.select(); } };
+    requestAnimationFrame(retry);
+    setTimeout(retry, 60);
   }
 
   // ------------------------------------------------------------------------------------------ nav + footer

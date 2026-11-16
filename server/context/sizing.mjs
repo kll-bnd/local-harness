@@ -82,6 +82,8 @@ export function kvCacheModel(arch = {}, profile = {}, kvCacheType = 'f16') {
     window = window || profile.swa.window;
   }
   const perLayer = kvHeads.avg * (headDimK + headDimV) * bpe;
+  // gemma4 metadata gives sliding-window layers their own (smaller) key/value lengths (`*_swa`).
+  const perLayerSwa = kvHeads.avg * ((Number(arch.keyLengthSwa) || headDimK) + (Number(arch.valueLengthSwa) || Number(arch.keyLengthSwa) || headDimV)) * bpe;
   let fullLayers = effectiveLayers;
   let swaLayers = 0;
   if (window && (globalEvery || globalLayers != null)) {
@@ -89,7 +91,7 @@ export function kvCacheModel(arch = {}, profile = {}, kvCacheType = 'f16') {
     swaLayers = effectiveLayers - fullLayers;
   }
   const perToken = Math.round(fullLayers * perLayer);
-  const fixedFor = (ctx) => Math.round(swaLayers * perLayer * Math.min(window || 0, ctx));
+  const fixedFor = (ctx) => Math.round(swaLayers * perLayerSwa * Math.min(window || 0, ctx));
   return { perToken, fixedFor, fullLayers, swaLayers, window: swaLayers ? window : null, source: swaLayers ? 'metadata+swa' : 'metadata' };
 }
 

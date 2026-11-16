@@ -35,7 +35,10 @@ test('errors: Ollama stopping mid-session gives a human message, and the typed t
     const t = page.locator('.toast-error');
     await t.waitFor();
     assert.match(await t.textContent(), /isn.t running|isn.t reachable|not running/i);
-    assert.equal(await page.locator('.composer-input').inputValue(), 'are you still there?');
+    // Nothing typed is lost: either it is back in the composer (failed before the stream started) or it is
+    // in the transcript with an inline error and Retry (failed mid-stream).
+    await page.waitForFunction(() => document.querySelector('.composer-input').value === 'are you still there?'
+      || (/are you still there/.test(document.querySelector('.turn:last-child .msg-user')?.textContent || '') && document.querySelector('.turn:last-child .msg-error button[data-action="regenerate"]')));
   } finally { await app.close(); await stack.close(); }
 });
 
@@ -45,11 +48,15 @@ test('busy: a chat already generating elsewhere answers 409 → "still replying"
   try {
     const { page } = app;
     await send(page, 'first message');
+    await sleep(500); // let the server release the first turn
     const chatId = page.url().split('/chat/')[1];
     // Another window starts a long generation in this chat.
     const ac = new AbortController();
-    const other = fetch(`${stack.url}/api/chats/${chatId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'long answer 3000' }), signal: ac.signal }).then((r) => r.body?.getReader().read()).catch(() => {});
+    let otherStatus = null;
+    const other = fetch(`${stack.url}/api/chats/${chatId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'long answer 3000' }), signal: ac.signal })
+      .then((r) => { otherStatus = r.status; return r.body?.getReader().read(); }).catch(() => {});
     await sleep(300);
+    assert.equal(otherStatus, 200, 'the other generation is running');
     await page.locator('.composer-input').fill('my second message');
     await page.locator('.composer-input').press('Enter');
     const t = page.locator('.toast', { hasText: 'still replying' });

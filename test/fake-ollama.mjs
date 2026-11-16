@@ -1,12 +1,18 @@
 #!/usr/bin/env node
-// A realistic fake Ollama server (native API) for tests and UI development.
+// A realistic fake Ollama server (native API) for tests and UI development, modelled on Ollama 0.40.x.
 //   node test/fake-ollama.mjs --port 11434 [--delay 25]
 //   import { startFakeOllama } from './fake-ollama.mjs'; const fake = await startFakeOllama({ port: 0 });
 //
 // Implements: GET /api/version, /api/tags, /api/ps; POST /api/show, /api/chat (NDJSON stream or not),
-// /api/generate (load / unload via keep_alive 0), /api/embed, /api/pull (progress stream), DELETE /api/delete.
+// /api/generate (load / unload via keep_alive 0), /api/embed, /api/pull (progress stream), /api/create (files),
+// DELETE /api/delete.
+// Behaviour copied from the real server: unit-less keep_alive strings → 400; `think` omitted on a thinking model
+// means thinking ON; tool calls carry ids; history tool_calls arguments must be objects (a string → 400);
+// prompt_eval_cached_count; /api/ps `size` is NOT the resident footprint (KV + buffers, weights excluded) —
+// the resident size is what fake.runners() reports (llama-server RSS) for the fake memory probe.
 // Test hooks: fake.requests (recorded bodies), fake.failNext({path, status, error, match, count}),
-// fake.setDelay(ms), fake.loaded (Map), fake.unloads (array of model names),
+// fake.setDelay(ms), fake.loaded (Map), fake.unloads (array of model names), fake.setPsProfile(name, profile),
+// fake.failLoad(name, {unlessCpu}) (HTTP 500 "llama-server process has terminated"), fake.creates,
 // fake.chatScript = ({model, messages, tools}) => ({thinking, content, toolCalls:[{name, arguments}]}) | null  (override a reply).
 import http from 'node:http';
 import { respond, chunkText, fakeEmbedding, fakeTokenCount, readBody, sendJson, sleep, parseArgs, isCli } from './fake-model.mjs';
@@ -14,15 +20,31 @@ import { respond, chunkText, fakeEmbedding, fakeTokenCount, readBody, sendJson, 
 const GiB = 1024 ** 3;
 const now = () => new Date().toISOString();
 
+const MiB = 1024 ** 2;
+// Real `/api/show` facts for NVIDIA Nemotron 3.5 Bolt E4B (Ollama 0.40.13 on Apple Silicon, probed by the coordinator).
+const NEMOTRON_INFO = {
+  'general.architecture': 'gemma4', 'general.name': 'NVIDIA-Nemotron-3.5-Bolt-E4B', 'general.basename': 'NVIDIA-Nemotron-3.5-Bolt', 'general.parameter_count': 7518069290,
+  'general.sampling.temp': 1, 'general.sampling.top_k': 64, 'general.sampling.top_p': 0.95,
+  'gemma4.context_length': 131072, 'gemma4.block_count': 42, 'gemma4.embedding_length': 2560, 'gemma4.attention.head_count': 8, 'gemma4.attention.head_count_kv': 2,
+  'gemma4.attention.key_length': 512, 'gemma4.attention.key_length_swa': 256, 'gemma4.attention.value_length': 512, 'gemma4.attention.value_length_swa': 256,
+  'gemma4.attention.sliding_window': 512, 'gemma4.attention.shared_kv_layers': 18,
+};
+// A gemma-style Go template (the fake's stand-in for the template Ollama derives for these models).
+const GEMMA_TEMPLATE = '{{- range .Messages }}<start_of_turn>{{ .Role }}\n{{ .Content }}<end_of_turn>\n{{ end }}{{- if .Tools }}{{ .Tools }}{{ end }}{{- if .Think }}{{ end }}<start_of_turn>model\n';
+
 export const FAKE_OLLAMA_MODELS = {
+  // Official tag: model layer + vision/audio projector + speculative-decoding draft model ≈ 7.9 GB.
   'nemotron-3.5-bolt:e4b': {
-    family: 'gemma4', params: '7.9B', quant: 'Q4_K_M', size: Math.round(6.0 * GiB), caps: ['completion', 'tools', 'thinking', 'vision'],
-    info: { 'general.architecture': 'gemma4', 'general.name': 'NVIDIA Nemotron 3.5 Bolt E4B', 'general.parameter_count': 7.9e9, 'gemma4.context_length': 131072, 'gemma4.block_count': 35, 'gemma4.embedding_length': 2048, 'gemma4.attention.head_count': 8, 'gemma4.attention.head_count_kv': 2, 'gemma4.attention.key_length': 256, 'gemma4.attention.value_length': 256, 'gemma4.attention.sliding_window': 512 },
-    parameters: 'temperature 1\ntop_k 64\ntop_p 0.95\nstop "<end_of_turn>"',
+    family: 'gemma4', params: '7.52B', quant: 'Q6_K', caps: ['completion', 'tools', 'thinking', 'vision', 'audio'],
+    blobs: [{ kind: 'model', size: 6180446208 }, { kind: 'projector', size: 991551808 }, { kind: 'draft', size: 736812096 }],
+    info: { ...NEMOTRON_INFO, 'general.name': 'NVIDIA Nemotron 3.5 Bolt E4B' },
+    parameters: 'stop "<end_of_turn>"', template: GEMMA_TEMPLATE,
   },
-  'hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:Q4_K_M': {
-    family: 'gemma4', params: '7.9B', quant: 'Q4_K_M', size: 4.6e9, caps: ['completion', 'tools', 'thinking', 'vision'],
-    info: { 'general.architecture': 'gemma4', 'general.name': 'NVIDIA-Nemotron-3.5-Bolt-E4B', 'general.basename': 'NVIDIA-Nemotron-3.5-Bolt', 'gemma4.context_length': 131072, 'gemma4.block_count': 35, 'gemma4.embedding_length': 2048, 'gemma4.attention.head_count': 8, 'gemma4.attention.head_count_kv': 2, 'gemma4.attention.key_length': 256, 'gemma4.attention.value_length': 256, 'gemma4.attention.sliding_window': 512 },
+  // Hugging Face quant as pulled: model layer + 946 MiB projector. No "thinking" capability reported.
+  'hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL': {
+    family: 'gemma4', params: '7.52B', quant: 'Q3_K_M', caps: ['tools', 'completion', 'vision', 'audio'],
+    blobs: [{ kind: 'model', size: 4024 * MiB }, { kind: 'projector', size: 946 * MiB }],
+    info: NEMOTRON_INFO, parameters: 'stop "<end_of_turn>"', template: GEMMA_TEMPLATE,
   },
   'qwen3:4b': {
     family: 'qwen3', params: '4.0B', quant: 'Q4_K_M', size: 2.5e9, caps: ['completion', 'tools', 'thinking'],
@@ -51,31 +73,67 @@ const PULLABLE = { 'llama3.2:3b': { family: 'llama', params: '3.2B', quant: 'Q4_
 
 const norm = (name) => (name && !name.includes(':') ? `${name}:latest` : name);
 
+const hexOf = (k, salt = '') => Buffer.from(`${salt}${k}`).toString('hex').padEnd(64, '0').slice(0, 64);
+const RUNNER_OVERHEAD = 300 * 1024 * 1024;
+
+function prepareModel(name, v) {
+  const blobs = (v.blobs || [{ kind: 'model', size: v.size }]).map((b, i) => ({ ...b, digest: b.digest || hexOf(name, `${b.kind}${i}:`) }));
+  const size = v.size ?? blobs.reduce((a, b) => a + b.size, 0);
+  return { ...v, blobs, size, weightBytes: blobs.reduce((a, b) => a + b.size, 0), modified: now(), digest: `sha256:${hexOf(name)}` };
+}
+
 export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 0, models, pullStepMs = 5, log = false } = {}) {
-  const installed = new Map(Object.entries(models || FAKE_OLLAMA_MODELS).map(([k, v]) => [k, { ...v, modified: now(), digest: `sha256:${Buffer.from(k).toString('hex').padEnd(64, '0').slice(0, 64)}` }]));
+  const installed = new Map(Object.entries(models || FAKE_OLLAMA_MODELS).map(([k, v]) => [k, prepareModel(k, v)]));
   const fake = {
     requests: [],
     loaded: new Map(),
     unloads: [],
+    creates: [],
     unloadDelayMs: 0,
     delayMs,
     failures: [],
+    loadFailures: new Map(),
+    lastPrompt: new Map(),
     setDelay(ms) { this.delayMs = ms; },
     failNext(f) { this.failures.push({ count: 1, status: 500, error: 'injected failure', ...f }); },
+    /** Loading `name` fails like a crashed runner (HTTP 500); with unlessCpu it loads when options.num_gpu is 0. */
+    failLoad(name, { unlessCpu = true, error = 'llama-server process has terminated: signal: abort trap' } = {}) {
+      if (name) this.loadFailures.set(name, { unlessCpu, error }); else this.loadFailures.clear();
+    },
     clear() { this.requests.length = 0; this.unloads.length = 0; this.failures.length = 0; },
     installed,
     chatRequests() { return this.requests.filter((r) => r.path === '/api/chat').map((r) => r.body); },
     /**
-     * What /api/ps reports per model: size = sizeBytes ?? baseBytes + perTokenBytes·num_ctx,
-     * size_vram = min(size, vramCapBytes) (CPU split when smaller), context_length only if reportContext.
-     * Defaults: baseBytes = model file size, perTokenBytes = 1000, no VRAM cap, reportContext = true.
+     * True resident footprint per loaded model (what the llama-server process really occupies):
+     *   resident = baseBytes + perTokenBytes·num_ctx   (defaults: file size + 300 MB, 1000 B/token)
+     * /api/ps reports `size` = resident − weights − runner overhead (KV + buffers, like the real server), or
+     * `psSizeBytes` verbatim (e.g. Nemotron's flat ~90 MB); with num_gpu 0 `size` includes the weights and
+     * `size_vram` is 0. `vramCapBytes` puts what exceeds it on the CPU (size_vram < size).
+     * `reportContext: false` omits context_length.
      */
     psProfiles: new Map(),
     setPsProfile(name, profile) { if (profile) this.psProfiles.set(name, profile); else this.psProfiles.delete(name); },
+    residentBytes(name) {
+      const l = this.loaded.get(name);
+      const m = find(name);
+      if (!l || !m) return 0;
+      const pr = this.psProfiles.get(name) || {};
+      return Math.round((pr.baseBytes ?? m.weightBytes + RUNNER_OVERHEAD) + (pr.perTokenBytes ?? 1000) * l.numCtx);
+    },
+    /** llama-server runner processes (for the fake memory probe): [{ pid, rssBytes, args, model }]. */
+    runners() {
+      return [...this.loaded.entries()].filter(([n]) => find(n)).map(([name, l], i) => {
+        const m = find(name);
+        const blob = m.blobs.find((b) => b.kind === 'model');
+        const mm = m.blobs.find((b) => b.kind === 'projector');
+        return { pid: 40000 + i, model: name, rssBytes: this.residentBytes(name), args: `/Applications/Ollama.app/Contents/Resources/llama-server --model /Users/me/.ollama/models/blobs/sha256-${blob.digest}${mm ? ` --mmproj /Users/me/.ollama/models/blobs/sha256-${mm.digest}` : ''} --ctx-size ${l.numCtx} --port ${50000 + i}` };
+      });
+    },
   };
 
   const find = (name) => installed.get(name) || installed.get(norm(name)) || null;
   const resolveName = (name) => (installed.has(name) ? name : installed.has(norm(name)) ? norm(name) : name);
+  const notFound = (name) => ({ error: `model '${name}' not found` });
 
   function takeFailure(path, body) {
     const i = fake.failures.findIndex((f) => (!f.path || f.path === path) && (!f.match || f.match(body)));
@@ -85,12 +143,12 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
     return f;
   }
 
-  function markLoaded(name, keepAlive, numCtx) {
+  function httpError(status, message) { return Object.assign(new Error(message), { status }); }
+
+  function markLoaded(name, keepAlive, numCtx, options = {}) {
     if (typeof keepAlive === 'string' && !/^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(keepAlive)) {
       // Real Ollama parses string durations with Go's time.ParseDuration ("-1" / "30" are rejected).
-      const e = new Error(`time: missing unit in duration "${keepAlive}"`);
-      e.status = 400;
-      throw e;
+      throw httpError(400, `time: missing unit in duration "${keepAlive}"`);
     }
     if (keepAlive === 0 || keepAlive === '0' || keepAlive === '0s') {
       fake.unloads.push(name);
@@ -99,7 +157,41 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
       else fake.loaded.delete(name);
       return;
     }
-    fake.loaded.set(name, { at: Date.now(), numCtx: numCtx || 4096, expires: new Date(Date.now() + 30 * 60000).toISOString() });
+    const ctx = numCtx || 4096;
+    const cur = fake.loaded.get(name);
+    const lf = fake.loadFailures.get(name);
+    if (lf && !(cur && cur.numCtx === ctx) && !(lf.unlessCpu && options.num_gpu === 0)) {
+      fake.loaded.delete(name);
+      throw httpError(500, lf.error);
+    }
+    const reloaded = !cur || cur.numCtx !== ctx || cur.cpu !== (options.num_gpu === 0);
+    fake.loaded.set(name, { at: Date.now(), numCtx: ctx, cpu: options.num_gpu === 0, expires: new Date(Date.now() + 30 * 60000).toISOString() });
+    return reloaded;
+  }
+
+  function psEntry(name, l) {
+    const m = find(name);
+    const pr = fake.psProfiles.get(name) || {};
+    const resident = fake.residentBytes(name);
+    let size = pr.psSizeBytes ?? Math.max(16 * 1024 * 1024, resident - m.weightBytes - RUNNER_OVERHEAD);
+    let vram = size;
+    if (l.cpu) { size = resident - RUNNER_OVERHEAD; vram = 0; } else if (pr.vramCapBytes != null) vram = Math.max(0, size - Math.max(0, resident - pr.vramCapBytes));
+    return { name, model: name, size: Math.round(size), digest: m.digest, details: { parent_model: '', format: 'gguf', family: m.family, families: [m.family], parameter_size: m.params, quantization_level: m.quant }, expires_at: l.expires, size_vram: Math.round(vram), ...(pr.reportContext === false ? {} : { context_length: l.numCtx }) };
+  }
+
+  function blobOwner(digest) {
+    for (const m of installed.values()) for (const b of m.blobs) if (b.digest === digest) return { m, b };
+    return null;
+  }
+
+  /** Common-prefix "prompt cache" like llama-server's: tokens of leading messages identical to the last request. */
+  function cachedTokens(name, messages, tools) {
+    const prev = fake.lastPrompt.get(name);
+    fake.lastPrompt.set(name, { messages, tools: JSON.stringify(tools || null) });
+    if (!prev || prev.tools !== JSON.stringify(tools || null)) return 0;
+    let i = 0;
+    while (i < messages.length && i < prev.messages.length && JSON.stringify(messages[i]) === JSON.stringify(prev.messages[i])) i++;
+    return i ? fakeTokenCount(messages.slice(0, i), tools) - 1 : 0;
   }
 
   const server = http.createServer(async (req, res) => {
@@ -112,44 +204,69 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
     const fail = takeFailure(url.pathname, body);
     if (fail) return sendJson(res, fail.status, { error: fail.error });
     try {
-      if (req.method === 'GET' && url.pathname === '/api/version') return sendJson(res, 200, { version: '0.12.6-fake' });
+      if (req.method === 'GET' && url.pathname === '/api/version') return sendJson(res, 200, { version: '0.40.13-fake' });
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '')) { res.writeHead(200); return res.end('Ollama is running'); }
       if (req.method === 'GET' && url.pathname === '/api/tags') {
-        return sendJson(res, 200, { models: [...installed.entries()].map(([name, m]) => ({ name, model: name, modified_at: m.modified, size: m.size, digest: m.digest, details: { parent_model: '', format: 'gguf', family: m.family, families: [m.family], parameter_size: m.params, quantization_level: m.quant } })) });
-      }
-      if (req.method === 'GET' && url.pathname === '/api/ps') {
         return sendJson(res, 200, {
-          models: [...fake.loaded.entries()].filter(([n]) => find(n)).map(([name, l]) => {
-            const m = find(name);
-            const pr = fake.psProfiles.get(name) || {};
-            const size = pr.sizeBytes ?? Math.round((pr.baseBytes ?? m.size) + (pr.perTokenBytes ?? 1000) * l.numCtx);
-            const vram = pr.vramCapBytes != null ? Math.min(size, pr.vramCapBytes) : size;
-            return { name, model: name, size, digest: m.digest, details: { family: m.family, parameter_size: m.params, quantization_level: m.quant }, expires_at: l.expires, size_vram: vram, ...(pr.reportContext === false ? {} : { context_length: l.numCtx }) };
+          models: [...installed.entries()].map(([name, m]) => {
+            const arch = m.info?.['general.architecture'];
+            const ctx = arch ? m.info[`${arch}.context_length`] : undefined;
+            const emb = arch ? m.info[`${arch}.embedding_length`] : undefined;
+            return { name, model: name, modified_at: m.modified, size: m.size, digest: m.digest, details: { parent_model: '', format: 'gguf', family: m.family, families: [m.family], parameter_size: m.params, quantization_level: m.quant, ...(ctx ? { context_length: ctx } : {}), ...(emb ? { embedding_length: emb } : {}) } };
           }),
         });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/ps') {
+        return sendJson(res, 200, { models: [...fake.loaded.entries()].filter(([n]) => find(n)).map(([name, l]) => psEntry(name, l)) });
       }
       if (req.method === 'POST' && url.pathname === '/api/show') {
         const name = body.model || body.name;
         const m = find(name);
-        if (!m) return sendJson(res, 404, { error: `model '${name}' not found` });
+        if (!m) return sendJson(res, 404, notFound(name));
+        const template = m.template ?? (m.caps.includes('tools') ? '{{- if .Tools }}tools{{ end }}{{ .Prompt }}' : '{{ .Prompt }}');
+        const modelfile = `# Modelfile generated by "ollama show"\n${m.blobs.map((b) => `FROM /Users/me/.ollama/models/blobs/sha256-${b.digest}`).join('\n')}\nTEMPLATE """${template}"""\n${(m.parameters || '').split('\n').filter(Boolean).map((l) => `PARAMETER ${l}`).join('\n')}`;
         return sendJson(res, 200, {
-          license: 'fake', modelfile: `FROM ${name}`, parameters: m.parameters || '',
-          template: m.caps.includes('tools') ? '{{- if .Tools }}tools{{ end }}{{ .Prompt }}' : '{{ .Prompt }}',
+          license: 'fake', modelfile, parameters: m.parameters || '', template,
           details: { parent_model: '', format: 'gguf', family: m.family, families: [m.family], parameter_size: m.params, quantization_level: m.quant },
           model_info: m.info, capabilities: m.caps, modified_at: m.modified,
+          ...(m.blobs.some((b) => b.kind === 'projector') ? { projector_info: { 'general.architecture': 'clip' } } : {}),
         });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/create') {
+        const name = norm(body.model);
+        if (!name || !body.files || typeof body.files !== 'object') return sendJson(res, 400, { error: 'neither \'from\' or \'files\' was specified' });
+        const blobs = [];
+        let src = null;
+        for (const [file, d] of Object.entries(body.files)) {
+          const digest = String(d).replace(/^sha256:/, '');
+          const own = blobOwner(digest);
+          if (!own) return sendJson(res, 400, { error: `blob sha256:${digest} not found (${file})` });
+          blobs.push({ ...own.b, kind: 'model' });
+          src = own.m;
+        }
+        const params = Object.entries(body.parameters || {}).flatMap(([k, v]) => (Array.isArray(v) ? v.map((x) => `${k} ${JSON.stringify(x)}`) : [`${k} ${typeof v === 'string' ? JSON.stringify(v) : v}`])).join('\n');
+        // As observed: a copy of the gemma4 model layer reports completion/tools/thinking, without a template "{{ .Prompt }}".
+        const caps = src.family === 'gemma4' ? ['completion', 'tools', 'thinking'] : ['completion'];
+        installed.set(name, prepareModel(name, { family: src.family, params: src.params, quant: src.quant, caps, blobs, info: src.info, parameters: params, template: body.template ?? '{{ .Prompt }}' }));
+        fake.creates.push({ model: name, body });
+        if (body.stream === false) return sendJson(res, 200, { status: 'success' });
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.write(JSON.stringify({ status: 'using existing layer' }) + '\n');
+        res.write(JSON.stringify({ status: 'writing manifest' }) + '\n');
+        res.write(JSON.stringify({ status: 'success' }) + '\n');
+        return res.end();
       }
       if (req.method === 'POST' && url.pathname === '/api/generate') {
         const name = resolveName(body.model);
-        if (!find(name)) return sendJson(res, 404, { error: `model '${body.model}' not found, try pulling it first` });
-        if (find(name).caps.includes('embedding') && !find(name).caps.includes('completion')) return sendJson(res, 400, { error: `"${name}" does not support generate` });
-        markLoaded(name, body.keep_alive, body.options?.num_ctx);
+        if (!find(name)) return sendJson(res, 404, notFound(body.model));
+        if (find(name).caps.includes('embedding') && !find(name).caps.includes('completion') && body.keep_alive !== 0) return sendJson(res, 400, { error: `"${name}" does not support generate` });
+        markLoaded(name, body.keep_alive, body.options?.num_ctx, body.options);
         return sendJson(res, 200, { model: name, created_at: now(), response: '', done: true, done_reason: body.keep_alive === 0 ? 'unload' : 'load' });
       }
       if (req.method === 'POST' && url.pathname === '/api/embed') {
         const name = resolveName(body.model);
         const m = find(name);
-        if (!m) return sendJson(res, 404, { error: `model '${body.model}' not found` });
+        if (!m) return sendJson(res, 404, notFound(body.model));
         if (!m.caps.includes('embedding')) return sendJson(res, 400, { error: `"${name}" does not support embeddings` });
         const input = Array.isArray(body.input) ? body.input : [body.input];
         markLoaded(name, body.keep_alive, 2048);
@@ -170,13 +287,13 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
         if (aborted) return;
         w({ status: 'verifying sha256 digest' });
         w({ status: 'writing manifest' });
-        installed.set(name, { ...src, modified: now(), digest });
+        installed.set(name, { ...prepareModel(name, src), digest });
         w({ status: 'success' });
         return res.end();
       }
       if (req.method === 'DELETE' && url.pathname === '/api/delete') {
         const name = resolveName(body.model || body.name);
-        if (!installed.has(name)) return sendJson(res, 404, { error: `model '${body.model}' not found` });
+        if (!installed.has(name)) return sendJson(res, 404, notFound(body.model));
         installed.delete(name);
         fake.loaded.delete(name);
         res.writeHead(200);
@@ -185,17 +302,34 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
       if (req.method === 'POST' && url.pathname === '/api/chat') {
         const name = resolveName(body.model);
         const m = find(name);
-        if (!m) return sendJson(res, 404, { error: `model "${body.model}" not found, try pulling it first` });
+        if (!m) return sendJson(res, 404, notFound(body.model));
         if (!m.caps.includes('completion')) return sendJson(res, 400, { error: `"${name}" does not support chat` });
         if (body.tools?.length && !m.caps.includes('tools')) return sendJson(res, 400, { error: `registry.ollama.ai/library/${name} does not support tools` });
         if (body.think && !m.caps.includes('thinking')) return sendJson(res, 400, { error: `"${name}" does not support thinking` });
+        for (const msg of body.messages || []) {
+          for (const tc of msg.tool_calls || []) {
+            if (typeof tc.function?.arguments === 'string') return sendJson(res, 400, { error: "Value looks like object, but can't find closing '}' symbol" });
+          }
+        }
         const numCtx = body.options?.num_ctx || 4096;
-        markLoaded(name, body.keep_alive, numCtx);
-        const out = fake.chatScript?.({ model: name, messages: body.messages || [], tools: body.tools }) || respond({ model: name, messages: body.messages || [], tools: body.tools, think: body.think, capabilities: m.caps });
+        const reloaded = markLoaded(name, body.keep_alive, numCtx, body.options);
+        // Real Ollama: `think` omitted on a thinking-capable model means thinking is ON.
+        const thinking = body.think === undefined ? m.caps.includes('thinking') : !!body.think;
+        const out = { ...(fake.chatScript?.({ model: name, messages: body.messages || [], tools: body.tools }) || respond({ model: name, messages: body.messages || [], tools: body.tools, think: thinking, capabilities: m.caps })) };
+        let doneReason = 'stop';
+        if (thinking && m.caps.includes('thinking') && !out.thinking && !out.toolCalls.length) out.thinking = 'Let me think step by step about what is being asked here before I answer. '.repeat(4);
+        const budget = body.options?.num_predict;
+        if (budget && out.thinking) {
+          // The thinking spends the num_predict budget first.
+          const thinkTokens = Math.ceil(out.thinking.length / 3.5);
+          if (thinkTokens >= budget) { out.thinking = out.thinking.slice(0, Math.floor(budget * 3.5)); out.content = ''; doneReason = 'length'; }
+          else if (Math.ceil(out.content.length / 3.5) > budget - thinkTokens) { out.content = out.content.slice(0, Math.floor((budget - thinkTokens) * 3.5)); doneReason = 'length'; }
+        }
         const promptTokens = Math.min(numCtx, fakeTokenCount(body.messages || [], body.tools));
+        const cached = Math.min(promptTokens - 1, cachedTokens(name, body.messages || [], body.tools));
         const evalCount = Math.max(1, Math.ceil((out.content.length + out.thinking.length) / 3.5));
-        const final = { model: name, created_at: now(), message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop', total_duration: 120e6, load_duration: 5e6, prompt_eval_count: promptTokens, prompt_eval_duration: 40e6, eval_count: evalCount, eval_duration: 75e6 };
-        const toolCalls = out.toolCalls.map((c) => ({ function: { name: c.name, arguments: c.arguments } }));
+        const final = { model: name, created_at: now(), message: { role: 'assistant', content: '' }, done: true, done_reason: doneReason, total_duration: 120e6, load_duration: reloaded ? 900e6 : 5e6, prompt_eval_count: promptTokens, ...(cached > 0 ? { prompt_eval_cached_count: cached } : {}), prompt_eval_duration: 40e6, eval_count: evalCount, eval_duration: 75e6 };
+        const toolCalls = out.toolCalls.map((c, i) => ({ id: `call_${Math.random().toString(36).slice(2, 10)}`, function: { index: i, name: c.name, arguments: c.arguments } }));
         if (body.stream === false) {
           return sendJson(res, 200, { ...final, message: { role: 'assistant', content: out.content, ...(out.thinking ? { thinking: out.thinking } : {}), ...(toolCalls.length ? { tool_calls: toolCalls } : {}) } });
         }

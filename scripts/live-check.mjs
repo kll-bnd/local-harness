@@ -227,7 +227,7 @@ async function loadHarness() {
     imp('server/store/settings.mjs'), imp('server/image/comfyui.mjs'), imp('server/image/defaults.mjs'),
     imp('server/chat/prompts.mjs'), imp('server/chat/llm.mjs'), imp('server/providers/registry.mjs'),
     imp('server/docs/extract.mjs'), imp('server/tools/builtin.mjs'), imp('server/image/http.mjs'),
-    imp('server/image/a1111.mjs'), imp('server/image/openai-images.mjs'),
+    imp('server/image/a1111.mjs'), imp('server/image/openai-images.mjs'), imp('server/image/service.mjs'),
   ]);
   H = Object.assign({}, ...mods);
   H.normalizeKeepAlive ||= (v) => v; // older trees did not normalize
@@ -278,6 +278,7 @@ const SRC = {
   psExpires: ['server/providers/ollama.mjs', 'm.expires_at', 'OllamaProvider.ps (expires_at)'],
   measure: ['server/context/measurements.mjs', 'async measure(provider, model', 'MeasurementStore.measure'],
   measureReported: ['server/context/measurements.mjs', 'entry.contextLength', 'MeasurementStore.measure (reported context)'],
+  measureTotal: ['server/context/measurements.mjs', 'totalBytes: entry.sizeBytes', 'MeasurementStore.measure (/api/ps size = total footprint)'],
   llmLoadedCtx: ['server/chat/llm.mjs', 'e?.contextLength', 'LLM.resolveFor (loaded context after restart)'],
   fit: ['server/context/sizing.mjs', 'export function fitMeasurements', 'fitMeasurements'],
   fitClamp: ['server/context/sizing.mjs', 'perToken * 0.25', 'fitMeasurements (slope clamp ¼–4×)'],
@@ -288,6 +289,7 @@ const SRC = {
   unloadEmbed: ['server/providers/ollama.mjs', "e.code === 'not_chat_model'", 'OllamaProvider.unload (embedding fallback)'],
   load: ['server/providers/ollama.mjs', 'async load(model', 'OllamaProvider.load'],
   imageUnload: ['server/image/service.mjs', 'ollama.unload(m.model)', 'ImageService._run (unload before generating)'],
+  waitUnloaded: ['server/image/service.mjs', 'async _waitUnloaded(', 'ImageService._waitUnloaded'],
   resolveThink: ['server/chat/engine.mjs', 'export function resolveThink', 'resolveThink'],
   retryThink: ['server/chat/engine.mjs', "'thinking_unsupported' && useThink", 'ChatEngine.streamOnce (retry without think)'],
   retryTools: ['server/chat/engine.mjs', "'tools_unsupported' && useTools", 'ChatEngine.streamOnce (retry without tools)'],
@@ -406,6 +408,8 @@ function resolveAnchor(key) {
   if (found < 0) unresolvedAnchors.add(key);
   return { file, line: found >= 0 ? found + 1 : null, label };
 }
+/** True while the Harness code still contains the anchored line, i.e. still makes that assumption. */
+export function harnessAssumes(key) { return resolveAnchor(key).line != null; }
 export function sourceRefs(keys) {
   return (keys || []).map(resolveAnchor).map((r) => `${r.file}${r.line ? `:${r.line}` : ''} (${r.label})`);
 }
@@ -437,16 +441,16 @@ def('ollama.chat.calibration_ratio', 'raw', "prompt_eval_count / Harness's raw t
 def('ollama.chat.done_reason_length', 'raw', 'Hitting num_predict ends with done_reason "length"', ['ollamaDone', 'finalLength']);
 def('ollama.chat.over_context', 'raw', 'A prompt longer than num_ctx is truncated (HTTP 200, prompt_eval_count ≤ num_ctx) or rejected with an error that classifies as context_overflow', ['classifyOverflow', 'observe']);
 def('ollama.chat.abort', 'raw', 'Closing the connection mid-stream ends it cleanly and Ollama stops generating (Harness stop() only aborts the fetch)', ['engineStop']);
-def('ollama.ps.shape', 'raw', 'GET /api/ps lists the loaded model with name/model, size, size_vram, expires_at, digest', ['ollamaPs']);
+def('ollama.ps.shape', 'raw', 'GET /api/ps lists the loaded model with name/model, size (the resident footprint, weights included), size_vram, expires_at, digest', ['ollamaPs', 'measureTotal']);
 def('ollama.ps.context_length', 'raw', '/api/ps reports context_length = the num_ctx Harness sent (optional field; used after a restart and to detect server-side capping)', ['psContext', 'measureReported', 'llmLoadedCtx']);
 def('ollama.ps.size_vram', 'raw', 'size_vram ≤ size; on Apple Silicon the whole model is on the GPU (size_vram == size)', ['cpuSplit']);
 def('ollama.ps.expires_at', 'raw', 'expires_at is an ISO timestamp ≈ now + keep_alive', ['psExpires']);
 def('ollama.load.generate_empty', 'raw', 'POST /api/generate {model, keep_alive, options:{num_ctx}} without a prompt loads the model (used by /api/models/load and eager reload after images)', ['load']);
 def('ollama.ps.size_grows_with_num_ctx', 'raw', '/api/ps size grows with num_ctx (measured memory = fixed + per-token × num_ctx)', ['measure', 'fit']);
-def('ollama.ps.measurement_fit', 'raw', "Real /api/ps samples pass fitMeasurements' sanity limits and give a slope within ¼–4× of the architecture estimate", ['fit', 'fitClamp', 'kvModel']);
+def('ollama.ps.measurement_fit', 'raw', "Real /api/ps samples pass fitMeasurements' sanity limits and give a slope within ¼–4× of the architecture estimate", ['measureTotal', 'fit', 'fitClamp', 'kvModel']);
 def('ollama.ps.kv_cache_type', 'raw', "The measured per-token cost matches the KV cache precision Harness assumes (f16 unless OLLAMA_KV_CACHE_TYPE is visible to Harness)", ['kvType', 'kvModel']);
 for (const [label] of keepAliveForms()) def(`ollama.keep_alive.${label}`, 'raw', `keep_alive ${label.replace(/^(number|string)_/, '$1 ')} (allowed by the settings validator) is accepted as Harness sends it and means what Harness intends`, ['ollamaKeepAlive', 'normalizeKeepAlive', 'settingsKeepAlive']);
-def('ollama.unload.chat', 'raw', 'POST /api/generate {model, keep_alive:0} → done_reason "unload", and /api/ps stops listing the model quickly (the image service starts generating right after unload())', ['unload', 'imageUnload']);
+def('ollama.unload.chat', 'raw', 'POST /api/generate {model, keep_alive:0} → done_reason "unload", and /api/ps stops listing the model within the time the image service waits before generating', ['unload', 'imageUnload', 'waitUnloaded']);
 def('ollama.think.on', 'raw', 'think:true on a thinking model streams message.thinking separately from message.content', ['ollamaThinking', 'resolveThink']);
 def('ollama.think.off', 'raw', 'think:false on a thinking model suppresses thinking (internal tasks rely on it)', ['llmThinkFalse']);
 def('ollama.think.level', 'raw', 'think:"low" (settings reasoning.think low/medium/high) is accepted, or rejected with a text the retry logic handles', ['resolveThink', 'retryThink', 'classifyThink']);
@@ -1298,6 +1302,8 @@ async function ollamaGroup(run, B) {
     const c = Cq.p.final?.prompt_eval_count;
     const d = (q) => (isNum(q.p.final?.prompt_eval_duration) ? fmtMs(q.p.final.prompt_eval_duration / 1e6) : '?');
     const info = [`first ${a} tokens (prompt ${d(A)}), identical repeat ${b ?? 'MISSING'} (prompt ${d(Bq)}), extended conversation ${c ?? 'MISSING'} (prompt ${d(Cq)}; estimate ${rawEstimate(msgsC)})`];
+    const cachedField = [A, Bq, Cq].map((q) => q.p.final?.prompt_eval_cached_count);
+    if (cachedField.some((x) => x !== undefined)) info.push(`prompt_eval_cached_count: first ${cachedField[0] ?? '-'}, repeat ${cachedField[1] ?? '-'}, extended ${cachedField[2] ?? '-'} (Harness does not read this field)`);
     if (!Bq.r.ok || !Cq.r.ok) return FAIL(`follow-up request failed: ${Bq.p.errorText || Cq.p.errorText}`, { info });
     if (!isInt(b) || b <= 0) return FAIL('prompt_eval_count is MISSING on a fully cached repeat', { info, expected: `≈ ${a} (the full prompt)`, actual: excerpt({ ...Bq.p.final, message: undefined }), fix: 'engine.mjs only calibrates when promptTokens is truthy, so cached turns are never observed; fall back to the previous count + estimated delta, or tokenize.' });
     if (b < a * 0.8) return FAIL(`repeat reports ${b} instead of ~${a}: only the uncached tokens are counted`, { info, expected: `≈ ${a}`, fix: 'Calibrator.observe() would learn a far too small ratio (or reject it): treat prompt_eval_count as "evaluated" tokens and track the cached part separately.' });
@@ -1331,6 +1337,8 @@ async function ollamaGroup(run, B) {
     if (typeof entry1.digest !== 'string') bad.push('digest missing');
     if (!(entry1.model || entry1.name)) bad.push('model/name missing');
     if (bad.length) return FAIL(`entry fields: ${bad.join(', ')}`, { actual: excerpt(entry1), expected: 'size (bytes) > 0, size_vram, expires_at, digest', fix: 'MeasurementStore.measure needs size; isCpuSplit needs size_vram.' });
+    const fileBytes = tagOf(C)?.size;
+    if (fileBytes && entry1.size < fileBytes * 0.5) return WARN(`size ${fmtBytes(entry1.size)} is far below the model file (${fmtBytes(fileBytes)}): /api/ps size does not include the weights here (KV cache + buffers only)`, { info: [`size_vram ${fmtBytes(entry1.size_vram)}, context_length ${entry1.context_length ?? 'absent'}`], fix: harnessAssumes('measureTotal') ? 'MeasurementStore.measure records ps size as the whole footprint (see ollama.ps.measurement_fit); add the weights or measure the runner process instead.' : 'Harness no longer records ps size as the total footprint; nothing to do unless the plan looks wrong.' });
     return PASS(`${entry1.model || entry1.name}: size ${fmtBytes(entry1.size)}, size_vram ${fmtBytes(entry1.size_vram)}, context_length ${entry1.context_length ?? 'absent'}, expires ${entry1.expires_at}`);
   });
 
@@ -1442,6 +1450,7 @@ async function ollamaGroup(run, B) {
     need(entry1 && entry2, 'need /api/ps at num_ctx 2048 and 4096', 'ollama.load.generate_empty to pass');
     const dSize = entry2.size - entry1.size;
     const perTok = dSize / 2048;
+    if (dSize <= 0 && !harnessAssumes('measureTotal')) return WARN(`size did not grow: ${fmtBytes(entry1.size)} at 2048 → ${fmtBytes(entry2.size)} at 4096 (Harness no longer records ps size as the footprint, so this is informational)`);
     if (dSize <= 0) return FAIL(`size did not grow: ${fmtBytes(entry1.size)} at 2048 → ${fmtBytes(entry2.size)} at 4096`, { expected: 'size(4096) > size(2048)', fix: 'fitMeasurements assumes size = fixed + perToken·num_ctx; a flat or shrinking size makes it fall back to the architecture estimate for the slope (method "linear-clamped"), so measurements only correct the fixed part. Check that options.num_ctx really changes the KV allocation.' });
     O.measuredPerToken = perTok;
     return PASS(`${fmtBytes(entry1.size)} → ${fmtBytes(entry2.size)}: ${fmtBytes(perTok)} per token`);
@@ -1459,7 +1468,12 @@ async function ollamaGroup(run, B) {
     const fit = H.fitMeasurements(samples, { estModelOnly, perToken: kv.perToken, modelBytes });
     const lines = [`estimate (${kvType}): ${fmtBytes(estModelOnly(2048))} at 2K, ${fmtBytes(estModelOnly(4096))} at 4K, ${fmtBytes(kv.perToken)}/token; measured ${fmtBytes(entry1.size)} / ${fmtBytes(entry2.size)}`];
     if (fit) lines.push(`fit: usable ${fit.usable}, method ${fit.method}, rejected ${fit.rejected}, fixed ${fmtBytes(fit.fixedBytes)}, per-token ${fmtBytes(fit.perTokenBytes)}`);
-    if (!fit?.usable) return FAIL(`both real samples are rejected by fitMeasurements' sanity limits (0.4–3× the estimate) — Harness would ignore real measurements of this model`, { info: lines, fix: 'The architecture estimate is far off for this model; widen the sanity band or fix kvCacheModel for this architecture.' });
+    if (!fit?.usable) {
+      const noWeights = modelBytes > 0 && entry1.size < modelBytes * 0.5;
+      if (!harnessAssumes('measureTotal')) return WARN('the /api/ps samples would be rejected by fitMeasurements, but Harness no longer records ps size as the footprint (anchor gone) — re-check what it measures now', { info: lines });
+      if (noWeights) return FAIL(`/api/ps size (${fmtBytes(entry1.size)}) does not include the weights (model file ${fmtBytes(modelBytes)}), so fitMeasurements rejects every sample (size < ½ weights) and the plan never becomes "measured"`, { info: lines, expected: 'size = weights + KV + buffers (what MeasurementStore.measure assumes)', actual: `size ${entry1.size} / ${entry2.size} bytes at num_ctx 2048 / 4096`, fix: 'In MeasurementStore.measure use weights + ps size (or the runner process RSS) as totalBytes.' });
+      return FAIL('both real samples are rejected by fitMeasurements\' sanity limits (0.4–3× the estimate) — Harness would ignore real measurements of this model', { info: lines, fix: 'The architecture estimate is far off for this model; widen the sanity band or fix kvCacheModel for this architecture.' });
+    }
     const slope = (entry2.size - entry1.size) / 2048;
     if (fit.method === 'linear-clamped') return WARN(`measured slope ${slope > 0 ? `${fmtBytes(slope)}/token` : `${Math.round(slope)} B/token (not positive)`} is outside ¼–4× of the estimate ${fmtBytes(kv.perToken)}/token, so the fit is clamped`, { info: lines, fix: slope > 0 ? 'kvCacheModel misjudges this architecture (sliding window? KV precision?); see ollama.ps.kv_cache_type.' : 'See ollama.ps.size_grows_with_num_ctx.' });
     return PASS(`usable linear fit (${fit.method})`, { info: lines });
@@ -1516,8 +1530,12 @@ async function ollamaGroup(run, B) {
     if (r.ms > 15000) return FAIL(`the unload request took ${fmtMs(r.ms)} (> 15 s timeout of OllamaProvider.unload)`, { info });
     if (!w.gone) return FAIL(`still listed in /api/ps after ${fmtMs(w.ms)}`, { info, fix: 'keep_alive:0 does not unload; use another unload path.' });
     if (r.json?.done_reason && r.json.done_reason !== 'unload') return WARN(`done_reason "${r.json.done_reason}" (expected "unload")`, { info });
-    if (nowMs() - t0 > 1000) return WARN(`unloading is asynchronous: the model stayed in /api/ps for ${fmtMs(nowMs() - t0)} after the request`, { info, fix: 'ImageService starts the diffusion job right after unload() resolves; on 8 GB both models are briefly resident. Poll /api/ps until the model is gone (with a timeout) before generating.' });
-    return PASS(`gone from /api/ps after ${fmtMs(nowMs() - t0)}`, { info });
+    const took = nowMs() - t0;
+    const budget = H.ImageService?.unloadWaitMs;
+    const waits = typeof H.ImageService?.prototype?._waitUnloaded === 'function';
+    if (waits && budget && took > budget * 0.75) return WARN(`the model stayed in /api/ps for ${fmtMs(took)} — close to or beyond the ${fmtMs(budget)} ImageService waits before generating anyway`, { info, fix: 'Raise ImageService.unloadWaitMs, or check why Ollama is slow to free the runner.' });
+    if (!waits && took > 1000) return WARN(`unloading is asynchronous: the model stayed in /api/ps for ${fmtMs(took)} after the request`, { info, fix: 'ImageService starts the diffusion job right after unload() resolves; poll /api/ps until the model is gone before generating.' });
+    return PASS(`gone from /api/ps after ${fmtMs(took)}${took > 1000 ? ` (asynchronous; ImageService waits up to ${fmtMs(budget)})` : ''}`, { info });
   }, { timeoutMs: 180000 });
 
   // ---- thinking
@@ -2937,7 +2955,7 @@ async function e2eGroup(run, B) {
       const unloaded = phases.includes('unloading') && phases.includes('unloaded');
       if (!unloaded) return WARN('the chat model was not unloaded before generating (nothing was loaded per /api/ps?)', { info });
       if (!(ms.includes('loading') && ms.includes('ready'))) return FAIL('the chat model was unloaded but the stream has no model_status loading → ready before the final answer', { info, fix: 'ChatEngine.run should emit model_status around the reload after an image job.' });
-      if (psAtGenerating?.listed) return WARN(`${TM} was still in /api/ps when the diffusion job started (unload is asynchronous)`, { info, fix: 'Wait until /api/ps no longer lists the model before generating (ImageService._run).' });
+      if (psAtGenerating?.listed) return WARN(`${TM} was still in /api/ps when the diffusion job started`, { info, fix: 'ImageService._waitUnloaded gave up (or is missing): see ollama.unload.chat for how long unloading takes here.' });
       return PASS('tool → unload → generate → image → reload → answer', { info });
     }, { timeoutMs: 1600000 });
   } finally {

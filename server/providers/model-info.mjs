@@ -1,6 +1,21 @@
 // Normalize per-provider model metadata into one ModelInfo shape (see docs/API.md "ModelInfo").
-import { parseModelfileParameters } from './ollama.mjs';
+import { parseModelfileParameters, modelfileBlobs } from './ollama.mjs';
 import { profileFor, contextOverrideFor, EMBEDDING_NAME_RE } from './catalog.mjs';
+
+/** GGUF `general.sampling.*` (the model's own suggested sampling defaults) → Ollama option names. */
+const SAMPLING_META = { temp: 'temperature', temperature: 'temperature', top_k: 'top_k', top_p: 'top_p', min_p: 'min_p', repeat_penalty: 'repeat_penalty', penalty_repeat: 'repeat_penalty' };
+export function metadataSampling(mi = {}) {
+  const out = {};
+  for (const [k, v] of Object.entries(mi)) {
+    const m = k.match(/^general\.sampling\.(.+)$/);
+    const opt = m && SAMPLING_META[m[1]];
+    if (opt && typeof v === 'number' && Number.isFinite(v)) out[opt] = v;
+  }
+  return out;
+}
+
+/** A template that only passes the prompt through: Ollama then formats chats as generic ChatML. */
+export const isTrivialTemplate = (t) => !t || /^\s*\{\{-?\s*\.Prompt\s*-?\}\}\s*$/.test(t);
 
 function findKey(obj, suffix) {
   for (const [k, v] of Object.entries(obj || {})) if (k.endsWith(suffix)) return v;
@@ -28,6 +43,7 @@ export function normalizeOllamaShow(model, show = {}, tag = null) {
     if (/\.Think\b/.test(tpl)) caps.push('thinking');
     if (show.projector_info || families.includes('clip') || families.includes('mllama')) caps.push('vision');
   }
+  const blobs = modelfileBlobs(show.modelfile);
 
   const contextLength = override?.contextLength || advertised || null;
   return {
@@ -51,14 +67,23 @@ export function normalizeOllamaShow(model, show = {}, tag = null) {
       headCountKv: g('attention.head_count_kv') ?? null,
       keyLength: g('attention.key_length') ?? null,
       valueLength: g('attention.value_length') ?? null,
+      // gemma4: sliding-window layers use smaller heads than the global ones
+      keyLengthSwa: g('attention.key_length_swa') ?? null,
+      valueLengthSwa: g('attention.value_length_swa') ?? null,
       slidingWindow: g('attention.sliding_window') ?? null,
       slidingWindowPattern: g('attention.sliding_window_pattern') ?? null,
       sharedKvLayers: g('attention.shared_kv_layers') ?? null,
       parameterCount: mi['general.parameter_count'] ?? null,
     },
     modelfileParameters: parseModelfileParameters(show.parameters),
+    // suggested sampling carried in the model file (general.sampling.*); preferred over the family profile's guess
+    metadataSampling: metadataSampling(mi),
     profile: { id: profile.id, family: profile.family, sampling: profile.sampling || {}, imageTokens: profile.imageTokens || 576, swa: profile.swa || null, notes: profile.notes || null },
     serverContext: null,
+    // Blob layers (first = model weights; more = vision/audio projector, draft model …) and the chat template state.
+    blobs,
+    hasProjector: blobs.length > 1 || !!show.projector_info || caps.includes('vision') || caps.includes('audio'),
+    templateTrivial: isTrivialTemplate(show.template),
   };
 }
 

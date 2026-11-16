@@ -19,12 +19,18 @@ import { normalizeUrl, URL_RE } from '../lib/url.mjs';
 
 const nonNull = (o) => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v !== null && v !== undefined));
 
+/**
+ * The `think` value for a request. Ollama turns thinking ON when `think` is omitted on a thinking-capable model
+ * (a small num_predict then goes entirely into thinking), so Ollama always gets an explicit value: thinking only
+ * when the user turned it on ('on' / 'low' / 'medium' / 'high') and the model can; `false` otherwise ('auto' = off).
+ * `think:false` on a model without the capability is accepted; a rejection is retried without the field.
+ */
 export function resolveThink(s, info, provider) {
   const t = s.reasoning?.think ?? 'auto';
   if (provider.kind !== 'ollama') return t === 'off' ? false : undefined;
-  if (!info.capabilities.includes('thinking')) return undefined;
-  if (t === 'auto' || t === 'on') return true;
-  if (t === 'off') return false;
+  const capable = (info.capabilities || []).includes('thinking');
+  if (!capable || t === 'auto' || t === 'off') return false;
+  if (t === 'on') return true;
   return t;
 }
 
@@ -34,7 +40,9 @@ export const SAMPLING_KEYS = new Set(['temperature', 'top_p', 'top_k', 'min_p', 
 export function buildOptions(info, s, numCtx, providerKind) {
   const o = {};
   const mf = info.modelfileParameters || {};
-  for (const [k, v] of Object.entries(info.profile?.sampling || {})) if (mf[k] === undefined && SAMPLING_KEYS.has(k)) o[k] = v;
+  // Suggested sampling: the model file's own general.sampling.* beats the family profile; both yield to the Modelfile.
+  const suggested = { ...(info.profile?.sampling || {}), ...(info.metadataSampling || {}) };
+  for (const [k, v] of Object.entries(suggested)) if (mf[k] === undefined && SAMPLING_KEYS.has(k)) o[k] = v;
   for (const [k, v] of Object.entries(nonNull(s.params))) if (SAMPLING_KEYS.has(k)) o[k] = v;
   if (providerKind === 'ollama') o.num_ctx = numCtx;
   return o;
@@ -572,8 +580,9 @@ export class ChatEngine {
           continue;
         }
         if (!streamed && e.code === 'thinking_unsupported' && useThink !== undefined) {
+          const wanted = !!useThink;
           useThink = undefined;
-          emit('notice', { code: 'thinking_unsupported', message: `${t.model} does not support thinking mode; continuing without it.` });
+          if (wanted) emit('notice', { code: 'thinking_unsupported', message: `${t.model} does not support thinking mode; continuing without it.` });
           continue;
         }
         throw e;
@@ -619,6 +628,8 @@ function statsPayload(messageId, iteration, u, numCtx) {
     messageId,
     iteration,
     promptTokens: u.promptTokens,
+    // tokens of the prompt the backend reused from its prompt cache (Ollama ≥ 0.40), null when not reported
+    cachedPromptTokens: u.cachedPromptTokens ?? null,
     completionTokens: u.completionTokens,
     tokensPerSecond: u.evalMs ? Math.round(((u.completionTokens || 0) / u.evalMs) * 10000) / 10 : null,
     promptTokensPerSecond: u.promptMs ? Math.round(((u.promptTokens || 0) / u.promptMs) * 10000) / 10 : null,

@@ -12,7 +12,7 @@ import { startFakeOllama } from './fake-ollama.mjs';
 import { startFakeOpenAI } from './fake-openai.mjs';
 import { startFakeA1111 } from './fake-a1111.mjs';
 import { startFakeComfyUI } from './fake-comfyui.mjs';
-import { runLiveCheck, redact, parseOptions, CATALOG, sourceRefs } from '../scripts/live-check.mjs';
+import { runLiveCheck, redact, parseOptions, CATALOG, sourceRefs, harnessAssumes } from '../scripts/live-check.mjs';
 import { A1111Provider } from '../server/image/a1111.mjs';
 
 process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1';
@@ -61,6 +61,18 @@ async function deviant(target, { rules = () => null, transform = (req, status, t
   return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }) };
 }
 
+/**
+ * While server/context/measurements.mjs records /api/ps `size` as the model's whole footprint, make the fake report
+ * that (weights + per-token KV at Harness's own f16 estimate for qwen3:4b). The fake now models real Ollama 0.40,
+ * whose `size` excludes the weights; that case is the "KV-only /api/ps size" deviant test below.
+ */
+function pinPsToTotalFootprint(fake, model = 'qwen3:4b', perTokenBytes = 147456) {
+  if (!harnessAssumes('measureTotal')) return;
+  const m = fake.installed.get(model);
+  const weights = m.weightBytes ?? m.size;
+  fake.setPsProfile(model, { baseBytes: 'weightBytes' in m ? 2 * weights + 300 * 1024 ** 2 : weights, perTokenBytes });
+}
+
 const byId = (result, id) => {
   const c = result.checks.find((x) => x.id === id);
   assert.ok(c, `check ${id} was not reported`);
@@ -87,6 +99,7 @@ async function withFakes(which, fn) {
 
 describe('live-check against the repo fakes', { concurrency: true }, () => {
   test('full run (raw + e2e, pulls and images allowed) passes, writes valid JSON and Markdown, exits 0', () => withFakes(['ollama', 'openai', 'a1111', 'comfy'], async (fakes, tmp) => {
+    pinPsToTotalFootprint(fakes.ollama);
     const json = path.join(tmp, 'out.json');
     const md = path.join(tmp, 'out.md');
     const { code, out } = await runCli([
@@ -119,6 +132,7 @@ describe('live-check against the repo fakes', { concurrency: true }, () => {
   }));
 
   test('deviant Ollama: string tool arguments, uncached prompt_eval_count, no ps context_length, flat ps size, negative keep_alive rejected, different thinking error, slow unload', () => withFakes(['ollama'], async (fakes) => {
+    pinPsToTotalFootprint(fakes.ollama);
     const lastKeepAlive = new Map();
     const lastPs = new Map();
     const unloadedAt = new Map();
@@ -192,9 +206,40 @@ describe('live-check against the repo fakes', { concurrency: true }, () => {
       assert.equal(s('ollama.think.unsupported_error').status, 'FAIL');
       assert.match(s('ollama.think.unsupported_error').detail, /thinking is not enabled for this model/);
       assert.match(s('ollama.think.unsupported_error').fix, /classifyOllamaError/);
-      assert.equal(s('ollama.unload.chat').status, 'WARN');
-      assert.match(s('ollama.unload.chat').detail, /asynchronous/);
+      // slow unload (1.3 s): Harness waits for /api/ps (ImageService._waitUnloaded), so this passes but says so
+      assert.equal(s('ollama.unload.chat').status, 'PASS');
+      assert.match(s('ollama.unload.chat').detail, /asynchronous; ImageService waits up to/);
       assert.equal(s('ollama.think.on').status, 'PASS');
+    } finally {
+      await proxy.close();
+    }
+  }));
+
+  test('KV-only /api/ps size (weights excluded, as on Ollama 0.40): measurements are diagnosed as unusable', () => withFakes(['ollama'], async (fakes) => {
+    pinPsToTotalFootprint(fakes.ollama);
+    const proxy = await deviant(fakes.ollama.url, {
+      transform(r, status, text) {
+        if (r.path !== '/api/ps') return text;
+        const j = JSON.parse(text);
+        for (const m of j.models) { m.size = 64 * 1024 ** 2 + 50000 * (m.context_length || 2048); m.size_vram = m.size; }
+        return JSON.stringify(j);
+      },
+    });
+    try {
+      const q = quiet();
+      const { result } = await runLiveCheck(['--no-detect', '--ollama-url', proxy.url, '--only', 'ollama', '--no-color'], q);
+      await keep('deviant-ollama-kv-only-ps', q);
+      const s = (id) => byId(result, id);
+      assert.equal(s('ollama.ps.shape').status, 'WARN');
+      assert.match(s('ollama.ps.shape').detail, /does not include the weights/);
+      assert.equal(s('ollama.ps.size_grows_with_num_ctx').status, 'PASS');
+      if (harnessAssumes('measureTotal')) {
+        assert.equal(s('ollama.ps.measurement_fit').status, 'FAIL');
+        assert.match(s('ollama.ps.measurement_fit').detail, /does not include the weights .* rejects every sample/);
+        assert.match(s('ollama.ps.measurement_fit').fix, /MeasurementStore\.measure/);
+      } else {
+        assert.equal(s('ollama.ps.measurement_fit').status, 'WARN');
+      }
     } finally {
       await proxy.close();
     }

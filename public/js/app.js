@@ -218,7 +218,12 @@ function connectEvents() {
     const m = peekChatModel(d.chatId);
     if (m && !m.live) { m.load({ force: true }).catch(() => {}); m.loadSummary().catch(() => {}); }
   });
-  on('generation.started', (d) => { store.set('chats', (store.get('chats') || []).map((c) => (c.id === d.chatId ? { ...c, generating: true } : c))); });
+  on('generation.started', (d) => {
+    store.set('chats', (store.get('chats') || []).map((c) => (c.id === d.chatId ? { ...c, generating: true } : c)));
+    // Started somewhere else (another window, a scheduled job): show it as running here too.
+    const m = peekChatModel(d.chatId);
+    if (m && !m.live && m.chat) { m.chat = { ...m.chat, generating: { generationId: d.generationId, assistantMessageId: d.assistantMessageId || null } }; m.emit('live'); shell.updateToolbar(); }
+  });
   on('generation.finished', (d) => {
     store.set('chats', (store.get('chats') || []).map((c) => (c.id === d.chatId ? { ...c, generating: false } : c)));
     const m = peekChatModel(d.chatId);

@@ -28,10 +28,15 @@ export const MODEL_PROFILES = [
     match: /nemotron[-_. ]?3\.5[-_. ]?bolt/i,
     family: 'gemma4',
     label: 'NVIDIA Nemotron 3.5 Bolt',
-    sampling: { temperature: 0.6, top_p: 0.95, top_k: 64 },
+    // = the model file's general.sampling.* (temp 1, top_k 64, top_p 0.95), which is read and preferred when present.
+    sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 },
+    // gemma4 layout: 42 layers, the last 18 share KV (no cache of their own); 1 in 5 of the rest is global
+    // (the 1:5 ratio is an assumption — metadata has no sliding_window_pattern), sliding layers keep 512 tokens.
     swa: { globalEvery: 5, window: 512 },
     imageTokens: 280,
-    notes: 'Gemma-4-E4B derivative tuned for multi-turn tool use. Sampling defaults are an assumption.',
+    // Measured: 13,499 characters of English prompt = 3,020 tokens (≈4.5 chars/token).
+    charsPerToken: 4.5,
+    notes: 'Gemma-4 based (7.5B parameters, "E4B") tuned for multi-turn tool use. Trained for 64K context.',
   },
   { id: 'gemma4', match: /gemma-?4/i, family: 'gemma4', sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 }, swa: { globalEvery: 5, window: 512 }, imageTokens: 280 },
   { id: 'gemma3n', match: /gemma-?3n/i, family: 'gemma3n', sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 }, swa: { globalEvery: 5, window: 512 }, imageTokens: 256 },
@@ -76,24 +81,50 @@ export function embeddingProfileFor(model) {
   return EMBEDDING_MODELS.find((e) => base === e.model || base.startsWith(e.model)) || { model, prefixes: { query: '', document: '' } };
 }
 
+const MiB = 1024 ** 2;
+export const NEMOTRON_HF_REPO = 'hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF';
+const NEMO_UD_PROJECTOR = 946 * MiB;
+const hfNemo = (tag, layerMiB, label, extra = {}) => ({
+  model: `${NEMOTRON_HF_REPO}:${tag}`, label, approxSizeBytes: layerMiB * MiB + NEMO_UD_PROJECTOR,
+  modelLayerBytes: layerMiB * MiB, projectorBytes: NEMO_UD_PROJECTOR, textOnlyBytes: layerMiB * MiB, ...extra,
+});
+
 /**
- * Curated recommended chat models. Sizes are approximate download/RAM sizes (unverified) used to
- * pre-compute a fit estimate for this machine; `variants` are ordered largest → smallest.
+ * Curated recommended chat models. `variants` are ordered largest → smallest; `approxSizeBytes` is the download
+ * (and resident) size as pulled — for Nemotron these are the real layer sizes reported by the registry.
+ * `textOnlyBytes`: size of a text-only copy (model layer without the vision/audio projector, see
+ * POST /api/models/text-only). `lowRam`: how the variant is presented on ≤ 8 GB machines.
  */
 export const RECOMMENDED_MODELS = [
   {
     id: 'nemotron-3.5-bolt-e4b',
     name: 'NVIDIA Nemotron 3.5 Bolt E4B',
-    description: 'Fast ~4B-effective-parameter model tuned for multi-turn tool use. Real context 64K.',
+    description: 'Fast Gemma-4-based model tuned for multi-turn tool use. Real context 64K.',
     tags: ['recommended', 'tools', 'thinking', 'fast'],
     contextLength: 65536,
     family: 'gemma4',
-    // Architecture hints (assumed Gemma-3n-E4B-like) used only for the pre-download fit estimate.
-    archHint: { blockCount: 35, embeddingLength: 2048, headCount: 8, headCountKv: 2, keyLength: 256, valueLength: 256 },
+    // Real /api/show metadata (UD-Q3_K_XL pull), used for the pre-download fit estimate.
+    archHint: { blockCount: 42, embeddingLength: 2560, headCount: 8, headCountKv: 2, keyLength: 512, valueLength: 512, keyLengthSwa: 256, valueLengthSwa: 256, slidingWindow: 512, sharedKvLayers: 18, parameterCount: 7518069290 },
+    // On ≤ 8 GB the vision/audio projector costs ~1 GB of RAM the Mac does not have: recommend a text-only copy.
+    textOnly: { supported: true, recommendedOnLowRam: true },
+    lowRamAdvice: {
+      suggested: `${NEMOTRON_HF_REPO}:UD-IQ3_XXS`,
+      largestRealistic: `${NEMOTRON_HF_REPO}:UD-Q3_K_XL`,
+      note: 'On an 8 GB Mac use a text-only copy. UD-Q3_K_XL (4.0 GB) is the largest that is realistic: it runs, but leaves almost nothing for macOS and an app window (measured ≈4.3 GB resident at 2–4K context on a 7 GB Mac that was already swapping). UD-IQ3_XXS or UD-Q2_K_XL (≈3.5 GB) are the comfortable choice, with a small quality trade-off.',
+    },
     variants: [
-      { model: 'nemotron-3.5-bolt:e4b', label: 'Default quant', approxSizeBytes: 6.0 * GiB },
-      { model: 'hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:Q4_K_M', label: 'Q4_K_M (GGUF)', approxSizeBytes: 4.6e9 },
-      { model: 'hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:Q3_K_M', label: 'Q3_K_M (GGUF, low RAM)', approxSizeBytes: 3.9e9 },
+      { model: 'nemotron-3.5-bolt:e4b', label: 'Official (vision + audio + draft model)', approxSizeBytes: 6180446208 + 991551808 + 736812096, modelLayerBytes: 6180446208, projectorBytes: 991551808, draftBytes: 736812096, textOnlyBytes: 6180446208, minRamBytes: 16 * GiB, note: '7.9 GB download: the model plus a vision/audio projector and a speculative-decoding draft model. Not usable on 8 GB.' },
+      hfNemo('UD-Q4_K_XL', 4826, 'UD-Q4_K_XL (GGUF)'),
+      hfNemo('UD-Q3_K_XL', 4024, 'UD-Q3_K_XL (GGUF)', { lowRam: 'largest_realistic', note: 'Largest that is realistic on 8 GB, as a text-only copy (4.0 GB): runs, but leaves almost nothing for macOS and other apps.' }),
+      hfNemo('UD-Q2_K_XL', 3569, 'UD-Q2_K_XL (GGUF)', { lowRam: 'comfortable', note: 'Comfortable on 8 GB as a text-only copy (≈3.5 GB); some quality loss versus UD-Q3_K_XL.' }),
+      hfNemo('UD-IQ3_XXS', 3532, 'UD-IQ3_XXS (GGUF)', { lowRam: 'comfortable', note: 'Comfortable on 8 GB as a text-only copy (≈3.5 GB); some quality loss versus UD-Q3_K_XL.' }),
+    ],
+    // Tags that look plausible but must never be suggested.
+    avoid: [
+      { model: 'nemotron-3.5-bolt:latest', reason: 'A different, 22 GB model — not the E4B.' },
+      { model: `${NEMOTRON_HF_REPO}:latest`, reason: 'The 14 GB BF16 file.' },
+      { model: `${NEMOTRON_HF_REPO}:Q4_K_M`, reason: 'This tag does not exist in the repository (use UD-Q4_K_XL).' },
+      { model: `${NEMOTRON_HF_REPO}:Q3_K_M`, reason: 'This tag does not exist in the repository (use UD-Q3_K_XL).' },
     ],
   },
   {
@@ -117,6 +148,53 @@ export const RECOMMENDED_MODELS = [
     variants: [{ model: 'qwen3:8b', label: 'Q4_K_M', approxSizeBytes: 5.2e9 }],
   },
 ];
+
+/** Name for a text-only copy of `model` (valid Ollama name, lower case): "<repo>-text:<tag>". */
+export function textOnlyName(model) {
+  const [pathPart, tag = 'latest'] = String(model).split(/:(?=[^/:]*$)/);
+  const base = pathPart.split('/').pop().replace(/-gguf$/i, '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-');
+  return `${base}-text:${tag.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')}`;
+}
+
+/** The catalog variant a (possibly text-only copy) model name refers to, with its recommendation. */
+export function catalogVariantFor(model) {
+  const m = String(model || '');
+  for (const rec of RECOMMENDED_MODELS) {
+    for (const v of rec.variants) {
+      if (v.model === m) return { rec, variant: v, textOnly: false };
+      if (textOnlyName(v.model) === m) return { rec, variant: v, textOnly: true };
+    }
+  }
+  return null;
+}
+
+export function avoidedTag(model) {
+  for (const rec of RECOMMENDED_MODELS) for (const a of rec.avoid || []) if (a.model === model) return a;
+  return null;
+}
+
+/**
+ * The next smaller recommended file for `model` (same family first; on ≤ 8 GB the "comfortable" variant), or a
+ * smaller recommended model of another family. Sizes are those of a text-only copy where one is recommended.
+ * @returns {null | { model, approxSizeBytes, label, textOnly }}
+ */
+export function smallerVariantFor(model, { totalMem = 0, sizeBytes = null } = {}) {
+  const hit = catalogVariantFor(model);
+  const lowRam = totalMem > 0 && totalMem <= 8.5 * GiB;
+  const sizeOf = (rec, v) => (lowRam && rec.textOnly?.recommendedOnLowRam && v.textOnlyBytes ? v.textOnlyBytes : v.approxSizeBytes);
+  if (!hit && !sizeBytes) return null;
+  const current = hit ? sizeOf(hit.rec, hit.variant) : sizeBytes;
+  const pick = (rec, v) => ({ model: v.model, approxSizeBytes: sizeOf(rec, v), label: v.label, textOnly: !!(lowRam && rec.textOnly?.recommendedOnLowRam) });
+  if (hit) {
+    const smaller = hit.rec.variants.filter((v) => sizeOf(hit.rec, v) < current * 0.97);
+    if (smaller.length) {
+      const comfy = lowRam && smaller.find((v) => v.lowRam === 'comfortable');
+      return pick(hit.rec, comfy || smaller[0]);
+    }
+  }
+  const others = RECOMMENDED_MODELS.filter((r) => r !== hit?.rec).flatMap((r) => r.variants.map((v) => ({ r, v }))).filter(({ r, v }) => sizeOf(r, v) < current * 0.97).sort((a, b) => sizeOf(b.r, b.v) - sizeOf(a.r, a.v));
+  return others.length ? pick(others[0].r, others[0].v) : null;
+}
 
 export const RECOMMENDED_EMBEDDING = [
   { id: 'embeddinggemma', name: 'EmbeddingGemma 300M', model: 'embeddinggemma', approxSizeBytes: 0.62e9, description: 'Best quality small embedding model; improves memory and document search.' },

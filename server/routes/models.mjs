@@ -140,23 +140,46 @@ export function registerModelRoutes(r, app) {
     const installed = await app.registry.listModels().catch(() => []);
     const kv = app.registry.kvCacheType(app.settings.get());
     const budget = memoryBudget({ totalMem: sys.totalMem, platform: sys.platform, arch: sys.arch, memoryFraction: app.settings.get().context?.memoryFraction });
+    const lowRam = ramTier(sys.totalMem) === 'low';
+    const ctxSettings = app.settings.get().context || {};
+    const estimateFor = (rec, profile, bytes) => {
+      const plan = computeContextPlan({ providerKind: 'ollama', modelMax: rec.contextLength, modelMaxSource: 'catalog', modelBytes: bytes, arch: rec.archHint || {}, profile, mode: 'auto', system: sys, kvCacheType: kv, lowRamCap: ctxSettings.lowRamCap ?? null, memoryFraction: ctxSettings.memoryFraction ?? null });
+      return { numCtx: plan.numCtx, estimatedTotalBytes: plan.memory.estimatedTotalBytes, fits: plan.fits && !plan.warnings.some((w) => w.code === 'model_exceeds_budget'), limitedBy: plan.limitedBy, explanation: plan.explanation };
+    };
     const models = RECOMMENDED_MODELS.map((rec) => {
       const profile = profileFor(rec.variants[0].model, rec.family);
       const variants = rec.variants.map((v) => {
-        const plan = computeContextPlan({ providerKind: 'ollama', modelMax: rec.contextLength, modelMaxSource: 'catalog', modelBytes: v.approxSizeBytes, arch: rec.archHint || {}, profile, mode: 'auto', system: sys, kvCacheType: kv, lowRamCap: app.settings.get().context?.lowRamCap ?? null, memoryFraction: app.settings.get().context?.memoryFraction ?? null });
+        const copy = rec.textOnly?.supported ? textOnlyName(v.model) : null;
         const hit = installed.find((m) => m.model === v.model || (v.model.includes(':') ? false : m.model.startsWith(`${v.model}:`)));
-        return { ...v, installed: !!hit, providerId: hit?.providerId || null, estimate: { numCtx: plan.numCtx, estimatedTotalBytes: plan.memory.estimatedTotalBytes, fits: plan.fits && !plan.warnings.some((w) => w.code === 'model_exceeds_budget'), limitedBy: plan.limitedBy, explanation: plan.explanation } };
+        const copyHit = copy ? installed.find((m) => m.model === copy) : null;
+        const estimate = estimateFor(rec, profile, v.approxSizeBytes);
+        const textOnly = copy && v.textOnlyBytes ? { model: copy, approxSizeBytes: v.textOnlyBytes, installed: !!copyHit, recommended: !!(lowRam && rec.textOnly.recommendedOnLowRam), estimate: estimateFor(rec, profile, v.textOnlyBytes) } : null;
+        // The plain estimate explains RAM; the variant note says what the file is and how it behaves on this Mac.
+        if (v.note && (lowRam || !v.lowRam)) estimate.explanation = `${v.note} ${estimate.explanation}`;
+        if (textOnly?.recommended && v.note) textOnly.estimate.explanation = `${v.note} ${textOnly.estimate.explanation}`;
+        const { minRamBytes, ...pubV } = v;
+        return { ...pubV, installed: !!hit, providerId: hit?.providerId || copyHit?.providerId || null, estimate, textOnly, ...(minRamBytes && sys.totalMem < minRamBytes ? { notForThisMachine: true } : {}) };
       });
-      // Suggest the largest variant that fits with a useful window (≥ 8K, else ≥ 4K, else smallest).
-      const pick = variants.find((v) => v.estimate.fits && v.estimate.numCtx >= 8192) || variants.find((v) => v.estimate.fits && v.estimate.numCtx >= 4096) || variants[variants.length - 1];
-      const { archHint, ...pub } = rec;
-      return { ...pub, variants, suggestedVariant: pick.model, installed: variants.some((v) => v.installed), fitsThisMachine: !!pick.estimate.fits };
+      const usable = (v) => (lowRam && v.textOnly?.recommended ? v.textOnly.estimate : v.estimate);
+      let pick;
+      let largest = null;
+      if (lowRam && rec.lowRamAdvice) {
+        pick = variants.find((v) => v.model === rec.lowRamAdvice.suggested);
+        largest = rec.lowRamAdvice.largestRealistic;
+      }
+      // Otherwise suggest the largest variant that fits with a useful window (≥ 8K, else ≥ 4K, else smallest).
+      pick ||= variants.find((v) => !v.notForThisMachine && usable(v).fits && usable(v).numCtx >= 8192) || variants.find((v) => !v.notForThisMachine && usable(v).fits && usable(v).numCtx >= 4096) || variants[variants.length - 1];
+      const { archHint, lowRamAdvice, ...pub } = rec;
+      return {
+        ...pub, variants, suggestedVariant: pick.model, installed: variants.some((v) => v.installed || v.textOnly?.installed), fitsThisMachine: !!usable(pick).fits,
+        ...(lowRam && lowRamAdvice ? { largestRealisticVariant: largest, suggestTextOnly: !!rec.textOnly?.recommendedOnLowRam, lowRamNote: lowRamAdvice.note } : {}),
+      };
     });
     return {
       machine: { totalMemBytes: sys.totalMem, ramTier: ramTier(sys.totalMem), budgetBytes: budget.budgetBytes, kvCacheType: kv },
       models,
       embedding: RECOMMENDED_EMBEDDING.map((e) => ({ ...e, installed: installed.some((m) => m.model.split(':')[0] === e.model) })),
-      note: 'Sizes are approximate and the fit estimate uses architecture hints until the model is installed.',
+      note: 'Sizes are download sizes as pulled; the fit estimate uses architecture hints until the model is installed, then real measurements.',
     };
   });
 

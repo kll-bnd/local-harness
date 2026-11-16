@@ -34,7 +34,9 @@ export class LLM {
     const options = { temperature };
     if (t.provider.kind === 'ollama') options.num_ctx = t.numCtx;
     if (maxTokens) options.num_predict = maxTokens;
-    let think = t.provider.kind === 'ollama' && t.info.capabilities.includes('thinking') ? false : undefined;
+    // Explicit think:false for every Ollama call: omitted means ON for thinking models, and an internal call with a
+    // small num_predict would then spend its whole budget thinking and return nothing.
+    let think = t.provider.kind === 'ollama' ? false : undefined;
     let fmt = t.provider.kind === 'ollama' ? format : undefined;
     for (let attempt = 0; attempt < 3; attempt++) {
       let text = '';
