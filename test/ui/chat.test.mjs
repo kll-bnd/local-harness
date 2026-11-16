@@ -193,7 +193,7 @@ test('desktop shell: every native menu action is handled; traffic-light zone is 
     await page.goBack(); await page.goBack(); await page.goBack(); await page.goBack(); await page.goBack();
     await page.waitForFunction(() => /#\/chat\/chat_/.test(location.hash));
     await menu('toggle-sidebar'); await page.waitForSelector('.app.sidebar-closed');
-    assert.ok(await page.locator('.main-titlebar').evaluate((el) => parseFloat(getComputedStyle(el).paddingLeft)) >= 80);
+    await page.waitForFunction(() => parseFloat(getComputedStyle(document.querySelector('.main-titlebar')).paddingLeft) >= 80);
     await menu('toggle-sidebar'); await page.waitForSelector('.app:not(.sidebar-closed)');
     await menu('toggle-inspector'); await page.waitForSelector('.app.inspector-open');
     await menu('toggle-inspector'); await page.waitForSelector('.app:not(.inspector-open)');

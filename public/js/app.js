@@ -26,9 +26,9 @@ const currentSummary = () => {
   return m ? (store.get('chats') || []).find((c) => c.id === m.id) || (store.get('archived') || []).find((c) => c.id === m.id) || m.chat : null;
 };
 
-defineAction('new-chat', { title: 'New chat', keys: ['Mod+N', 'Mod+Shift+O'], group: 'Chats', icon: 'compose', run: () => { store.set('pendingChat', null); navigate('/chat'); requestAnimationFrame(() => shell.chatView.composer.focus()); } });
-defineAction('new-incognito-chat', { title: 'New incognito chat', keys: ['Mod+Shift+N'], group: 'Chats', icon: 'incognito', run: () => { store.set('pendingChat', { incognito: true }); navigate('/chat'); shell.chatView.renderIntro(); shell.updateToolbar(); requestAnimationFrame(() => shell.chatView.composer.focus()); } });
-defineAction('search-chats', { title: 'Search chats', keys: ['Mod+Shift+F'], group: 'Chats', icon: 'search', run: () => { shell.toggleSidebar(true); requestAnimationFrame(() => shell.sidebar.focusSearch()); } });
+defineAction('new-chat', { title: 'New chat', keys: ['Mod+N', 'Mod+Shift+O'], group: 'Chats', icon: 'compose', run: () => { store.set('pendingChat', null); navigate('/chat'); shell.focusComposer(); } });
+defineAction('new-incognito-chat', { title: 'New incognito chat', keys: ['Mod+Shift+N'], group: 'Chats', icon: 'incognito', run: () => { store.set('pendingChat', { incognito: true }); navigate('/chat'); shell.chatView.renderIntro(); shell.updateToolbar(); shell.focusComposer(); } });
+defineAction('search-chats', { title: 'Search chats', keys: ['Mod+Shift+F'], group: 'Chats', icon: 'search', run: () => { shell.toggleSidebar(true); shell.sidebar.focusSearch(); } });
 defineAction('command-palette', { title: 'Command palette', keys: ['Mod+K', 'Mod+Shift+P'], group: 'General', icon: 'command', palette: false, run: () => openPalette(shell) });
 defineAction('open-settings', { title: 'Settings', keys: ['Mod+,'], group: 'Go to', icon: 'settings', run: (section) => navigate(`/settings${typeof section === 'string' ? `/${section}` : ''}`) });
 defineAction('open-models', { title: 'Models', keys: ['Mod+Shift+M'], group: 'Go to', icon: 'cube', run: () => navigate('/models') });

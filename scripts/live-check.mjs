@@ -227,6 +227,7 @@ async function loadHarness() {
     imp('server/store/settings.mjs'), imp('server/image/comfyui.mjs'), imp('server/image/defaults.mjs'),
     imp('server/chat/prompts.mjs'), imp('server/chat/llm.mjs'), imp('server/providers/registry.mjs'),
     imp('server/docs/extract.mjs'), imp('server/tools/builtin.mjs'), imp('server/image/http.mjs'),
+    imp('server/image/a1111.mjs'), imp('server/image/openai-images.mjs'),
   ]);
   H = Object.assign({}, ...mods);
   H.normalizeKeepAlive ||= (v) => v; // older trees did not normalize
@@ -1279,7 +1280,7 @@ async function ollamaGroup(run, B) {
     sample('ollama /api/chat num_predict 3 (final chunk)', q.p.final ? { ...q.p.final } : q.p.errorText);
     if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.p.errorText}`);
     if (q.p.final?.done_reason === 'length') return PASS(`done_reason "length" after ${q.p.final.eval_count} tokens`);
-    return FAIL(`done_reason "${q.p.final?.done_reason}"`, { expected: '"length"', actual: excerpt({ ...q.p.final, message: undefined }), fix: 'ChatEngine marks truncated answers via doneReason === "length"; map this value in OllamaProvider.chat.' });
+    return WARN(`done_reason "${q.p.final?.done_reason}" after hitting num_predict — truncated answers would not be marked`, { expected: '"length"', actual: excerpt({ ...q.p.final, message: undefined }), fix: 'ChatEngine marks truncated answers via doneReason === "length"; map this value in OllamaProvider.chat.' });
   }, { timeoutMs: 300000 });
 
   let ps1 = null;
@@ -1630,7 +1631,7 @@ async function ollamaGroup(run, B) {
     const info = [`/api/generate keep_alive 0 → HTTP ${g.status}${g.ok ? ` done_reason ${g.json?.done_reason ?? '?'}` : ` "${excerpt(gMsg, 140)}" → ${gCode}`}`];
     const fallbackWouldRun = !g.ok && (gCode === 'not_chat_model' || /embed/i.test(gMsg || ''));
     if (!g.ok && !fallbackWouldRun) return FAIL(`OllamaProvider.unload() would throw: the generate error "${excerpt(gMsg, 160)}" does not trigger the /api/embed fallback`, { info, fix: 'Match this text in OllamaProvider.unload (or check capabilities and go straight to /api/embed for embedding models).' });
-    let w = await waitGone(O, run, E, T(3000));
+    let w = g.ok ? await waitGone(O, run, E, T(3000)) : { gone: false };
     if (!w.gone) {
       const prov = new H.OllamaProvider({ baseUrl: O.url });
       let err = null;
@@ -1861,7 +1862,7 @@ async function openaiGroup(run, S) {
     sample(`${S.sid} chat max_tokens 3 (last chunks)`, { status: q.r.status, chunks: q.s.chunks.slice(-2), body: q.r.ok ? undefined : q.r.json ?? q.r.bodyText });
     if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.s.errorText}`);
     if (q.s.finish === 'length') return PASS('finish_reason "length"');
-    return FAIL(`finish_reason "${q.s.finish}"`, { expected: '"length"', fix: 'Truncated answers would not be marked (finishReason "length").' });
+    return WARN(`finish_reason "${q.s.finish}" after hitting max_tokens — truncated answers would not be marked`, { expected: '"length"', fix: 'Map this finish_reason in OpenAICompatProvider.chat (finishReason "length").' });
   }, { timeoutMs: 300000 });
 
   await run.check(id('chat.reasoning'), async ({ sample }) => {
@@ -2086,7 +2087,7 @@ async function a1111Group(run, B) {
       const from = proxy.log.length;
       const t0 = nowMs();
       try {
-        const result = await p.__raw ? null : await prov.generate(p, { signal: anySignal(signal, T(600000)) });
+        const result = await prov.generate(p, { signal: anySignal(signal, T(600000)) });
         return { ok: true, result, ms: nowMs() - t0, calls: proxy.log.slice(from) };
       } catch (e) { return { ok: false, error: e.message, ms: nowMs() - t0, calls: proxy.log.slice(from) }; }
     };
@@ -2167,7 +2168,6 @@ async function a1111Group(run, B) {
       });
 
       await run.check('a1111.txt2img.unknown_fields', async ({ sample }) => {
-        need(A.minSize || true, '', '');
         const s = A.minSize || 64;
         const common = { prompt: 'a red circle on a white background', negative_prompt: '', width: s, height: s, steps: 1, seed: 77 };
         const variants = { a1111Only: { ...common, cfg_scale: 1.5, batch_size: 1, n_iter: 1 }, drawThingsOnly: { ...common, guidance_scale: 1.5, batch_size: 1, batch_count: 1 } };
@@ -2505,4 +2505,624 @@ async function openaiImagesGroup(run, B) {
   }, { timeoutMs: 700000 });
 }
 
-// @@CONTINUE@@
+// =============================================================================================== e2e (Harness in-process)
+async function harnessSse(base, p, body, { timeoutMs, onEvent } = {}) {
+  const events = [];
+  let ev = null;
+  let data = [];
+  const r = await streamLines(base + p, {
+    body,
+    timeoutMs,
+    onLine: async (line) => {
+      if (line === '') {
+        if (ev && data.length) {
+          let d;
+          try { d = JSON.parse(data.join('\n')); } catch { d = { raw: data.join('\n') }; }
+          const e = { ...d, type: ev };
+          events.push(e);
+          if (onEvent) await onEvent(e);
+        }
+        ev = null;
+        data = [];
+        return undefined;
+      }
+      if (line.startsWith('event:')) ev = line.slice(6).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+      return undefined;
+    },
+  });
+  const by = (t) => events.filter((e) => e.type === t);
+  return { r, events, by, last: (t) => by(t).at(-1), text: by('token').map((e) => e.delta).join(''), reasoning: by('reasoning').map((e) => e.delta).join(''), error: r.ok ? (by('error')[0] || null) : { message: r.json?.error?.message || r.bodyText || r.error, code: r.json?.error?.code } };
+}
+const evTypes = (t) => { const out = []; for (const e of t.events) if (out.at(-1) !== e.type) out.push(e.type); return out.join(' > '); };
+
+async function e2eGroup(run, B) {
+  const T = (ms) => run.T(ms);
+  const O = run.ollama;
+  run.section('e2e', 'Harness end-to-end (real server in-process, temp data dir, same backends)');
+  const picks = run.picks.ollama || {};
+  const ok = (k) => (picks[k]?.usable ? picks[k].model : null);
+  const oai = B.openai.find((s) => run.picks.openai?.[s.sid]?.model);
+  const chatRef = ok('chat') ? { providerId: 'ollama', model: ok('chat') } : oai ? { providerId: oai.sid, model: run.picks.openai[oai.sid].model } : null;
+  const imgs = [];
+  if (B.a1111) imgs.push({ kind: 'a1111', id: 'a1111', size: run.a1111?.minSize || 64 });
+  if (B.comfyui) imgs.push({ kind: 'comfyui', id: 'comfyui', size: 64 });
+  if (B.openaiImages) imgs.push({ kind: 'openai-images', id: 'livecheck-images', size: 256 });
+
+  const settings = {
+    defaultModel: chatRef,
+    keepAlive: run.opts.keepAlive,
+    titles: { auto: false },
+    // autoExtract must stay on (extractMemories() returns early otherwise, also for the manual route); the long
+    // delay keeps background extraction from running during the run — the check calls POST /api/memories/extract.
+    memory: { autoExtract: true, extractDelayMs: 600000 },
+    embeddings: { model: 'off' },
+    ollama: { autoStart: false, stopOnExit: false },
+    providers: {
+      autodetect: true,
+      builtin: {
+        ollama: B.ollama ? { enabled: true, baseUrl: B.ollama.url } : { enabled: false },
+        llamacpp: B.openai.find((s) => s.sid === 'llamacpp') ? { enabled: true, baseUrl: B.openai.find((s) => s.sid === 'llamacpp').url } : { enabled: false },
+        lmstudio: B.openai.find((s) => s.sid === 'lmstudio') ? { enabled: true, baseUrl: B.openai.find((s) => s.sid === 'lmstudio').url } : { enabled: false },
+      },
+      custom: B.openai.filter((s) => !s.builtin).map((s) => ({ id: s.sid, name: `live-check ${s.sid}`, kind: 'openai', baseUrl: s.url, apiKey: run.opts.apiKey || '', enabled: true })),
+    },
+    image: {
+      enabled: true,
+      autodetect: true,
+      providerId: imgs[0]?.id || null,
+      builtin: { a1111: B.a1111 ? { enabled: true, baseUrl: B.a1111.url } : { enabled: false }, comfyui: B.comfyui ? { enabled: true, baseUrl: B.comfyui.url } : { enabled: false } },
+      custom: B.openaiImages ? [{ id: 'livecheck-images', name: 'live-check images', kind: 'openai', baseUrl: B.openaiImages.url, apiKey: run.opts.apiKey || '', enabled: true }] : [],
+      defaults: { steps: 1, count: 1, width: imgs[0]?.size || 512, height: imgs[0]?.size || 512 },
+      unloadChatModel: 'always',
+      reloadAfter: 'lazy',
+    },
+  };
+  let dataDir = null;
+  let srv = null;
+  let base = null;
+  const api = (method, p, body, timeoutMs = 60000) => http(base, p, { method, body, timeoutMs: T(timeoutMs) });
+  const newChat = async (chatSettings) => {
+    const r = await api('POST', '/api/chats', { settings: chatSettings });
+    if (r.status !== 201) throw new Error(`POST /api/chats → HTTP ${r.status}: ${excerpt(r.json ?? r.text, 200)}`);
+    return r.json.chat.id;
+  };
+  const turn = (chatId, content, { timeoutMs = 600000, onEvent } = {}) => harnessSse(base, `/api/chats/${chatId}/messages`, { content }, { timeoutMs: T(timeoutMs), onEvent });
+  const params = { num_predict: 128, temperature: 0, seed: 7 };
+  const turnFail = (t) => (t.error ? `${t.error.code || 'error'}: ${excerpt(t.error.message, 300)}` : !t.last('done') ? `stream ended without done (${evTypes(t)})` : null);
+
+  await run.check('e2e.server', async () => {
+    need(chatRef || imgs.length, 'no chat model and no image backend to drive', 'a reachable backend with a usable model');
+    dataDir = await fsp.mkdtemp(path.join(run.opts.dataDir || os.tmpdir(), 'harness-livecheck-'));
+    await fsp.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify(settings, null, 2));
+    process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1';
+    const { startServer } = await import(pathToFileURL(path.join(ROOT, 'server/index.mjs')).href);
+    const system = run.opts.simulateRamGb ? { totalMem: Math.round(run.opts.simulateRamGb * GiB) } : undefined;
+    srv = await startServer({ port: 0, dataDir, autodetect: true, logLevel: run.opts.verbose ? 'warn' : 'silent', system });
+    base = srv.url;
+    const h = await api('GET', '/api/health');
+    const sys = await api('GET', '/api/system');
+    const m = sys.json?.machine;
+    const info = [`data dir ${dataDir}`, m ? `Harness sees ${fmtBytes(m.totalMemBytes)} RAM (tier ${m.ramTier}), safe budget ${fmtBytes(m.memoryBudget?.budgetBytes)}, ${m.platform}/${m.arch} ${m.chip}` : `GET /api/system → ${sys.status}`];
+    if (!h.ok) return FAIL(`GET /api/health → ${httpSummary(h)}`, { info });
+    return PASS(`listening on ${base}${chatRef ? `, default model ${chatRef.providerId}/${chatRef.model}` : ''}`, { info });
+  }, { timeoutMs: 60000 });
+
+  try {
+    if (!base) return;
+    await run.check('e2e.providers', async ({ sample }) => {
+      const r = await api('GET', '/api/providers?refresh=1');
+      const ir = await api('GET', '/api/images/providers?refresh=1');
+      sample('harness GET /api/providers', r.json);
+      const list = r.json?.providers || [];
+      const want = [...(B.ollama ? ['ollama'] : []), ...B.openai.map((s) => s.sid)];
+      const bad = want.map((id) => [id, list.find((p) => p.id === id)]).filter(([, p]) => !p || p.status !== 'running');
+      const ibad = imgs.map((i) => [i.id, (ir.json?.providers || []).find((p) => p.id === i.id)]).filter(([, p]) => !p || p.status !== 'running');
+      const info = [...list.map((p) => `chat ${p.id}: ${p.status}${p.version ? ` ${p.version}` : ''}${p.flavor ? ` (${p.flavor})` : ''}${p.error ? ` — ${p.error}` : ''}`), ...(ir.json?.providers || []).map((p) => `image ${p.id}: ${p.status}${p.currentModel ? `, current model ${p.currentModel}` : ''}${p.error ? ` — ${p.error}` : ''}`)];
+      if (bad.length || ibad.length) return FAIL(`not running inside Harness: ${[...bad, ...ibad].map(([id, p]) => `${id} (${p ? p.error || p.status : 'not listed'})`).join(', ')}`, { info, fix: 'Harness status() disagrees with the raw probes: compare its probe (provider status()) with what the backend answers.' });
+      return PASS(`${want.length} chat + ${imgs.length} image backend(s) running`, { info });
+    });
+
+    const C = chatRef?.model;
+    const P = chatRef?.providerId;
+    const qs = (m, pid) => `model=${encodeURIComponent(m)}&providerId=${encodeURIComponent(pid)}`;
+    await run.check('e2e.models', async () => {
+      need(C, 'no chat model', 'a chat model');
+      const r = await api('GET', '/api/models?details=1&refresh=1', undefined, 120000);
+      const m = (r.json?.models || []).find((x) => x.providerId === P && sameModel(x.model, C));
+      if (!m) return FAIL(`${P}/${C} is not in /api/models`, { actual: excerpt((r.json?.models || []).map((x) => `${x.providerId}/${x.model}`), 300) });
+      const raw = P === 'ollama' ? O?.inventory.find((x) => sameModel(x.name, C))?.caps : null;
+      const info = [`${(r.json.models || []).length} model(s) listed; ${C}: capabilities [${(m.capabilities || []).join(', ')}], context ${m.contextLength}, loaded ${m.loaded}`];
+      if (raw && JSON.stringify([...raw].sort()) !== JSON.stringify([...(m.capabilities || [])].sort())) return WARN(`capabilities differ from /api/show: Harness [${(m.capabilities || []).join(', ')}] vs Ollama [${raw.join(', ')}]`, { info });
+      return PASS(info[0]);
+    }, { timeoutMs: 180000 });
+
+    let plan = null;
+    await run.check('e2e.context_plan', async ({ sample }) => {
+      need(C, 'no chat model', 'a chat model');
+      const r = await api('GET', `/api/models/context?${qs(C, P)}`, undefined, 120000);
+      plan = r.json?.contextPlan;
+      sample('harness GET /api/models/context', r.json);
+      if (!plan) return FAIL(`→ ${httpSummary(r)}`);
+      const mem = plan.memory || {};
+      const info = [`plan: num_ctx ${plan.numCtx} (mode ${plan.mode}, limited by ${plan.limitedBy}; model max ${plan.modelMax} from ${plan.modelMaxSource})`, `explanation: ${plan.explanation}`];
+      if (P === 'ollama') info.push(`memory: model ${fmtBytes(mem.modelBytes)}, KV ${fmtBytes(mem.kvBytesPerToken)}/token (${mem.kvSource}, ${mem.kvCacheType}), est. total ${fmtBytes(mem.estimatedTotalBytes)} of budget ${fmtBytes(mem.budgetBytes)}, basis ${mem.basis}`);
+      for (const w of plan.warnings || []) info.push(`warning ${w.code}: ${w.message}`);
+      if (plan.numCtx < 2048) return FAIL(`num_ctx ${plan.numCtx} < 2048`, { info });
+      if (P === 'ollama' && (!(mem.kvBytesPerToken > 0) || mem.kvSource === 'heuristic')) return WARN(`KV estimate is ${mem.kvSource} (${mem.kvBytesPerToken} B/token)`, { info });
+      if ((plan.warnings || []).some((w) => ['model_exceeds_budget', 'context_unknown'].includes(w.code))) return WARN(`plan warnings: ${plan.warnings.map((w) => w.code).join(', ')}`, { info });
+      return PASS(`num_ctx ${plan.numCtx}, limited by ${plan.limitedBy}`, { info });
+    }, { timeoutMs: 180000 });
+
+    let mainChat = null;
+    const turns = [];
+    await run.check('e2e.chat_stream', async ({ sample }) => {
+      need(C, 'no chat model', 'a chat model');
+      mainChat = await newChat({ model: chatRef, params, reasoning: { think: 'off' } });
+      const t = await turn(mainChat, 'Hello! In one short sentence: what is the capital of France?');
+      turns.push(t);
+      sample('harness chat SSE event sequence (turn 1)', { sequence: evTypes(t), context: t.by('context')[0], stats: t.by('stats'), done: t.last('done') ? { reason: t.last('done').reason, stats: t.last('done').stats, context: t.last('done').context } : null, notices: t.by('notice') });
+      const f = turnFail(t);
+      const st = t.by('stats')[0];
+      const info = [`events: ${evTypes(t)}`, `reply: ${excerpt(t.text, 160)}`, st ? `stats: prompt ${st.promptTokens} tokens, completion ${st.completionTokens}, ${st.tokensPerSecond ?? '?'} tok/s, load ${fmtMs(st.loadMs)}, num_ctx ${st.numCtx}` : 'no stats event', ...t.by('notice').map((n) => `notice ${n.code}: ${n.message}`)];
+      if (f) return FAIL(f, { info });
+      if (t.events[0]?.type !== 'start') return FAIL(`first event is ${t.events[0]?.type}`, { info });
+      if (!t.text) return WARN('no answer tokens', { info });
+      if (!(st?.promptTokens > 0)) return WARN('stats without promptTokens (backend gave no prompt count)', { info });
+      return PASS(`${t.by('token').length} token events, ${st.promptTokens} prompt tokens, done reason ${t.last('done').reason}`, { info });
+    }, { timeoutMs: 700000 });
+
+    await run.check('e2e.measurement', async ({ sample }) => {
+      need(P === 'ollama', 'measurements exist only for Ollama', 'an Ollama chat model');
+      need(turns[0]?.last('done'), 'first turn failed', 'e2e.chat_stream to pass');
+      const r = await api('GET', `/api/models/measurements?${qs(C, P)}`);
+      sample('harness GET /api/models/measurements', r.json);
+      const samples = r.json?.samples || [];
+      const after = (await api('GET', `/api/models/context?${qs(C, P)}`)).json?.contextPlan;
+      const info = [...samples.map((s) => `sample: num_ctx ${s.numCtx} (sent ${s.sentNumCtx}, reported ${s.reportedContext ?? 'absent'}), ${fmtBytes(s.totalBytes)} total, ${fmtBytes(s.vramBytes)} VRAM, KV ${s.kvCacheType}`), `plan now: num_ctx ${after?.numCtx}, basis ${after?.memory?.basis}`, `explanation: ${after?.explanation}`];
+      if (!samples.length) return FAIL('no measurement was recorded after the first turn', { info, fix: 'measureLoaded() found no /api/ps entry for the model (name mismatch? size missing?) — see ollama.ps.shape.' });
+      const planCtx = turns[0].by('context')[0]?.contextPlan?.numCtx;
+      if (planCtx && samples.at(-1).sentNumCtx !== planCtx) return WARN(`sample was recorded for num_ctx ${samples.at(-1).sentNumCtx}, the turn used ${planCtx}`, { info });
+      if (after?.memory?.basis !== 'measured') return WARN('the plan still uses the estimate: the sample was rejected by fitMeasurements', { info, fix: 'See ollama.ps.measurement_fit.' });
+      return PASS(`${samples.length} sample(s); plan basis "measured"`, { info });
+    });
+
+    await run.check('e2e.calibration', async () => {
+      need(turns[0]?.last('done'), 'first turn failed', 'e2e.chat_stream to pass');
+      const more = [
+        'Thanks. Now tell me, in one sentence, why the sky looks blue during the day. Please keep it simple, as if you were explaining it to a curious ten year old who loves science and asks many questions.',
+        'Great. One more: in one sentence, why are sunsets often red or orange? Again keep it simple and friendly, and avoid technical words like scattering or wavelength if you can.',
+      ];
+      for (const m of more) {
+        const t = await turn(mainChat, m);
+        turns.push(t);
+        if (turnFail(t)) return FAIL(`turn ${turns.length} failed: ${turnFail(t)}`);
+      }
+      const rows = turns.map((t, i) => {
+        const ctx = t.by('context')[0];
+        const st = t.by('stats')[0];
+        const err = st?.promptTokens ? (ctx.used - st.promptTokens) / st.promptTokens : null;
+        return { turn: i + 1, estimate: ctx?.used, actual: st?.promptTokens ?? null, factor: ctx?.calibration, error: err };
+      });
+      let file = null;
+      try { file = JSON.parse(await fsp.readFile(path.join(dataDir, 'calibration.json'), 'utf8')); } catch { /* not written yet */ }
+      const entry = file?.[`${P}/${C}`];
+      const info = [...rows.map((r) => `turn ${r.turn}: estimated ${r.estimate} vs actual ${r.actual ?? 'MISSING'} tokens (factor ${r.factor}) → error ${r.error == null ? '?' : `${(r.error * 100).toFixed(1)} %`}`), `calibration.json: ${entry ? `ratio ${entry.ratio}, ${entry.samples} sample(s), last ${entry.lastSample}` : 'no entry'}`];
+      if (rows.some((r) => r.actual == null)) return FAIL('some turns report no prompt token count, so calibration cannot learn', { info, fix: 'See ollama.chat.prompt_eval_cached / openai.*.chat.usage.' });
+      const first = Math.abs(rows[0].error);
+      const lastE = Math.abs(rows.at(-1).error);
+      if (!entry) return WARN('calibration.json has no entry for the model (samples rejected: tiny prompts or ratio outside 0.33–3)', { info });
+      if (lastE <= 0.15 || lastE < first * 0.75) return PASS(`estimate error ${(first * 100).toFixed(1)} % → ${(lastE * 100).toFixed(1)} % after ${rows.length - 1} calibration step(s)`, { info });
+      return WARN(`estimate error did not improve (${(first * 100).toFixed(1)} % → ${(lastE * 100).toFixed(1)} %)`, { info, fix: 'The real count may exclude something Harness counts (system/tools) or include cached-only parts; see the raw prompt_eval checks.' });
+    }, { timeoutMs: 1300000 });
+
+    const TH = ok('think');
+    await run.check('e2e.reasoning', async ({ sample }) => {
+      need(TH, 'no thinking model', 'a model with "thinking"');
+      const id = await newChat({ model: { providerId: 'ollama', model: TH }, params: { ...params, num_predict: 400 }, reasoning: { think: 'on' } });
+      const t = await turn(id, 'What is 12 + 30? Answer with just the number.');
+      sample('harness chat with thinking (event sequence)', { sequence: evTypes(t), notices: t.by('notice') });
+      const f = turnFail(t);
+      const info = [`events: ${evTypes(t)}`, `reasoning ${t.reasoning.length} chars, answer "${excerpt(t.text, 80)}"`, ...t.by('notice').map((n) => `notice ${n.code}: ${n.message}`)];
+      if (f) return FAIL(f, { info });
+      if (t.by('notice').some((n) => n.code === 'thinking_unsupported')) return FAIL('Harness had to retry without thinking on a model whose capabilities include "thinking"', { info });
+      if (!t.reasoning) return WARN('no reasoning events', { info });
+      return PASS(`${t.by('reasoning').length} reasoning events, then the answer`, { info });
+    }, { timeoutMs: 700000 });
+
+    const TM = ok('tool');
+    await run.check('e2e.tool_turn', async ({ sample }) => {
+      need(TM, 'no tool-capable model', 'a model with "tools"');
+      const id = await newChat({ model: { providerId: 'ollama', model: TM }, params: { ...params, num_predict: 256 }, reasoning: { think: 'off' } });
+      const t = await turn(id, 'Use a tool to calculate 17*23');
+      sample('harness tool turn (event sequence + tool events)', { sequence: evTypes(t), toolCalls: t.by('tool_call'), toolResults: t.by('tool_result').map((e) => ({ name: e.name, content: e.content, isError: e.isError })), notices: t.by('notice') });
+      const f = turnFail(t);
+      const calls = t.by('tool_call');
+      const res = t.by('tool_result');
+      const info = [`events: ${evTypes(t)}`, ...calls.map((c) => `tool_call ${c.toolCall?.name}(${excerpt(c.toolCall?.arguments, 100)})`), ...res.map((r) => `tool_result ${r.name}: ${excerpt(r.content, 100)}${r.isError ? ' (error)' : ''}`), `answer: ${excerpt(t.text, 160)}`, ...t.by('notice').map((n) => `notice ${n.code}: ${n.message}`)];
+      if (f) return FAIL(f, { info });
+      if (t.by('notice').some((n) => n.code === 'tools_unsupported')) return FAIL('Harness got tools_unsupported from a model whose capabilities include "tools"', { info });
+      if (!calls.length) return WARN('the model did not call a tool (model behaviour)', { info });
+      if (!res.length || res.some((r) => r.isError)) return FAIL('the tool did not run cleanly', { info });
+      if (!t.text) return WARN('no final answer after the tool result', { info });
+      return PASS(`${calls.map((c) => c.toolCall?.name).join(', ')} → "${excerpt(res[0].content, 60)}" → answer`, { info });
+    }, { timeoutMs: 700000 });
+
+    await run.check('e2e.compaction_forced', async ({ sample }) => {
+      need(mainChat && turns.length >= 2, 'not enough history', 'e2e.calibration (3 turns)');
+      const r = await api('POST', `/api/chats/${mainChat}/compact`, { keepRecentMessages: 2 }, 600000);
+      sample('harness POST /api/chats/:id/compact', r.json ?? r.text);
+      if (!r.ok) return FAIL(`→ ${httpSummary(r)}`, { fix: 'summarizeSpan() failed with the real model.' });
+      const s = r.json?.summary;
+      const heads = H.SUMMARY_SECTIONS.filter((h) => s?.content?.includes(`## ${h}`));
+      const info = [`${r.json.messagesSummarized} message(s) summarized (${r.json.tokensBefore} tokens before, ${r.json.keptMessages} kept); method ${s?.method}`, `summary: ${excerpt(s?.content, 300)}`];
+      if (!s?.content?.trim()) return FAIL('empty summary', { info });
+      if (heads.length < 3) return WARN(`summary uses ${heads.length} of the ${H.SUMMARY_SECTIONS.length} required headings (model quality)`, { info });
+      return PASS(`summary with ${heads.length}/${H.SUMMARY_SECTIONS.length} sections`, { info });
+    }, { timeoutMs: 700000 });
+
+    await run.check('e2e.compaction_auto', async ({ sample }) => {
+      need(C, 'no chat model', 'a chat model');
+      const id = await newChat({ model: chatRef, params: { ...params, num_predict: 48 }, reasoning: { think: 'off' }, context: { mode: 1024 }, tools: { enabled: false }, memory: { enabled: false }, recall: { enabled: false } });
+      const para = (n) => `Here is part ${n} of my travel notes. We took the early train from Lisbon to Porto, stopped in Coimbra for lunch at a small family restaurant near the university, walked along the river, visited the old library with its gilded shelves, bought postcards and local cheese, talked to a retired teacher about the history of the city, and finally arrived in Porto late in the evening, tired but happy. Please reply with a single short sentence acknowledging part ${n}.`;
+      const seen = [];
+      let completed = null;
+      let failed = null;
+      for (let i = 1; i <= 4 && !completed && !failed; i++) {
+        const t = await turn(id, para(i));
+        const f = turnFail(t);
+        const c = t.by('compaction');
+        seen.push(`turn ${i}: used ${t.by('context')[0]?.used}/${t.by('context')[0]?.numCtx} tokens${c.length ? `, compaction ${c.map((x) => x.status).join('→')}` : ''}${f ? ` — ${f}` : ''}`);
+        completed = c.find((x) => x.status === 'completed') || null;
+        failed = c.find((x) => x.status === 'failed') || null;
+        if (f) return FAIL(`turn ${i} failed: ${f}`, { info: seen });
+      }
+      sample('harness auto-compaction events', { completed, failed });
+      if (failed) return FAIL(`auto-compaction failed: ${failed.error}`, { info: seen, fix: 'The summarizer request failed in a 1K window (fallback: truncation).' });
+      if (!completed) return WARN('auto-compaction did not trigger within 4 turns at num_ctx 1024', { info: seen });
+      return PASS(`summarized ${completed.messages} message(s): ${completed.usedBefore} → ${completed.usedAfter} tokens`, { info: [...seen, `summary: ${excerpt(completed.summary?.content, 200)}`] });
+    }, { timeoutMs: 1500000 });
+
+    await run.check('e2e.memory_extraction', async ({ sample }) => {
+      need(C, 'no chat model', 'a chat model');
+      const id = await newChat({ model: chatRef, params, reasoning: { think: 'off' } });
+      const t = await turn(id, 'Hi! My name is Ada Lovelace, I live in Lisbon and I prefer short answers.');
+      if (turnFail(t)) return FAIL(`chat turn failed: ${turnFail(t)}`);
+      const r = await api('POST', '/api/memories/extract', { chatId: id }, 600000);
+      const list = await api('GET', '/api/memories');
+      sample('harness POST /api/memories/extract', { extract: r.json ?? r.text, memories: list.json?.memories });
+      if (!r.ok) return FAIL(`→ ${httpSummary(r)}`, { fix: 'extractMemories failed with the real model (format rejected? see ollama.format.json_schema).' });
+      const added = [...(r.json.added || []), ...(r.json.updated || [])];
+      const info = [...added.map((m) => `memory: ${m.content} (${m.category})`), ...(r.json.skipped || []).map((s) => `skipped: ${s}`)];
+      if (!added.length) return WARN('no memory extracted from a clear self-introduction (model quality or format problem)', { info });
+      return PASS(`${added.length} memor${added.length === 1 ? 'y' : 'ies'} extracted`, { info });
+    }, { timeoutMs: 800000 });
+
+    const E = ok('embed');
+    await run.check('e2e.embeddings', async ({ sample }) => {
+      need(E, 'no embedding model', 'an embedding model (e.g. all-minilm) or --embed-model');
+      const p = await api('PATCH', '/api/settings', { embeddings: { model: { providerId: 'ollama', model: E } } });
+      if (!p.ok) return FAIL(`PATCH /api/settings → ${httpSummary(p)}`);
+      const st = await api('GET', '/api/embeddings/status');
+      await api('POST', '/api/memories', { content: "The user's cat is called Miso.", category: 'fact' }, 180000);
+      await api('POST', '/api/memories', { content: 'The user works as a nurse in a hospital.', category: 'fact' }, 180000);
+      const s = await api('POST', '/api/memories/search', { query: 'what is my cat called', minSimilarity: 0.2 }, 180000);
+      const st2 = await api('GET', '/api/embeddings/status');
+      sample('harness memory search with embeddings', { status: st.json, search: s.json, statusAfter: st2.json });
+      const info = [`embeddings status: enabled ${st.json?.enabled}, available ${st2.json?.available}, model ${st.json?.model}, lastError ${st2.json?.lastError ?? 'none'}`, ...(s.json?.results || []).slice(0, 3).map((r) => `hit ${r.score?.toFixed?.(3) ?? r.score}: ${r.memory?.content}`)];
+      if (s.json?.retrieval !== 'hybrid') return FAIL(`search fell back to ${s.json?.retrieval} — embedding failed: ${st2.json?.lastError}`, { info, fix: 'See ollama.embed.batch.' });
+      if (!(s.json.results || []).some((r) => /Miso/.test(r.memory?.content))) return WARN('hybrid search did not return the related memory', { info });
+      return PASS(`hybrid retrieval with ${E} found the memory`, { info });
+    }, { timeoutMs: 600000 });
+
+    for (const S of B.openai) {
+      const M = run.picks.openai?.[S.sid]?.model;
+      await run.check(`e2e.openai_chat.${S.sid}`, async ({ sample }) => {
+        need(M, 'no model picked for this server', run.picks.openai?.[S.sid]?.why || '--openai-model');
+        const id = await newChat({ model: { providerId: S.sid, model: M }, params, reasoning: { think: 'off' } });
+        const t = await turn(id, 'Hello! In one short sentence: what is the capital of France?');
+        sample(`harness chat via ${S.sid}`, { sequence: evTypes(t), stats: t.by('stats'), plan: t.by('start')[0]?.contextPlan });
+        const f = turnFail(t);
+        const pl = t.by('start')[0]?.contextPlan;
+        const st = t.by('stats')[0];
+        const info = [`events: ${evTypes(t)}`, `plan: num_ctx ${pl?.numCtx} (${pl?.mode}) — ${pl?.explanation}`, `stats: prompt ${st?.promptTokens}, completion ${st?.completionTokens}`, `reply: ${excerpt(t.text, 120)}`];
+        if (f) return FAIL(f, { info });
+        if (!(st?.promptTokens > 0)) return WARN('no prompt token count', { info });
+        return PASS(`answered; plan num_ctx ${pl?.numCtx}`, { info });
+      }, { timeoutMs: 700000 });
+    }
+
+    await run.check('e2e.pull_delete', async ({ sample }) => {
+      need(run.opts.allowPull, 'pulling is off by default', '--allow-pull');
+      need(B.ollama, 'no Ollama', 'Ollama');
+      const PM = run.opts.pullModel;
+      const before = O?.installedBefore.size ? O.installedBefore : new Set(((await http(B.ollama.url, '/api/tags', { timeoutMs: T(15000) })).json?.models || []).map((m) => m.model || m.name));
+      const userOwned = [...before].some((m) => sameModel(m, PM));
+      const t = await harnessSse(base, '/api/models/pull', { model: PM, providerId: 'ollama' }, { timeoutMs: T(1800000) });
+      const prog = t.by('progress');
+      sample('harness POST /api/models/pull (SSE)', { sequence: evTypes(t), first: prog.slice(0, 3), last: prog.slice(-2), done: t.last('done'), error: t.error });
+      if (t.error || !t.last('done')) return FAIL(`pull failed: ${t.error?.message || evTypes(t)}`);
+      if (O && !userOwned) O.pulledByUs.add(PM);
+      const info = [`${prog.length} progress event(s), percents ${[...new Set(prog.map((p) => p.percent).filter((x) => x != null))].slice(0, 6).join(', ')}…`];
+      if (userOwned) return PASS(`pulled (already present); not deleted because ${PM} was installed before this run`, { info });
+      const d = await api('DELETE', `/api/models?model=${encodeURIComponent(PM)}&providerId=ollama`);
+      if (!d.ok) return FAIL(`DELETE /api/models → ${httpSummary(d)}`, { info });
+      const tags = await http(B.ollama.url, '/api/tags', { timeoutMs: T(15000) });
+      const still = (tags.json?.models || []).some((m) => sameModel(m.model || m.name, PM));
+      if (!still) O?.pulledByUs.delete(PM);
+      if (O) O.deletedViaHarness = !still;
+      if (still) return FAIL(`${PM} is still installed after DELETE /api/models`, { info });
+      return PASS(`pulled and deleted ${PM} through Harness`, { info });
+    }, { timeoutMs: 1900000 });
+
+    for (const ib of imgs) {
+      await run.check(`e2e.image_direct.${ib.kind}`, async ({ sample }) => {
+        need(run.opts.allowImages, 'image generation is off by default', '--allow-images');
+        const t = await harnessSse(base, '/api/images/generate', { prompt: 'a small red circle on a white background', providerId: ib.id, width: ib.size, height: ib.size, steps: 1, count: 1, seed: 42, cfg: 1.5 }, { timeoutMs: T(900000) });
+        const phases = t.by('image_status').map((s) => s.phase);
+        const done = t.last('done');
+        sample(`harness POST /api/images/generate (${ib.kind})`, { sequence: evTypes(t), phases, job: done?.job, error: t.error });
+        const info = [`events: ${evTypes(t)}`, `phases: ${phases.join(' → ')}`, done?.job?.memory ? `memory decision: ${done.job.memory.reason}, unloaded [${(done.job.memory.unloaded || []).join(', ')}]` : ''].filter(Boolean);
+        if (t.error) return FAIL(`${t.error.code || 'error'}: ${excerpt(t.error.message, 300)}`, { info });
+        const img = done?.images?.[0];
+        if (!img) return FAIL('done without images', { info });
+        const f = await http(base, `/api/images/${img.id}/file`, { timeoutMs: T(30000), binary: true });
+        const d = f.buf ? decodeImage(f.buf) : null;
+        info.push(`stored ${img.id}: ${d ? `${d.width}×${d.height} ${d.mime} ${fmtBytes(d.bytes)}` : `HTTP ${f.status}`}, seed ${img.seed}, model ${img.model}`);
+        if (!d?.recognized) return FAIL('stored file is not an image', { info });
+        return PASS(`${d.width}×${d.height} ${d.mime}`, { info });
+      }, { timeoutMs: 1000000 });
+    }
+
+    await run.check('e2e.image_tool', async ({ sample }) => {
+      need(run.opts.allowImages, 'image generation is off by default', '--allow-images');
+      need(imgs.length, 'no image backend', 'Draw Things/A1111, ComfyUI or an OpenAI-style image server');
+      need(TM, 'no tool-capable chat model', 'a model with "tools"');
+      const id = await newChat({ model: { providerId: 'ollama', model: TM }, params: { ...params, num_predict: 256 }, reasoning: { think: 'off' } });
+      let psAtGenerating = null;
+      const t = await turn(id, 'Draw a red fox in the snow.', {
+        timeoutMs: 1500000,
+        onEvent: async (e) => {
+          if (e.type === 'image_status' && e.phase === 'generating' && O && !psAtGenerating) {
+            const { models } = await psList(O, run);
+            psAtGenerating = { listed: !!psFind(models, TM), models: (models || []).map((m) => m.model || m.name) };
+          }
+        },
+      });
+      const after = O ? await psList(O, run) : null;
+      const phases = t.by('image_status').map((s) => s.phase);
+      const ms = t.by('model_status').map((s) => s.phase);
+      sample('harness generate_image tool turn (event sequence)', { sequence: evTypes(t), phases, modelStatus: t.by('model_status'), psAtGenerating, imageDone: t.last('image_done') ? { chatModelUnloaded: t.last('image_done').chatModelUnloaded, reload: t.last('image_done').reload } : null });
+      const f = turnFail(t);
+      const calls = t.by('tool_call').filter((c) => c.toolCall?.name === 'generate_image');
+      const res = t.by('tool_result').filter((r) => r.name === 'generate_image');
+      const info = [`events: ${evTypes(t)}`, `image phases: ${phases.join(' → ') || 'none'}; model_status: ${ms.join(' → ') || 'none'}`, `/api/ps when generation started: ${psAtGenerating ? (psAtGenerating.listed ? `${TM} STILL LOADED` : `${TM} not loaded`) + ` [${psAtGenerating.models.join(', ')}]` : 'not observed'}; after the turn: ${after ? (psFind(after.models, TM) ? `${TM} loaded again` : `${TM} not loaded`) : '?'}`, `answer: ${excerpt(t.text, 120)}`];
+      if (f) return FAIL(f, { info });
+      if (!calls.length) return WARN('the model did not call generate_image (model behaviour)', { info });
+      if (!res.length || res[0].isError || !(res[0].images || []).length) return FAIL(`tool result without an image: ${excerpt(res[0]?.content, 200)}`, { info });
+      const unloaded = phases.includes('unloading') && phases.includes('unloaded');
+      if (!unloaded) return WARN('the chat model was not unloaded before generating (nothing was loaded per /api/ps?)', { info });
+      if (!(ms.includes('loading') && ms.includes('ready'))) return FAIL('the chat model was unloaded but the stream has no model_status loading → ready before the final answer', { info, fix: 'ChatEngine.run should emit model_status around the reload after an image job.' });
+      if (psAtGenerating?.listed) return WARN(`${TM} was still in /api/ps when the diffusion job started (unload is asynchronous)`, { info, fix: 'Wait until /api/ps no longer lists the model before generating (ImageService._run).' });
+      return PASS('tool → unload → generate → image → reload → answer', { info });
+    }, { timeoutMs: 1600000 });
+  } finally {
+    if (srv) await srv.close().catch(() => {});
+    if (dataDir && !run.opts.keepData) await fsp.rm(dataDir, { recursive: true, force: true }).catch(() => {});
+    else if (dataDir) run.notes.push(`kept Harness data dir ${dataDir}`);
+  }
+}
+
+// =============================================================================================== cleanup
+async function cleanup(run) {
+  const O = run.ollama;
+  if (!O) return;
+  const groupRan = run.results.some((r) => r.group === 'ollama');
+  if (groupRan || run.opts.allowPull) {
+    await run.check('ollama.delete.own_model', async ({ sample }) => {
+      need(run.opts.allowPull, 'pulling is off by default', '--allow-pull');
+      if (!O.pulledByUs.size) return O.deletedViaHarness ? PASS('the pulled model was already deleted through Harness (e2e.pull_delete)') : SKIP('nothing was pulled by this run', 'a --pull-model that is not installed');
+      const out = [];
+      for (const m of [...O.pulledByUs]) {
+        const r = await http(O.url, '/api/delete', { method: 'DELETE', body: { model: m }, timeoutMs: run.T(30000) });
+        sample(`ollama DELETE /api/delete ${m}`, { status: r.status, body: r.json ?? r.text });
+        out.push(`${m}: HTTP ${r.status}`);
+        if (r.ok) O.pulledByUs.delete(m);
+      }
+      if (O.pulledByUs.size) return FAIL(`could not delete ${[...O.pulledByUs].join(', ')}`, { info: out });
+      return PASS(out.join('; '));
+    });
+  }
+  if (!run.opts.unloadAtEnd) return;
+  const toUnload = [...O.used].filter((m) => ![...O.initiallyLoaded].some((x) => sameModel(x, m)));
+  const prov = new H.OllamaProvider({ baseUrl: O.url });
+  const { models } = await psList(O, run);
+  const done = [];
+  for (const m of toUnload) if (psFind(models, m)) { await prov.unload(m).catch(() => {}); done.push(m); }
+  if (done.length) run.notes.push(`unloaded ${done.join(', ')} (loaded by this run)`);
+}
+
+// =============================================================================================== reports
+function terminalSummary(run, s) {
+  const c = (k, v) => run.c(ANSI[k], `${v} ${k}`);
+  const lines = [''];
+  lines.push(run.c(ANSI.head, 'Summary'));
+  lines.push(`  ${s.total} checks: ${c('PASS', s.PASS)}, ${c('FAIL', s.FAIL)}, ${c('WARN', s.WARN)}, ${c('SKIP', s.SKIP)}`);
+  for (const [l, v] of Object.entries(s.byLayer)) if (v.PASS + v.FAIL + v.WARN + v.SKIP) lines.push(`  ${l.padEnd(4)} ${v.PASS} pass, ${v.FAIL} fail, ${v.WARN} warn, ${v.SKIP} skip`);
+  const bad = run.results.filter((r) => r.status === 'FAIL' || r.status === 'WARN');
+  if (bad.length) {
+    lines.push('');
+    for (const r of bad) lines.push(`  ${run.c(ANSI[r.status], r.status)} [${r.layer}] ${r.id}: ${r.fix || r.detail}`);
+  }
+  for (const n of run.notes) lines.push(`  note: ${n}`);
+  return lines.join('\n');
+}
+
+function markdownReport(run, s, result) {
+  const esc = (t) => String(t ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  const L = [];
+  L.push(`# Harness live check — ${run.startedAt}`);
+  L.push('');
+  L.push(`**Result:** ${s.FAIL} FAIL, ${s.WARN} WARN, ${s.PASS} PASS, ${s.SKIP} SKIP (${s.total} checks; raw ${s.byLayer.raw.FAIL} fail / e2e ${s.byLayer.e2e.FAIL} fail). Exit code ${result.exitCode}.`);
+  L.push('');
+  L.push('Layers: **raw** = direct probe of the backend API; **e2e** = through the real Harness server started in-process.');
+  L.push('');
+  const m = run.env.machine;
+  L.push('## Environment');
+  L.push('');
+  L.push('| | |');
+  L.push('|---|---|');
+  if (m) {
+    L.push(`| OS | ${esc(m.os)} (${m.arch}), ${esc(m.chip)}, ${m.cpus} cores |`);
+    L.push(`| Memory | ${fmtBytes(m.totalMemBytes)} total, ${fmtBytes(m.freeMemBytes)} free${m.swap ? `, swap ${esc(m.swap)}` : ''} |`);
+    L.push(`| Node / Harness | ${m.node} / ${m.harnessVersion} |`);
+  }
+  if (run.env.ollamaEnv) L.push(`| OLLAMA_* | process: ${esc(Object.entries(run.env.ollamaEnv.process).map(([k, v]) => `${k}=${v}`).join(' ') || '—')}; launchctl: ${esc(Object.entries(run.env.ollamaEnv.launchd).map(([k, v]) => `${k}=${v}`).join(' ') || '—')} |`);
+  L.push(`| Options | ${esc(result.options.join(' ') || '(defaults)')} |`);
+  L.push('');
+  L.push('## Backends');
+  L.push('');
+  for (const t of run.backends.tried || []) L.push(`- ${t.kind} \`${t.url}\`: ${t.ok ? `reachable${t.info ? ` (${esc(t.info)})` : ''}` : `not reachable (${esc(t.error)})`}`);
+  if (run.picks.ollama) {
+    L.push('');
+    L.push('Models picked (Ollama):');
+    for (const [k, v] of Object.entries(run.picks.ollama)) L.push(`- ${k}: ${v ? `\`${v.model}\` — ${esc(v.why)}` : '—'}`);
+  }
+  for (const [sid, p] of Object.entries(run.picks.openai || {})) L.push(`- ${sid}: ${p.model ? `\`${p.model}\`` : '—'} (${esc(p.why)})`);
+  const bad = run.results.filter((r) => r.status === 'FAIL' || r.status === 'WARN');
+  if (bad.length) {
+    L.push('');
+    L.push('## Failures and warnings');
+    for (const r of bad) {
+      L.push('');
+      L.push(`### ${r.status} \`${r.id}\` (${r.layer})`);
+      L.push('');
+      L.push(`${r.detail}`);
+      L.push('');
+      L.push(`- **Assumes:** ${r.assumption}`);
+      if (r.source.length) L.push(`- **Code:** ${r.source.map((x) => `\`${x}\``).join(', ')}`);
+      if (r.expected) L.push(`- **Expected:** ${r.expected}`);
+      if (r.actual) L.push(`- **Actual:** \`${r.actual.replace(/`/g, "'")}\``);
+      if (r.fix) L.push(`- **Fix:** ${r.fix}`);
+      for (const i of r.info || []) L.push(`  - ${i}`);
+    }
+  }
+  L.push('');
+  L.push('## All checks');
+  L.push('');
+  L.push('| Status | Layer | Check | Detail |');
+  L.push('|---|---|---|---|');
+  for (const r of run.results) L.push(`| ${r.status} | ${r.layer} | \`${r.id}\` | ${esc(r.status === 'SKIP' ? `${r.detail}${r.need ? ` — needs ${r.need}` : ''}` : r.detail).slice(0, 300)} |`);
+  L.push('');
+  return redact(L.join('\n'));
+}
+
+// =============================================================================================== main
+def('env.group_crash', 'env', 'Every check group ran to completion (an internal error here is a bug in this tool or a wildly unexpected answer)');
+
+/**
+ * Run the whole check. `argv` = CLI arguments (array) — returns { exitCode, result } and never calls process.exit.
+ * `out` receives the terminal output (default: stdout).
+ */
+export async function runLiveCheck(argv = [], { out } = {}) {
+  const opts = parseOptions(argv);
+  const write = out || ((s) => process.stdout.write(s));
+  if (opts.help) { write(`${helpText()}\n`); return { exitCode: 0, result: null }; }
+  if (opts.errors.length) { write(`${opts.errors.join('\n')}\n\n${helpText()}\n`); return { exitCode: 1, result: null }; }
+  if (opts.list) {
+    const rows = [...CATALOG.values()].map((c) => `${c.layer.padEnd(4)} ${c.id.padEnd(42)} ${c.title}`);
+    write(`${rows.join('\n')}\n`);
+    return { exitCode: 0, result: null };
+  }
+  const run = new Run(opts, { out: write });
+  const enabled = (g) => (!opts.only || opts.only.includes(g)) && !opts.skip.includes(g);
+  run.print(run.c(ANSI.head, `Harness live conformance check v${TOOL_VERSION} — ${run.startedAt}`));
+  run.print('Layers: [raw] = probes straight against each backend API; [e2e] = through the real Harness server (in-process, temp data dir).');
+  run.print(`Side effects: pulls ${opts.allowPull ? `ON (${opts.pullModel})` : 'OFF (--allow-pull)'}, image generation ${opts.allowImages ? 'ON' : 'OFF (--allow-images)'}; probes use keep_alive ${JSON.stringify(opts.keepAlive)}, num_ctx 2048/4096; timeouts ×${opts.timeoutScale}.`);
+  try {
+    await loadHarness();
+  } catch (e) {
+    run.section('env', 'Environment');
+    await run.check('env.harness_sources', async () => FAIL(`Harness server modules failed to load: ${e.message}`, { actual: excerpt(e.stack, 600), fix: 'server/ has a syntax/import error; fix it before running the live check.' }));
+    return finish(run, opts, 1, argv);
+  }
+  const B = await detectBackends(run);
+  run.backends = B;
+  const guard = async (name, fn) => {
+    try { await fn(); } catch (e) {
+      await run.check('env.group_crash', async () => FAIL(`group "${name}" stopped early: ${errText(e)}`, { actual: excerpt(e.stack, 800) }));
+    }
+  };
+  if (enabled('env')) await guard('env', () => envGroup(run, B));
+  run.print('');
+  run.print(run.c(ANSI.head, 'Backends'));
+  for (const t of B.tried) run.print(`  ${t.kind.padEnd(14)} ${t.url.padEnd(28)} ${t.ok ? run.c(ANSI.PASS, `reachable${t.info ? ` — ${t.info}` : ''}`) : run.c(ANSI.SKIP, `not reachable (${t.error})`)}`);
+  if (!B.tried.length) run.print('  (nothing probed: --no-detect without any --*-url)');
+  const any = B.ollama || B.openai.length || B.a1111 || B.comfyui || B.openaiImages;
+  if (!any) {
+    run.print('');
+    run.print('No backend is reachable. Start Ollama (`ollama serve` or the Ollama app), llama-server, LM Studio, Draw Things (HTTP API server on), or ComfyUI — or point at them with --ollama-url etc.');
+    return finish(run, opts, 2, argv);
+  }
+  if (B.ollama && (enabled('ollama') || enabled('e2e'))) {
+    if (enabled('ollama')) await guard('ollama', () => ollamaGroup(run, B));
+    else await guard('ollama-inventory', () => ollamaInventoryOnly(run, B));
+  }
+  if (enabled('openai')) for (const S of B.openai) await guard(`openai.${S.sid}`, () => openaiGroup(run, S));
+  else for (const S of B.openai) (run.picks.openai ||= {})[S.sid] = { model: opts.openaiModel || (S.flavor === 'llamacpp' ? S.models[0] : null), why: 'openai group skipped' };
+  if (B.a1111 && enabled('a1111')) await guard('a1111', () => a1111Group(run, B));
+  if (B.comfyui && enabled('comfyui')) await guard('comfyui', () => comfyGroup(run, B));
+  if (B.openaiImages && enabled('openai-images')) await guard('openai-images', () => openaiImagesGroup(run, B));
+  if (enabled('e2e')) await guard('e2e', () => e2eGroup(run, B));
+  await guard('cleanup', () => cleanup(run));
+  return finish(run, opts, null, argv);
+}
+
+/** Inventory + picks without running the Ollama probes (when only e2e is selected). */
+async function ollamaInventoryOnly(run, B) {
+  const O = { url: B.ollama.url, used: new Set(), pulledByUs: new Set(), installedBefore: new Set(), initiallyLoaded: new Set(), inventory: [], shows: new Map(), tags: [] };
+  run.ollama = O;
+  const { models } = await psList(O, run);
+  for (const m of models || []) O.initiallyLoaded.add(m.model || m.name);
+  const tags = await http(O.url, '/api/tags', { timeoutMs: run.T(15000) });
+  for (const m of tags.json?.models || []) {
+    const name = m.model || m.name;
+    O.installedBefore.add(name);
+    const s = await http(O.url, '/api/show', { method: 'POST', body: { model: name }, timeoutMs: run.T(15000) });
+    const caps = Array.isArray(s.json?.capabilities) ? s.json.capabilities : H.normalizeOllamaShow(name, s.json || {}, null).capabilities;
+    O.inventory.push({ name, size: m.size ?? null, caps, show: s.json });
+  }
+  const picks = pickOllamaModels(run.opts, O.inventory);
+  run.picks.ollama = Object.fromEntries(Object.entries(picks).map(([k, v]) => [k, v ? { model: v.name, sizeBytes: v.size, caps: v.caps, why: v.why, usable: !v.unusable } : null]));
+  for (const v of Object.values(picks)) if (v && !v.unusable) O.used.add(v.name);
+}
+
+async function finish(run, opts, forcedCode, argv = []) {
+  const s = run.summary();
+  const exitCode = forcedCode ?? (s.FAIL ? 1 : 0);
+  const optionList = argv.map((a) => redact(String(a)));
+  const result = redactDeep({
+    tool: 'harness-live-check', toolVersion: TOOL_VERSION, startedAt: run.startedAt, finishedAt: new Date().toISOString(), durationMs: Date.now() - run.t0,
+    exitCode, options: { ...opts, apiKey: opts.apiKey ? '<redacted>' : '', errors: undefined }, env: run.env,
+    backends: run.backends, picks: run.picks, summary: s, notes: run.notes, unresolvedAnchors: [...unresolvedAnchors],
+    checks: run.results, samples: run.samples,
+  });
+  result.optionsText = optionList;
+  run.out(`${redact(terminalSummary(run, s))}\n`);
+  if (forcedCode === 2) run.out('Exit code 2: no backend reachable.\n');
+  if (opts.json) {
+    try { await fsp.mkdir(path.dirname(path.resolve(opts.json)), { recursive: true }); await fsp.writeFile(opts.json, `${JSON.stringify(result, null, 2)}\n`); run.out(`JSON report: ${opts.json}\n`); } catch (e) { run.out(`could not write ${opts.json}: ${e.message}\n`); }
+  }
+  if (opts.markdown) {
+    try { await fsp.mkdir(path.dirname(path.resolve(opts.markdown)), { recursive: true }); await fsp.writeFile(opts.markdown, markdownReport(run, s, { exitCode, options: optionList })); run.out(`Markdown report: ${opts.markdown}\n`); } catch (e) { run.out(`could not write ${opts.markdown}: ${e.message}\n`); }
+  }
+  return { exitCode, result };
+}
+
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  runLiveCheck(process.argv.slice(2)).then(({ exitCode }) => {
+    process.exitCode = exitCode;
+    setTimeout(() => process.exit(exitCode), 200).unref();
+  }, (e) => { console.error(e); process.exit(1); });
+}

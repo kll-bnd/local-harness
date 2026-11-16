@@ -95,7 +95,7 @@ export class Shell {
     const next = force ?? !this.inspectorOpen();
     setUiPref('inspector', next);
     this.applyLayout();
-    if (next) requestAnimationFrame(() => this.inspector.tabsEl.querySelector('[aria-selected="true"]')?.focus());
+    if (next) this.inspector.tabsEl.querySelector('[aria-selected="true"]')?.focus();
   }
 
   showInspector(tab, opts) {
@@ -108,8 +108,9 @@ export class Shell {
   announce(text) { this.live.textContent = ''; requestAnimationFrame(() => { this.live.textContent = text; }); }
 
   focusComposer() {
-    if (store.get('route').view !== 'chat') navigate(store.get('route').chatId ? `/chat/${store.get('route').chatId}` : '/chat');
-    requestAnimationFrame(() => this.chatView.composer.focus());
+    if (store.get('route').view !== 'chat') navigate(this.chatView.model ? `/chat/${this.chatView.model.id}` : '/chat');
+    // The chat view is mounted synchronously by the router, so focus right away (rAF can be throttled).
+    this.chatView.composer.focus();
   }
 
   // ------------------------------------------------------------------------------------------ routing

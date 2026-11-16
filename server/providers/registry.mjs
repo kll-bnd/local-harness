@@ -13,6 +13,9 @@ const MODELS_TTL = 4000;
 const SERVER_INFO_TTL = 3000;
 
 export class ProviderRegistry {
+  /** How long OpenAI-compatible model info (incl. the server's loaded context) is reused. */
+  static serverInfoTtlMs = SERVER_INFO_TTL;
+
   constructor({ settings, bus, system, autodetect = true, ollamaProcess = null }) {
     this.settingsStore = settings;
     this.bus = bus;
@@ -168,7 +171,7 @@ export class ProviderRegistry {
     // Ollama metadata is tied to the model digest. OpenAI-compatible servers have no digest and their context is
     // set at launch (llama-server -c, LM Studio JIT loading), so their info is only reused for a few seconds.
     const hit = this._infoCache.get(key);
-    if (!refresh && hit && (provider.kind === 'ollama' || Date.now() - hit.at < SERVER_INFO_TTL)) return hit.info;
+    if (!refresh && hit && (provider.kind === 'ollama' || Date.now() - hit.at < ProviderRegistry.serverInfoTtlMs)) return hit.info;
     let info;
     if (provider.kind === 'ollama') {
       const show = await provider.show(model);

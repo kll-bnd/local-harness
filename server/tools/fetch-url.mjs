@@ -46,7 +46,7 @@ export function isPrivateAddress(ip) {
 class BlockedError extends Error {}
 
 /** DNS lookup used for the actual connection: resolves once, rejects if ANY returned address is non-public. */
-function vettedLookup(allowPrivate) {
+export function vettedLookup(allowPrivate) {
   return (hostname, options, cb) => {
     dns.lookup(hostname, { all: true, verbatim: true }, (err, addrs) => {
       if (err) return cb(err);
