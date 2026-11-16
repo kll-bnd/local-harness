@@ -26,11 +26,20 @@
   const MODEL = { providerId: 'ollama', model: 'qwen3:0.6b' };
 
   async function chat(chatId, content) {
-    const res = await fetch(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
-      method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
-      body: JSON.stringify({ content, model: MODEL }),
-    });
-    if (!res.ok) return { status: res.status, body: await res.text() };
+    // Right after an unlock the backend may still be starting its Ollama (503 connection_failed): retry for a while.
+    let res;
+    let waitedForOllamaMs = 0;
+    for (const end = Date.now() + 90000; ;) {
+      res = await fetch(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+        body: JSON.stringify({ content, model: MODEL }),
+      });
+      if (res.status !== 503 || Date.now() > end) break;
+      await res.text();
+      await sleep(2000);
+      waitedForOllamaMs += 2000;
+    }
+    if (!res.ok) return { status: res.status, body: (await res.text()).slice(0, 200), waitedForOllamaMs };
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     const times = [];
@@ -56,7 +65,7 @@
     }
     await sleep(500);
     const napHeldAfter = (await native('state')).activityHeld;
-    return { status: res.status, pieces: times.length, firstMs: times[0], lastMs: times[times.length - 1], types, chars: text.length, napHeldDuring, napHeldAfter };
+    return { status: res.status, pieces: times.length, firstMs: times[0], lastMs: times[times.length - 1], types, chars: text.length, napHeldDuring, napHeldAfter, waitedForOllamaMs };
   }
 
   // ------------------------------------------------------------------------------------------- launch 2
@@ -132,26 +141,30 @@
   }, 120000);
 
   await check('allowThenBlockAgain', async () => {
+    const netState = async () => { const n = await req('GET', '/api/network'); return n.body?.offlineLock || n.body || {}; };
+    const ollamaUp = () => waitFor(async () => (await native('ollama', { path: '/api/version' })).status === 200, 30000);
     const allow = await req('POST', '/api/network/allow', { minutes: 5, password: pw });
-    await sleep(1500);
-    const okUp = await waitFor(async () => (await native('ollama', { path: '/api/version' })).status === 200, 30000);
+    const unsandboxed = await waitFor(async () => (await netState()).osEnforced === false, 30000);
+    const upA = await ollamaUp();
+    const whileAllowed = await netState();
     const pulled = await native('ollama', { path: '/api/pull', body: { model: 'all-minilm', stream: false }, timeout: 240 });
     const block = await req('POST', '/api/network/block', {});
-    await sleep(1500);
-    await waitFor(async () => (await native('ollama', { path: '/api/version' })).status === 200, 30000);
-    const after = await req('GET', '/api/network');
-    const lock = after.body?.offlineLock || after.body;
+    const resandboxed = await waitFor(async () => (await netState()).osEnforced === true, 30000);
+    const upB = await ollamaUp();
+    const lock = await netState();
     const again = await native('ollama', { path: '/api/pull', body: { model: 'all-minilm', stream: false }, timeout: 60 });
     await native('ollama', { path: '/api/delete', body: { model: 'all-minilm' } });
     return {
-      ok: allow.status === 200 && okUp && /"status":"success"/.test(pulled.body || '') && block.status === 200 && lock?.blocked === true && lock?.osEnforced === true && !/"status":"success"/.test(again.body || ''),
-      allow: allow.status, pullWhileAllowed: String(pulled.body || pulled.error).slice(0, 80), block: block.status, reBlocked: lock?.blocked, osEnforcedAgain: lock?.osEnforced,
-      pullAfterBlock: String(again.body || again.error).slice(0, 100),
+      ok: allow.status === 200 && unsandboxed && upA && /"status":"success"/.test(pulled.body || '') && block.status === 200 && resandboxed && upB && lock.blocked === true && !/"status":"success"/.test(again.body || ''),
+      allow: allow.status, ollamaRestartedWithoutSandbox: unsandboxed, whileAllowed: { blocked: whileAllowed.blocked, osEnforced: whileAllowed.osEnforced, osScope: whileAllowed.osScope },
+      pullWhileAllowed: String(pulled.body || pulled.error).slice(0, 160), block: block.status, ollamaRestartedInSandbox: resandboxed, reBlocked: lock.blocked,
+      pullAfterBlock: String(again.body || again.error).slice(0, 160),
     };
   }, 400000);
 
   await check('lockUnloadsAndLocks', async () => {
-    await native('ollama', { path: '/api/generate', body: { model: 'qwen3:0.6b', prompt: 'hi', stream: false, options: { num_predict: 1 } }, timeout: 120 });
+    // Load the model through Harness (the backend unloads what it loaded itself).
+    const warm = await chat(chatId, `One word. ${marker}`);
     const before = await native('ollama', { path: '/api/ps' });
     await native('lock');
     const locked = await waitFor(async () => (await native('state')).locked === true, 15000);
@@ -161,7 +174,7 @@
     let models = null;
     try { models = JSON.parse(ps.body).models.map((m) => m.name); } catch { /* not JSON */ }
     const s = await native('state');
-    return { ok: locked && chats.status === 423 && Array.isArray(models) && models.length === 0 && !s.lockMenuEnabled && s.badge === '', appLocked: locked, chats: chats.status, modelsBefore: (before.body || '').includes('qwen3') ? 'loaded' : 'none', modelsAfterLock: models, lockMenuDisabled: !s.lockMenuEnabled };
+    return { ok: warm.status === 200 && locked && chats.status === 423 && Array.isArray(models) && models.length === 0 && !s.lockMenuEnabled && s.badge === '', appLocked: locked, chats: chats.status, modelsBefore: (before.body || '').includes('qwen3') ? 'loaded' : 'none', modelsAfterLock: models, lockMenuDisabled: !s.lockMenuEnabled };
   });
 
   await check('wrongPasswordRejected', async () => {

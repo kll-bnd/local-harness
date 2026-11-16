@@ -358,4 +358,6 @@ jobs:
           node native/ci/electron-memory.mjs dist/mac-arm64/Harness.app 20 > /dev/null
       - name: Facts
         if: always()
-        run: cat "$FACTS"
+        run: |
+          cat "$FACTS"
+          node native/ci/summary.mjs

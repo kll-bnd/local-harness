@@ -83,7 +83,7 @@ for (let n = 1; n <= launches; n++) {
     const theirs = pids.filter((p) => /^ollama/.test(name(p)));
     const sk = sockets(ours);
     say(`launch${n}.sockets`, { ok: sk.listening.length === 0 && sk.inet === 0, appAndBackend: sk, ollama: theirs.length ? sockets(theirs).listening : 'not started' });
-    if (n === 1) { await sleep(Number(opt('settle', '8')) * 1000); say(`launch${n}.memoryIdle`, memory(child.pid, st.backendPid)); }
+    if (n === 1) { await sleep(Number(opt('settle', '8')) * 1000); say(`launch${n}.memory`, memory(child.pid, st.backendPid)); }
   } else {
     say(`launch${n}.firstPage`, `none (state ${JSON.stringify(st)})`);
   }
