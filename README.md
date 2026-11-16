@@ -343,7 +343,8 @@ other servers you manage those in the server itself.
 | Old plain-text copies: Time Machine backups and data from before the upgrade to 0.2 | Harness cannot reach them. Turn on **FileVault** and use **encrypted backups** — they are still worth having. |
 
 Choose in **Settings**: **password** (the default), **Keychain** (opens without asking on this
-Mac; weaker, as above) or **off** (plain-text data; asks your password to confirm). Actions that lower the
+Mac; weaker, as above) or **off** (your data is stored as plain files; Harness still asks for your password when
+it opens, because that is the only way it can know the setting is really yours). Actions that lower the
 protection — allowing internet, turning the blocker off, a full backup, restoring, a new recovery key,
 changing the password or the mode — always ask your password again. After 3 wrong passwords Harness waits
 1 s, then twice as long after each further miss (up to 5 minutes), even across restarts. If you ever used
