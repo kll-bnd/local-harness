@@ -58,6 +58,9 @@ test('a lock written on another computer → refuse before any probe; the error 
   const err = Object.assign(new Error('busy'), { code: 'HARNESS_ALREADY_RUNNING', url: 'http://203.0.113.7:4747', pid: 9 });
   const r2 = await startOrRefuse({ dataDir: '/d', port: 1, probeFirst: false, findElsewhere: () => ({ hostname: 'other-mac', pid: null }), findApp: noApp, findRunning: none, startServer: async () => { throw err; } });
   assert.deepEqual(r2.other, { kind: 'elsewhere', pid: null, url: null, hostname: 'other-mac' }, 'the error\'s url is not used');
+  const flagged = Object.assign(new Error('elsewhere'), { code: 'HARNESS_ALREADY_RUNNING', otherComputer: true, url: null, port: null, pid: null });
+  const r3 = await startOrRefuse({ dataDir: '/d', port: 1, probeFirst: false, findApp: noApp, findRunning: none, startServer: async () => { throw flagged; } });
+  assert.equal(r3.other.kind, 'elsewhere', 'the backend\'s otherComputer flag alone is enough');
 });
 
 test('no address from the lock or the error is shown unless it is exactly http://127.0.0.1:<valid port>', async () => {

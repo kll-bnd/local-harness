@@ -49,7 +49,7 @@ async function startOrRefuse({ dataDir, port, findRunning, findApp, findElsewher
   } catch (err) {
     // The backend's own data-dir lock: another process holds the folder (it may have started after the probe).
     if (err?.code !== 'HARNESS_ALREADY_RUNNING') throw err;
-    const far = elsewhere();
+    const far = elsewhere() || (err.otherComputer ? { kind: 'elsewhere', pid: null, url: null, hostname: 'name unknown' } : null);
     if (far) return { server: null, other: far };
     return { server: null, other: { kind: err.transport === 'bridge' ? 'app' : 'listener', pid: err.pid ?? null, url: shownUrl(err.url) } };
   }
