@@ -83,8 +83,10 @@ reads a length above 1,048,581 treats the stream as corrupt and stops.
   start-up, so the app can show something better than a frozen window. `what` is `"encrypting"`,
   `"decrypting"` or `"reencrypting"`; the same progress is in `GET /api/security` → `migration`.
 - `{ "type": "keychain-key", "dataKey": "<base64 of 32 bytes>" | null }` when the user switches to keychain
-  mode (store this value in the login Keychain, service `local.harness`, account `data-key`, and send it as
-  `hello.dataKey` from then on) or leaves it (`null`: delete the item). Sent only after the backend has
+  mode (store this value in the login Keychain, service `local.harness`, account `data-key` — for a data folder
+  other than the default one, account `data-key-<first 16 hex digits of SHA-256 of the folder's real path>`, the
+  name the listener-mode backend uses for it — and send it as `hello.dataKey` from then on) or leaves it (`null`:
+  delete the item). Sent only after the backend has
   written `launch.json`.
 - `{ "type": "fatal", "code": "wrong_key" | "data_dir_locked" | "…", "message": "…", "url": null }` when the
   backend cannot start; it exits non-zero right after. Codes: `wrong_key` (keychain mode: the key in

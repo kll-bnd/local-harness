@@ -330,3 +330,17 @@ describe('which Keychain store (never the real one by accident)', () => {
   });
 });
 
+
+describe('the managed Ollama listens on this Mac only', () => {
+  test('OLLAMA_HOST is always a loopback address (extraEnv cannot change it); a non-local address is never started', async () => {
+    const { managedOllamaEnv, OllamaProcess } = await import('../server/providers/ollama-process.mjs');
+    assert.equal(managedOllamaEnv({ ollama: {} }, { baseUrl: 'http://127.0.0.1:11555', totalMem: 16 * 1024 ** 3 }).OLLAMA_HOST, '127.0.0.1:11555');
+    assert.equal(managedOllamaEnv({ ollama: {} }, { baseUrl: 'http://localhost:11434', totalMem: 16 * 1024 ** 3 }).OLLAMA_HOST, '127.0.0.1:11434');
+    assert.equal(managedOllamaEnv({ ollama: {} }, { baseUrl: 'http://0.0.0.0:11434', totalMem: 16 * 1024 ** 3 }).OLLAMA_HOST, '127.0.0.1:11434');
+    assert.equal(managedOllamaEnv({ ollama: { extraEnv: { OLLAMA_HOST: '0.0.0.0:11434', OLLAMA_DEBUG: '1' } } }, { baseUrl: 'http://127.0.0.1:11434', totalMem: 16 * 1024 ** 3 }).OLLAMA_HOST, '127.0.0.1:11434');
+    const p = new OllamaProcess({ getSettings: () => ({ ollama: { binaryPath: process.execPath } }), getProvider: () => ({ baseUrl: 'http://192.168.1.20:11434', status: async () => ({ ok: false }) }), totalMem: 8 * 1024 ** 3 });
+    const r = await p.start();
+    assert.equal(r.code, 'not_loopback');
+    assert.equal(p.managed, false);
+  });
+});

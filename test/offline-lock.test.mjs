@@ -117,7 +117,7 @@ describe('the OS layer around a managed Ollama', () => {
     await fs.writeFile(sbx, `#!/bin/sh
 echo "$@" >> "${log}"
 [ "${mode}" = "broken" ] && exit 71
-if [ "${mode}" = "deny" ] && [ "$4" = "-e" ]; then echo '{"tcp":{"ok":false,"code":"EPERM"},"udp":{"ok":false,"code":"EPERM"},"dns":{"ok":false,"code":"ENOTFOUND"}}'; exit 0; fi
+if [ "${mode}" = "deny" ] && [ "$4" = "-e" ]; then echo '{"tcp":{"ok":false,"code":"EPERM"},"tcp6":{"ok":false,"code":"EPERM"},"udp":{"ok":false,"code":"ECONNREFUSED"},"dns":{"ok":false,"code":"ENOTFOUND"}}'; exit 0; fi
 shift 2
 exec "$@"
 `, { mode: 0o755 });
@@ -174,7 +174,7 @@ exec "$@"
         const t = await s.call('POST', '/api/network/test', {});
         assert.equal(t.status, 200, JSON.stringify(t.data));
         assert.ok(t.data.results.filter((r) => r.layer === 'code').every((r) => r.result === 'blocked'));
-        const tcp = t.data.results.find((r) => r.layer === 'os' && r.target.startsWith('tcp'));
+        const tcp = t.data.results.find((r) => r.layer === 'os' && r.target === `tcp ${process.env.HARNESS_EGRESS_PROBE_TARGET}`);
         assert.equal(tcp.result, 'reachable');
         assert.equal(t.data.osEnforced, false);
         assert.equal((await s.call('GET', '/api/network')).data.offlineLock.osEnforced, false, 'never claimed again after a failed probe');
@@ -187,7 +187,9 @@ exec "$@"
       await s.call('POST', '/api/providers/ollama/start');
       const t = await s.call('POST', '/api/network/test', {});
       const os = t.data.results.filter((r) => r.layer === 'os');
-      assert.deepEqual(os.map((r) => r.result), ['blocked', 'blocked', 'blocked']);
+      assert.deepEqual(os.map((r) => r.result), ['blocked', 'blocked', 'blocked', 'blocked'], 'EPERM, EPERM, ECONNREFUSED (UDP), ENOTFOUND are what the proven profile answers');
+      const listen = t.data.results.find((r) => r.layer === 'listen');
+      if (process.platform === 'linux') assert.equal(listen.result, 'loopback', JSON.stringify(listen));
       assert.equal(t.data.osEnforced, true);
     });
     await withSandbox('broken', async ({ s, log }) => {

@@ -6,6 +6,7 @@ import { ramTier } from '../context/sizing.mjs';
 import { log } from '../lib/log.mjs';
 import { sleep } from '../lib/util.mjs';
 import { ROOT_DIR } from '../version.mjs';
+import { isLoopbackHost } from '../security/egress.mjs';
 
 /** The offline-lock profile an Ollama that Harness starts runs under while internet access is blocked. */
 export const SANDBOX_PROFILE = path.join(ROOT_DIR, 'server', 'security', 'offline-lock.sb');
@@ -36,8 +37,11 @@ export function findOllamaBinary(explicit) {
 export function managedOllamaEnv(settings, { baseUrl, totalMem }) {
   const o = settings.ollama || {};
   const u = new URL(baseUrl);
+  // Always bound to this Mac only: the offline-lock sandbox polices outbound connections, not connections accepted
+  // on a listening socket, so an Ollama listening on 0.0.0.0 could be reached (and answer) from the network.
+  const host = isLoopbackHost(u.hostname) && u.hostname !== 'localhost' ? u.hostname : '127.0.0.1';
   const env = {
-    OLLAMA_HOST: `${u.hostname}:${u.port || 11434}`,
+    OLLAMA_HOST: `${host}:${u.port || 11434}`,
     OLLAMA_NUM_PARALLEL: String(o.numParallel ?? 1),
   };
   if (o.flashAttention !== false) env.OLLAMA_FLASH_ATTENTION = '1';
@@ -51,7 +55,7 @@ export function managedOllamaEnv(settings, { baseUrl, totalMem }) {
   // reaches the runner ("prompt cache is enabled, size limit: 256 MiB").
   const cacheMiB = promptCacheMiB(o.promptCacheMiB, totalMem);
   if (cacheMiB !== null) env[PROMPT_CACHE_ENV] = String(cacheMiB);
-  for (const [k, v] of Object.entries(o.extraEnv || {})) if (/^OLLAMA_[A-Z_]+$/.test(k) || k === PROMPT_CACHE_ENV) env[k] = String(v);
+  for (const [k, v] of Object.entries(o.extraEnv || {})) if ((/^OLLAMA_[A-Z_]+$/.test(k) && k !== 'OLLAMA_HOST') || k === PROMPT_CACHE_ENV) env[k] = String(v);
   return env;
 }
 
@@ -162,6 +166,10 @@ export class OllamaProcess {
     if (st.ok) { this.external = !this.managed; return { started: false, alreadyRunning: true, managed: this.managed, version: st.version }; }
     this.external = false;
     const s = this.getSettings();
+    if (!isLoopbackHost(new URL(provider.baseUrl).hostname)) {
+      this.lastError = 'Harness starts Ollama only on this Mac (loopback); the configured Ollama address is another computer.';
+      return { started: false, error: this.lastError, code: 'not_loopback' };
+    }
     const bin = findOllamaBinary(s.ollama?.binaryPath);
     if (!bin) {
       this.lastError = 'Ollama is not installed (binary not found).';

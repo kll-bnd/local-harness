@@ -169,7 +169,7 @@ export function registerSecurityRoutes(r, core) {
     const wait = lastTest + selftestIntervalMs() - Date.now();
     if (running || wait > 0) throw new HttpError(429, 'rate_limited', 'The self-test ran a moment ago; try again shortly.', { retryAfterMs: Math.max(wait, 1000) });
     lastTest = Date.now();
-    running = runEgressSelfTest({ network: core.network, ollama: { sandboxExec: core.ollamaProcess.sandboxExec, profile: core.ollamaProcess.profile } });
+    running = runEgressSelfTest({ network: core.network, ollama: { sandboxExec: core.ollamaProcess.sandboxExec, profile: core.ollamaProcess.profile, managed: core.ollamaProcess.managed, pid: core.ollamaProcess.child?.pid ?? null } });
     try { return await running; } finally { running = null; lastTest = Date.now(); }
   }, open);
 }
