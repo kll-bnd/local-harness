@@ -604,7 +604,7 @@ export class SettingsView {
           await Promise.allSettled([loadChats(), loadSettings(), loadPresets()]);
           const got = r.restored || {};
           const bits = ['chats', 'memories', 'presets', 'attachments', 'images'].filter((k) => got[k]).map((k) => `${got[k]} ${k}`);
-          toast({ kind: 'success', message: 'Backup restored', detail: `${bits.join(', ') || 'Nothing new'}${got.settings && got.settings !== 'skipped' ? ` · settings ${got.settings}` : ''}${(r.warnings || []).length ? `\n${r.warnings.slice(0, 3).map((w) => w.message || w).join('\n')}` : ''}`, timeout: 10000 });
+          toast({ kind: 'success', message: 'Backup restored', detail: `${bits.join(', ') || 'Nothing new'}${got.settings && got.settings !== 'skipped' ? ` · settings ${got.settings}` : ''}${(r.warnings || []).length ? `\n${r.warnings.slice(0, 3).map((w) => w.message || w).join('\n')}` : ''}`, timeout: 7000 });
           return true;
         } catch (e) { t.dismiss(true); showError(e, 'restore the backup'); return false; }
       } }],

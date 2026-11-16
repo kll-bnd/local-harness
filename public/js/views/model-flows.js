@@ -33,7 +33,7 @@ export async function makeTextOnlyCopy(sourceModel, { providerId = 'ollama', set
       message: r.created === false ? 'The text-only copy already exists' : `Text-only copy ready: ${modelShort(r.model, 36)}`,
       detail: `${madeDefault ? 'It is now your default model. ' : ''}It can't read images. ${r.sourceSizeBytes ? `The original (${fmtBytes(r.sourceSizeBytes)}) can be removed to reclaim disk space.` : ''}`,
       action: findModel({ model: sourceModel }) ? { label: 'Remove original', run: () => removeOriginal(sourceModel, { providerId }) } : null,
-      timeout: 12000,
+      timeout: 7000,
       id: `copy-${sourceModel}`,
     });
     return r;
