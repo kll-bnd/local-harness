@@ -23,6 +23,7 @@ import { setSecurityContext } from './security-ui.js';
 import { applyNetworkStatus, startNetworkClock } from './views/network.js';
 import { startIdleWatch, stopIdleWatch } from './views/idle.js';
 import { setMenuHandler } from './menu-bridge.js';
+import { startTamperNotice } from './views/tamper.js';
 
 const desktop = window.harnessDesktop || null;
 const root = document.getElementById('app');
@@ -418,7 +419,7 @@ store.on('route', () => {
 export async function start({ security, passwordReset } = {}) {
   store.set('security', security || null);
   store.set('passwordResetUntil', passwordReset?.until || null);
-  setSecurityContext({ mode: security?.mode || 'password' });
+  setSecurityContext({ mode: security?.mode || 'password', passwordSet: security?.passwordSet });
   if (security?.offlineLock) applyNetworkStatus(security.offlineLock);
   store.set('uiPrefs', getUi('prefs', {}) || {});
   shell.applyAppearance();
@@ -426,6 +427,7 @@ export async function start({ security, passwordReset } = {}) {
   registerBusHandlers();
   startNetworkClock();
   startIdleWatch(security);
+  startTamperNotice();
   connectEvents();
   loadRecommended().catch(() => {}); // friendly model names; not needed to start
   const results = await Promise.allSettled([loadSettings(), loadPresets(), loadSystem(), loadModels(), loadChats(), refreshMemoryCount()]);

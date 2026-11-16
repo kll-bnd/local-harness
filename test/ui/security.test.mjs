@@ -627,3 +627,71 @@ test('how the blocker is enforced: Ollama waiting to go back into the sandbox, a
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });
+
+test('start-up files weakened while Harness was closed: one calm notice, restored settings, dismissed for good', async () => {
+  const stack = await startStack({ secure: true });
+  await stack.setupPassword(PASSWORD);
+  // While Harness is not running, something edits its plain start-up file to claim less protection.
+  await stack.stopServer();
+  const file = path.join(stack.dataDir, 'launch.json');
+  const launch = JSON.parse(await fs.readFile(file, 'utf8'));
+  await fs.writeFile(file, JSON.stringify({ ...launch, encryption: 'off', offlineLock: false }));
+  await stack.startServerAgain();
+  const app = await openApp(stack);
+  try {
+    const { page } = app;
+    // Nothing about it before the unlock (it is not known then).
+    await page.waitForSelector('.gate input[name="password"]');
+    assert.equal(await page.locator('.tamper-notice').count(), 0);
+    assert.doesNotMatch(await page.locator('.gate').textContent(), /changed from outside/);
+    await unlockViaUi(page);
+    // Harness kept the protection…
+    const sec = await page.evaluate(async () => (await fetch('/api/security')).json());
+    assert.equal(sec.mode, 'password');
+    assert.equal(sec.offlineLock.enabled, true);
+    // …and says so once, in plain words, until the owner has seen it.
+    await page.waitForSelector('.tamper-notice');
+    const notice = await page.locator('.tamper-notice').textContent();
+    assert.match(notice, /Harness’s security settings were changed from outside/);
+    assert.match(notice, /While Harness was closed, one of its start-up files was edited to weaken its protection \(open without your password and switch off the internet blocker\)\. Harness ignored the change and restored your settings; your chats stayed encrypted\./);
+    assert.match(notice, /If you did not restore an old copy of the Harness folder yourself, another program on this Mac may have tried to tamper with it\./);
+    assert.match(notice, /Noticed /);
+    assert.doesNotMatch(notice, /launch\.json/);
+    await page.waitForTimeout(6000); // not a toast: it does not go away by itself
+    assert.equal(await page.locator('.tamper-notice').count(), 1);
+    await page.goto(`${stack.url}/#/settings/privacy`);
+    await page.waitForSelector('.privacy .privacy-tamper');
+    assert.match(await page.locator('.privacy .privacy-tamper').textContent(), /open without your password and switch off the internet blocker/);
+    await app.shot('40-tamper');
+    await page.locator('.privacy .privacy-tamper button', { hasText: 'OK, got it' }).click();
+    await page.waitForSelector('.tamper-notice', { state: 'detached' });
+    await page.waitForSelector('.privacy .privacy-tamper', { state: 'detached' });
+    // Gone for good: after a reload, and after locking and unlocking again.
+    await page.reload();
+    await page.waitForSelector('.privacy');
+    assert.equal(await page.locator('.tamper-notice, .privacy-tamper').count(), 0);
+    await lockViaKeys(page);
+    await unlockViaUi(page);
+    await page.waitForSelector('.privacy');
+    await page.waitForTimeout(500);
+    assert.equal(await page.locator('.tamper-notice, .privacy-tamper').count(), 0);
+    assert.equal((await page.evaluate(async () => (await fetch('/api/security')).json())).tamper, null);
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
+test('the plain-language list covers every documented field (unknown ones shown as they are)', async () => {
+  const stack = await startStack();
+  const app = await openApp(stack);
+  try {
+    const items = await app.page.evaluate(async () => {
+      const { tamperItems } = await import('/js/views/tamper.js');
+      return tamperItems(['launch.json: encryption', 'launch.json: offlineLock', 'launch.json: offlineLockSuspendedUntil', 'vault.json: encrypted', 'vault.json: migration',
+        'vault.json: security record (an older copy)', 'vault.json: security record (not sealed with this key)', 'vault.json: security record (says the data is not encrypted)', 'something new: field']);
+    });
+    assert.deepEqual(items, ['open without your password', 'switch off the internet blocker', 'allow internet access', 'store your chats unencrypted', 'an older or foreign copy of the key file', 'something new: field']);
+    // In off mode (plain chats by the owner's choice) it does not claim the chats stayed encrypted.
+    const off = await app.page.evaluate(async () => (await import('/js/views/tamper.js')).tamperText({ fields: ['launch.json: offlineLock'] }, { mode: 'off' }));
+    assert.equal(off, 'While Harness was closed, one of its start-up files was edited to weaken its protection (switch off the internet blocker). Harness ignored the change and restored your settings. If you did not restore an old copy of the Harness folder yourself, another program on this Mac may have tried to tamper with it.');
+  } finally { await app.close(); await stack.close(); }
+});

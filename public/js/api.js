@@ -271,6 +271,8 @@ export const security = {
   rekey: (password) => post('/api/security/rekey', { password }),
   /** → { confirmation, expiresAt }: a single-use X-Harness-Confirm value (2 minutes). */
   confirm: (password) => post('/api/security/confirm', { password }),
+  /** The owner has seen the "changed from outside" notice (security.tamper). → { tamper: null } */
+  dismissTamper: () => post('/api/security/tamper/dismiss', {}),
   /** The user is here (pointer, keys…): keeps Harness from auto-locking. → { ok, idleLockAt } */
   activity: () => post('/api/security/activity', {}),
 };

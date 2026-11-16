@@ -12,6 +12,7 @@ import { runAction, keyLabel, getAction } from '../actions.js';
 import { confirmWithPassword, passwordField, strengthMeter, recoveryKeyPanel, migrationProgress, RECOVERY_WARNING, setSecurityContext, confirmationHeader, clearOnEdit } from '../security-ui.js';
 import { networkState, scopeNote, allowFor, blockNow, setBlocker, selfTest } from './network.js';
 import { lockdown, holdLockdown } from '../lockdown.js';
+import { tamperCallout } from './tamper.js';
 
 const MODES = [
   { id: 'password', label: 'Ask for my password', recommended: true, text: 'Harness asks for your password when it opens. Only your password or recovery key can unlock the data.' },
@@ -30,7 +31,7 @@ async function refreshSecurity() {
   try {
     const s = await api.security.status();
     store.set('security', s);
-    setSecurityContext({ mode: s.mode });
+    setSecurityContext({ mode: s.mode, passwordSet: s.passwordSet });
     if (s.offlineLock) store.set('network', { ...s.offlineLock, receivedAt: Date.now() });
     return s;
   } catch (e) { return store.get('security'); }
@@ -42,6 +43,8 @@ export function privacySection(view) {
   const settings = store.get('settings') || {};
   const mode = sec.mode || 'password';
   const wrap = h('div.stack-lg.privacy');
+  // Start-up files changed from outside while Harness was closed (ignored): the same notice as in the app.
+  if (sec.tamper) add(wrap, tamperCallout(sec.tamper, { className: 'privacy-tamper' }));
 
   // ---- protection mode
   const modeList = h('div.mode-list', { role: 'radiogroup', attrs: { 'aria-label': 'How Harness protects your data' } }, MODES.map((m) => {
@@ -58,7 +61,8 @@ export function privacySection(view) {
 
   // ---- password + recovery key (+ re-keying after the Keychain held the key)
   const rk = sec.recoveryKey;
-  const noPassword = mode === 'off' && !rk; // off mode that never had a password (a recovery key comes with one)
+  // Off mode that never had a password (older backends: no recovery key either).
+  const noPassword = mode === 'off' && (typeof sec.passwordSet === 'boolean' ? !sec.passwordSet : !rk);
   const encrypted = mode !== 'off';
   add(wrap, h('section.form-block',
     h('h3.h3', 'Password and recovery key'),
@@ -214,7 +218,7 @@ async function changeMode(next, view) {
   const release = holdLockdown();
   try {
     let r;
-    if (sec.mode === 'off' && !sec.recoveryKey && next !== 'off') {
+    if (sec.mode === 'off' && (typeof sec.passwordSet === 'boolean' ? !sec.passwordSet : !sec.recoveryKey) && next !== 'off') {
       const newPassword = await choosePassword();
       if (!newPassword) return;
       try { r = await api.security.setMode({ mode: next, newPassword }); } catch (e) { showError(e, 'turn encryption on'); return; }

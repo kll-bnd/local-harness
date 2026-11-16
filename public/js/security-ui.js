@@ -138,7 +138,8 @@ export const RECOVERY_WARNING = 'This key is shown only now: Harness does not ke
  * → result, or null when cancelled.
  */
 export async function confirmWithPassword({ title, message = null, confirmLabel = 'Continue', danger = false, body = null, run, validate = null }) {
-  if (ctx.mode === 'off' && !validate) {
+  // Off mode: no password ever set (passwordSet false) → nothing to ask; unknown (older backend) → try first.
+  if (ctx.mode === 'off' && !validate && ctx.passwordSet !== true) {
     try { return await run(null); } catch (e) {
       if (!(e instanceof api.ApiError) || e.code !== 'confirmation_required') throw e;
     }
