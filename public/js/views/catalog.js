@@ -317,6 +317,7 @@ export class ModelPage {
       d.baseModels?.length ? ['Based on', d.baseModels.join(', ')] : null,
     ].filter(Boolean);
     this.filesEl = h('div.files-wrap');
+    this.glanceEl = h('div.glance-wrap');
     const card = d.card?.text ? h('div.prose.model-card', renderMarkdown(d.card.text, { quietImages: true })) : null;
     mount(this.el,
       this.back(d.source),
@@ -330,7 +331,7 @@ export class ModelPage {
           ...(d.capabilities || []).filter((c) => c !== d.kind).map((c) => h('span.badge.outline', c)),
           d.gated ? h('span.badge.warn', icon('lock', { size: 11 }), 'gated') : null)),
       d.gated ? h('div.callout.warn', icon('lock'), h('div', h('b', 'The publisher approves each download. '), 'Accept their terms on Hugging Face first; Harness cannot download gated models in one click.')) : null,
-      this.glance(d),
+      this.glanceEl,
       d.description ? h('p.model-desc', d.description) : null,
       h('dl.kv.model-kv', numbers.flatMap(([k, v]) => [h('dt', k), h('dd', v)])),
       h('section.panel-section', h('h2.h2', 'Files'), d.hasProjector ? h('p.field-help', `This model reads images through an extra part (${fmtBytes((d.projectors || []).reduce((n, p) => n + (p.size || 0), 0))}). On a Mac with little memory Harness makes a text-only copy without it.`) : null, this.filesEl),
@@ -344,6 +345,7 @@ export class ModelPage {
   renderFiles() {
     const d = this.detail;
     if (!d || !this.filesEl) return;
+    mount(this.glanceEl, this.glance(d));
     const rows = d.files.map((f) => {
       const fit = f.fit;
       const copy = fit?.basis === 'text_only_copy';

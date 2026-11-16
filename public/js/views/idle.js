@@ -15,7 +15,8 @@ import { isLockingDown } from '../lockdown.js';
 
 const PASSIVE = /^GET \/api\/(events|security|health|auth\/status|network)(\?|$)/;
 const BEAT_MS = 60_000;
-const WARN_MS = 60_000;
+/** Warn in the last minute (a third of the time for very short settings). */
+const warnMs = () => Math.min(60_000, (minutes() * 60000) / 3);
 
 let serverLockAt = null; // ms, from the backend (null = no auto-lock pending: off, never, or busy)
 let lastActivity = Date.now();
@@ -79,7 +80,7 @@ async function check() {
   const at = expected();
   if (at == null) { hideHint(); return; }
   const left = at - Date.now();
-  if (left > WARN_MS) { hideHint(); return; }
+  if (left > warnMs()) { hideHint(); return; }
   // Near the deadline: ask the backend (a passive read) unless it told us very recently.
   if (Date.now() - confirmedAt > 15000) {
     try {

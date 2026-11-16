@@ -216,33 +216,42 @@ export async function dataFileSize(file) {
 /** A readable stream of a stored file's plaintext; HXC1 files are decrypted chunk by chunk (bounded memory). */
 export function createDataReadStream(file) {
   let fh = null;
+  let opened = false;
+  let finished = false;
   let dec = null;
   let pos = 0;
   let plainMode = false;
   const READ = 256 * 1024;
+  const closeFh = async () => { const f = fh; fh = null; await f?.close().catch(() => {}); };
   return new Readable({
     async read() {
+      if (finished) return;
       try {
-        if (!fh) {
+        if (!opened) {
+          opened = true;
           fh = await fs.open(file, 'r');
           const h = Buffer.alloc(HEADER_C);
           const { bytesRead } = await fh.read(h, 0, HEADER_C, 0);
           if (bytesRead >= 4 && isHXC(h)) { dec = hxcDecryptor(readKeyFor(file, h), h.subarray(0, bytesRead)); pos = HEADER_C; } else if (bytesRead >= 4 && isHXL(h)) {
+            finished = true;
+            await closeFh();
             const all = await readFileData(file);
             this.push(all);
             this.push(null);
-            await fh.close();
             return;
           } else { plainMode = true; pos = 0; }
         }
         for (;;) {
+          if (!fh) return; // destroyed meanwhile
           const b = Buffer.alloc(READ);
           const { bytesRead } = await fh.read(b, 0, READ, pos);
           pos += bytesRead;
           if (!bytesRead) {
-            if (dec) { const last = dec.finish(); if (last.length) this.push(last); }
-            await fh.close();
-            fh = null;
+            // close first, then push the rest and the end together (a push may start the next read at once)
+            const last = dec ? dec.finish() : null;
+            finished = true;
+            await closeFh();
+            if (last?.length) this.push(last);
             this.push(null);
             return;
           }
@@ -251,9 +260,14 @@ export function createDataReadStream(file) {
           if (parts.length) { this.push(Buffer.concat(parts)); return; }
         }
       } catch (e) {
-        await fh?.close().catch(() => {});
+        finished = true;
+        await closeFh();
         this.destroy(e);
       }
+    },
+    destroy(err, cb) {
+      finished = true;
+      closeFh().then(() => cb(err));
     },
   });
 }

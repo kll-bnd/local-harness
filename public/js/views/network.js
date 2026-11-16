@@ -144,7 +144,7 @@ export function allowPanel(details, { onAllowed, title = 'Internet access is blo
     h('div.allow-icon', icon('shieldCheck', { size: 22 })),
     h('div.allow-body',
       h('h3.allow-title', title),
-      h('p.allow-text', `${describeWhat(details)} Harness keeps everything on this Mac until you allow it, and blocks it again after ${minutes} minutes.`),
+      h('p.allow-text', `${title === 'Internet access is blocked' ? `${describeWhat(details)} ` : ''}Harness keeps everything on this Mac until you allow it, and blocks it again by itself after ${minutes} minutes.`),
       h('div.row', btn, h('button.btn.btn-ghost', { type: 'button', on: { click: () => navigate('/settings/privacy') } }, 'Internet settings'))));
 }
 

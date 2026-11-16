@@ -73,12 +73,13 @@ describe('file formats', () => {
   test('production KDF: scrypt N=2^17 r=8 p=1 (128 MiB) takes a measurable fraction of a second and fits in memory', async () => {
     const kdf = newKdf(KDF_PRODUCTION);
     assert.equal(kdf.N, 131072);
-    const before = process.memoryUsage().rss;
+    const before = process.resourceUsage().maxRSS * 1024; // peak RSS so far
     const t0 = process.hrtime.bigint();
     const k = await deriveKey('correct horse battery staple', kdf);
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-    const grew = process.memoryUsage().rss - before;
-    console.log(`# production scrypt: ${ms.toFixed(0)} ms, RSS +${Math.round(grew / 1048576)} MiB (expected ≈128 MiB transient)`);
+    const peak = process.resourceUsage().maxRSS * 1024;
+    const grew = Math.max(0, peak - before);
+    console.log(`# production scrypt: ${ms.toFixed(0)} ms, peak RSS ${Math.round(peak / 1048576)} MiB (+${Math.round(grew / 1048576)} MiB; the 128 MiB work area is transient)`);
     assert.equal(k.length, 32);
     assert.ok(ms > 20, `suspiciously fast (${ms} ms): is the cost really N=2^17?`);
     assert.ok(ms < 15000, `too slow for an unlock (${ms} ms)`);
@@ -266,7 +267,7 @@ const fs = require('fs');
 let input = '';
 process.stdin.on('data', (d) => { input += d; });
 process.stdin.on('end', () => {
-  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), env: Object.keys(process.env).filter((k) => /KEY|HARNESS_DATA/.test(k)), stdin: input }) + '\\n');
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), keyInEnv: Object.values(process.env).some((v) => /^[A-Za-z0-9+/]{43}=$/.test(v)), stdin: input }) + '\\n');
   const mode = process.env.FAKE_MODE || 'ok';
   if (mode === 'hang') return setTimeout(() => {}, 60000);
   if (mode === 'deny') { process.stderr.write('security: SecKeychainSearchCopyNext: User canceled the operation. (-128)\\n'); process.exit(0); }
@@ -284,7 +285,7 @@ process.stdin.on('end', () => {
     const b64 = k.toString('base64');
     for (const c of calls) {
       assert.deepEqual(c.argv, ['-i']);
-      assert.ok(!JSON.stringify(c.argv).includes(b64) && !c.env.length);
+      assert.ok(!JSON.stringify(c.argv).includes(b64) && !c.keyInEnv);
     }
     assert.ok(calls.some((c) => c.stdin.includes(`-w ${b64}`) && c.stdin.includes('-s "local.harness"') && c.stdin.includes('-a "data-key"') && c.stdin.includes('-l "Harness data key"')));
     process.env.FAKE_MODE = 'deny';
