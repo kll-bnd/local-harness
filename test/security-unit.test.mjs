@@ -105,13 +105,14 @@ describe('key store (vault.json)', () => {
     v2.lock();
     assert.deepEqual(await v2.unlockWithRecoveryKey(rk), dek);
     v2.lock();
-    for (let i = 1; i <= 3; i++) await assert.rejects(v2.unlockWithPassword(`wrong ${i}`), (e) => e.code === 'wrong_password' && e.status === 401);
-    await assert.rejects(v2.unlockWithPassword('wrong 4'), (e) => e.code === 'wrong_password' && e.details.retryAfterMs === 1000);
+    for (let i = 1; i <= 2; i++) await assert.rejects(v2.unlockWithPassword(`wrong ${i}`), (e) => e.code === 'wrong_password' && e.status === 401 && e.details.retryAfterMs === 0);
+    await assert.rejects(v2.unlockWithPassword('wrong 3'), (e) => e.code === 'wrong_password' && e.details.retryAfterMs === 1000, 'the 3rd free attempt; the 4th must wait 1 s');
     await assert.rejects(v2.unlockWithPassword('correct horse'), (e) => e.code === 'unlock_throttled' && e.status === 429 && e.details.retryAfterMs > 0);
     const v3 = new Vault(dir).load(); // a restart keeps the count
     assert.ok(v3.retryAfterMs() > 0);
-    assert.equal(throttleDelay(3), 0);
-    assert.equal(throttleDelay(5), 2000);
+    assert.equal(throttleDelay(2), 0);
+    assert.equal(throttleDelay(3), 1000);
+    assert.equal(throttleDelay(4), 2000);
     assert.equal(throttleDelay(40), 300000);
   });
 

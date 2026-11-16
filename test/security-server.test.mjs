@@ -140,10 +140,10 @@ describe('password setup and sessions', () => {
     const { recoveryKey } = await s.setup();
     try {
       assert.equal((await s.call('POST', '/api/security/lock', {})).data.state, 'locked');
-      for (let i = 0; i < 3; i++) assert.equal((await s.unlock({ password: `wrong ${i}` })).data.error.code, 'wrong_password');
-      const fourth = await s.unlock({ password: 'wrong 3' });
-      assert.equal(fourth.status, 401);
-      assert.equal(fourth.data.error.details.retryAfterMs, 1000);
+      for (let i = 0; i < 2; i++) assert.equal((await s.unlock({ password: `wrong ${i}` })).data.error.code, 'wrong_password');
+      const third = await s.unlock({ password: 'wrong 2' });
+      assert.equal(third.status, 401);
+      assert.equal(third.data.error.details.retryAfterMs, 1000, 'three free attempts, then 1 s before the 4th');
       const early = await s.unlock();
       assert.equal(early.status, 429);
       assert.equal(early.data.error.code, 'unlock_throttled');
@@ -151,7 +151,7 @@ describe('password setup and sessions', () => {
       s = await stack({ dataDir: s.dataDir });
       const st = await s.call('GET', '/api/security');
       assert.equal(st.data.state, 'locked');
-      assert.equal(st.data.unlock.failedAttempts, 4);
+      assert.equal(st.data.unlock.failedAttempts, 3);
       assert.ok(st.data.unlock.retryAfterMs > 0 || (await s.unlock()).status === 200);
       await new Promise((r) => setTimeout(r, st.data.unlock.retryAfterMs + 50));
       const rk = await s.unlock({ recoveryKey: recoveryKey.toLowerCase().replace(/-/g, ' ') });
@@ -162,6 +162,26 @@ describe('password setup and sessions', () => {
       await s.call('POST', '/api/security/lock', {});
       assert.equal((await s.unlock()).data.error.code, 'wrong_password');
       assert.equal((await s.unlock({ password: 'a brand new one' })).status, 200);
+    } finally { await s.close(); }
+  });
+});
+
+describe('unlock throttle under concurrency (review 02)', () => {
+  test('40 simultaneous guesses: only the 3 free ones reach the key derivation; after the wait, one more', async () => {
+    const s = await stack();
+    await s.setup();
+    try {
+      await s.call('POST', '/api/security/lock', {});
+      const guess = (pw) => fetch(`${s.url}/api/security/unlock`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: pw }) }).then(async (r) => ({ status: r.status, body: await r.json() }));
+      const r1 = await Promise.all(Array.from({ length: 40 }, (_, i) => guess(`wrong-${i}`)));
+      assert.equal(r1.filter((r) => r.status === 401).length, 3, 'checked against the password');
+      assert.equal(r1.filter((r) => r.status === 429).length, 37, 'refused without a key derivation');
+      const st = (await s.call('GET', '/api/security')).data.unlock;
+      assert.equal(st.failedAttempts, 3);
+      await new Promise((r) => setTimeout(r, st.retryAfterMs + 100));
+      const r2 = await Promise.all(Array.from({ length: 40 }, (_, i) => guess(`again-${i}`)));
+      assert.equal(r2.filter((r) => r.status === 401).length, 1, 'one guess per window');
+      assert.ok(r2.filter((r) => r.status === 429).every((r) => r.body.error.details.retryAfterMs > 0));
     } finally { await s.close(); }
   });
 });

@@ -11,9 +11,13 @@ import { HttpError } from '../lib/errors.mjs';
 export const MIN_PASSWORD = 8;
 const AAD = (name) => `harness-wrap-v1:${name}`;
 
-/** Unlock throttle: attempts 1–3 free, then 1 s, 2 s, 4 s … up to 5 minutes. */
+/**
+ * Unlock throttle: the wait before the next attempt after `failures` counted attempts — attempts 1–3 free, then
+ * 1 s before the 4th, 2 s before the 5th, … up to 5 minutes. Every attempt is counted (and persisted) BEFORE the
+ * key derivation starts, so concurrent guesses cannot share one window.
+ */
 export function throttleDelay(failures) {
-  return failures <= 3 ? 0 : Math.min(300000, 1000 * 2 ** (failures - 4));
+  return failures < 3 ? 0 : Math.min(300000, 1000 * 2 ** (failures - 3));
 }
 
 const B64 = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -129,19 +133,28 @@ export class Vault {
     return Math.max(0, Date.parse(t.lastFailureAt || 0) + wait - Date.now());
   }
 
-  _throttleCheck() {
+  /**
+   * One guess: refused with 429 (and no key derivation) while the wait is running; otherwise counted and persisted
+   * NOW, before the slow KDF — synchronously, so overlapping requests each see the previous one's count. A
+   * success resets the count.
+   */
+  _beginAttempt() {
     const wait = this.retryAfterMs();
     if (wait > 0) throw new HttpError(429, 'unlock_throttled', `Too many attempts. Try again in ${Math.ceil(wait / 1000)} s.`, { retryAfterMs: wait });
+    this.meta.throttle = { failures: (this.meta.throttle?.failures || 0) + 1, lastFailureAt: new Date().toISOString() };
+    this.save();
   }
 
   _fail(code, message) {
-    this.meta.throttle = { failures: (this.meta.throttle?.failures || 0) + 1, lastFailureAt: new Date().toISOString() };
-    this.save();
-    return new HttpError(401, code, message, { retryAfterMs: throttleDelay(this.meta.throttle.failures) });
+    return new HttpError(401, code, message, { retryAfterMs: throttleDelay(this.meta.throttle?.failures || 0) });
+  }
+
+  _resetThrottle() {
+    if (this.meta.throttle?.failures) { this.meta.throttle = { failures: 0, lastFailureAt: null }; this.save(); }
   }
 
   _succeed(dek) {
-    if (this.meta.throttle?.failures) { this.meta.throttle = { failures: 0, lastFailureAt: null }; this.save(); }
+    this._resetThrottle();
     // Already open: keep the buffer the file ciphers hold (same key) and drop the new copy.
     if (this.dek) {
       if (this.dek.equals(dek)) { if (dek !== this.dek) wipe(dek); return this.dek; }
@@ -163,14 +176,14 @@ export class Vault {
   // Key ownership: unlockWith*() return the vault's OWN data-key buffer (the one the file ciphers hold) — callers
   // must not wipe it (lock() does); setKeychainWrap(true) returns a fresh key the caller owns and wipes.
   async unlockWithPassword(password) {
-    this._throttleCheck();
+    this._beginAttempt();
     const dek = typeof password === 'string' && password ? await this._openPassword(password) : null;
     if (!dek) throw this._fail('wrong_password', 'That password is not right.');
     return this._succeed(dek);
   }
 
   async unlockWithRecoveryKey(text) {
-    this._throttleCheck();
+    this._beginAttempt();
     const rk = parseRecoveryKey(text);
     const w = this.meta?.wraps?.recovery;
     let dek = null;
@@ -184,12 +197,14 @@ export class Vault {
     return this._succeed(dek);
   }
 
-  /** Keychain mode: the key from the Keychain (or the app); null/false when it does not open the data. */
+  /** Keychain mode: the key from the Keychain (or the app); null/false when it does not open the data. Not a guess. */
   unlockWithKeychainKey(kek) {
     const w = this.meta?.wraps?.keychain;
     const dek = w && kek ? unseal(Buffer.from(kek), w, AAD('keychain')) : null;
     if (!dek) return null;
-    return this._succeed(dek);
+    if (this.dek) { if (this.dek.equals(dek)) { wipe(dek); return this.dek; } wipe(this.dek); }
+    this.dek = dek;
+    return dek;
   }
 
   /** Does `kek` (a key read from the Keychain) open this key store's keychain wrap? No side effects. */
@@ -204,11 +219,11 @@ export class Vault {
 
   /** Check the password for a confirmation while unlocked (same throttle). */
   async verifyPassword(password) {
-    this._throttleCheck();
+    this._beginAttempt();
     const dek = typeof password === 'string' && password ? await this._openPassword(password) : null;
     if (!dek) throw this._fail('wrong_password', 'That password is not right.');
     wipe(dek);
-    if (this.meta.throttle?.failures) { this.meta.throttle = { failures: 0, lastFailureAt: null }; this.save(); }
+    this._resetThrottle();
     return true;
   }
 
