@@ -44,7 +44,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     },
     custom: [],
   },
-  ollama: { autoStart: true, stopOnExit: true, binaryPath: null, flashAttention: true, kvCacheType: 'q8_0', numParallel: 1, maxLoadedModels: 'auto', extraEnv: {} },
+  ollama: { autoStart: true, stopOnExit: true, binaryPath: null, flashAttention: true, kvCacheType: 'q8_0', numParallel: 1, maxLoadedModels: 'auto', noCloud: true, promptCacheMiB: 'auto', extraEnv: {} },
   image: {
     enabled: true,
     providerId: null,
@@ -130,7 +130,10 @@ export const SETTINGS_SCHEMA = obj({
   ollama: obj({
     autoStart: bool(), stopOnExit: bool(), binaryPath: str({ max: 1000 }), flashAttention: bool(), kvCacheType: oneOf(['f16', 'q8_0', 'q4_0']),
     numParallel: num(1, 16, { int: true, nullable: false }), maxLoadedModels: custom((v, p) => (v === 'auto' || (Number.isInteger(v) && v >= 1 && v <= 16) ? null : `${p} must be 'auto' or 1-16`)),
-    extraEnv: custom((v, p) => (v && typeof v === 'object' && Object.keys(v).every((k) => /^OLLAMA_[A-Z_]+$/.test(k)) ? null : `${p} keys must look like OLLAMA_*`)),
+    noCloud: bool(),
+    // MiB for llama-server's host-RAM prompt cache (LLAMA_ARG_CACHE_RAM); 'auto' scales with RAM, null = runner default
+    promptCacheMiB: custom((v, p) => (v === 'auto' || (Number.isInteger(v) && v >= 0 && v <= 65536) ? null : `${p} must be 'auto', null or 0-65536 (MiB)`)),
+    extraEnv: custom((v, p) => (v && typeof v === 'object' && Object.keys(v).every((k) => /^OLLAMA_[A-Z_]+$/.test(k) || k === 'LLAMA_ARG_CACHE_RAM') ? null : `${p} keys must look like OLLAMA_* (or LLAMA_ARG_CACHE_RAM)`)),
   }),
   image: obj({
     enabled: bool(), providerId: str({ max: 64 }), model: str({ max: 500 }),

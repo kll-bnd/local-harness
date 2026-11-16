@@ -16,6 +16,7 @@ import { generateTitle, provisionalTitle } from './titles.mjs';
 import { embeddingProfileFor } from '../providers/catalog.mjs';
 import { ramTier, isCpuSplit, roundCtx } from '../context/sizing.mjs';
 import { normalizeUrl, URL_RE } from '../lib/url.mjs';
+import { loadFailureError } from '../providers/load-failure.mjs';
 
 const nonNull = (o) => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v !== null && v !== undefined));
 
@@ -340,8 +341,10 @@ export class ChatEngine {
       this.app.chats.saveNow(chat).catch(() => {});
       this.app.bus.publish('generation.finished', { chatId: chat.id, generationId });
     };
+    let target = null;
     try {
       const t = prepared || (await this.target(chat, modelRef));
+      target = t;
       // Re-check after the awaits: the chat or the message may have been deleted meanwhile.
       if (this.app.chats.chats.get(chat.id) !== chat) throw new HttpError(404, 'not_found', 'Chat not found (it was deleted)');
       if (!chat.messages[anchorId]) throw new HttpError(409, 'message_deleted', 'The message to answer no longer exists');
@@ -421,6 +424,16 @@ export class ChatEngine {
       const maxIter = s.tools?.maxIterations ?? 6;
       let iteration = 0;
       let measured = false;
+      let lastTools = []; // tool messages of the latest tool batch (for an empty final answer)
+      let retriedEmpty = false;
+      const addUsage = (u) => {
+        if (!u) return;
+        totals.promptTokens += u.promptTokens || 0;
+        totals.completionTokens += u.completionTokens || 0;
+        totals.evalMs += u.evalMs || 0;
+        totals.promptMs += u.promptMs || 0;
+        totals.loadMs += u.loadMs || 0;
+      };
       for (;;) {
         const offerTools = tools.length && iteration < maxIter ? tools : undefined;
         if (this.app.modelState.unloadedForImage) emit('model_status', { phase: 'loading', models: this.app.modelState.models, reason: 'reload_after_image', message: 'Reloading the chat model…' });
@@ -429,12 +442,9 @@ export class ChatEngine {
         if (r.toolsRejected) { tools = []; toolDefs = []; this.app.registry.toolsRejected.add(`${t.provider.id}|${t.model}`); }
         totals.iterations++;
         lastUsage = r.usage;
+        if (r.usage) this.app.loadFailures?.clear(t.provider.id, t.model);
         if (r.usage) {
-          totals.promptTokens += r.usage.promptTokens || 0;
-          totals.completionTokens += r.usage.completionTokens || 0;
-          totals.evalMs += r.usage.evalMs || 0;
-          totals.promptMs += r.usage.promptMs || 0;
-          totals.loadMs += r.usage.loadMs || 0;
+          addUsage(r.usage);
           if (r.usage.promptTokens) {
             const cal = this.app.calibrator.observe(t.provider.id, t.model, { estimatedRaw: asm.rawEstimate, actual: r.usage.promptTokens, numCtx: t.plan.numCtx, hasImages: asm.hasImages });
             if (cal) t.counter = this.app.calibrator.counter(t.provider.id, t.model, { imageTokens: t.info.profile?.imageTokens || 576 });
@@ -454,6 +464,7 @@ export class ChatEngine {
           asst.updatedAt = nowIso();
           emit('message', { message: publicMessage(asst) });
           let parent = asst;
+          lastTools = [];
           for (const call of r.toolCalls) {
             totals.toolCalls++;
             const tm = { id: newId('msg'), parentId: parent.id, role: 'tool', toolCallId: call.id, toolName: call.name, content: '', status: 'running', createdAt: nowIso() };
@@ -481,6 +492,7 @@ export class ChatEngine {
             tm.durationMs = Date.now() - started;
             emit('tool_result', { message: publicMessage(tm), toolCallId: call.id, name: call.name, content: tm.content, isError: tm.isError, data: tm.data ?? null, images: tm.images || [], durationMs: tm.durationMs });
             parent = tm;
+            lastTools.push({ tm, call });
           }
           this.app.chats.touch(chat);
           iteration++;
@@ -491,6 +503,21 @@ export class ChatEngine {
           asst.context = { ...asm.usage, summaryId: summary?.id || null };
           emit('context', { ...asst.context, messageId: asst.id });
           continue;
+        }
+        // An empty final answer after tool results is a normal outcome (seen with Nemotron after generate_image):
+        // the image is the answer; for other tools ask once more without tools, then fall back to a neutral line.
+        if (!r.toolCalls.length && lastTools.length && !asst.content.trim()) {
+          const fill = (text, kind) => { asst.content = text; asst.fallback = kind; emit('token', { messageId: asst.id, delta: text }); };
+          const pics = lastTools.filter(({ tm }) => tm.toolName === 'generate_image' && !tm.isError && tm.images?.length);
+          if (pics.length) {
+            fill(imageAnswerText(pics), 'image');
+          } else if (!retriedEmpty) {
+            retriedEmpty = true;
+            const r2 = await this.streamOnce({ t, messages: asm.messages, tools: undefined, options, think, signal: sig, asst, emit });
+            totals.iterations++;
+            if (r2.usage) { lastUsage = r2.usage; addUsage(r2.usage); emit('stats', statsPayload(asst.id, iteration, r2.usage, t.plan.numCtx)); }
+            if (!asst.content.trim()) fill(toolSummaryText(lastTools), 'tool_summary');
+          }
         }
         if (r.toolCalls.length && !offerTools) finalReason = 'tool_limit';
         break;
@@ -505,12 +532,16 @@ export class ChatEngine {
         finalReason = 'aborted';
         if (asst) asst.status = 'aborted';
       } else {
+        if (e.code === 'model_load_failed' && target && !e.nextSteps) {
+          this.app.loadFailures?.record(target.provider.id, target.model, { message: e.message });
+          e = loadFailureError(e, { model: target.model, providerId: target.provider.kind === 'ollama' ? target.provider.id : null, info: target.info, totalMem: this.app.system.totalMem });
+        }
         log.warn(`Generation failed for ${chat.id}: ${e.message}`);
-        if (asst) { asst.status = 'error'; asst.error = e.message; asst.errorCode = e.code || 'internal_error'; }
+        if (asst) { asst.status = 'error'; asst.error = e.message; asst.errorCode = e.code || 'internal_error'; if (e.nextSteps) asst.nextSteps = e.nextSteps; }
         // Close any tool messages left running.
         for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'error'; m.content ||= `Error: ${e.message}`; m.isError = true; } }
         finishUp();
-        emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId });
+        emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId, ...(e.nextSteps ? { nextSteps: e.nextSteps } : {}) });
         return asst;
       }
     } finally {
@@ -621,6 +652,21 @@ export class ChatEngine {
     this.app.chats.touch(chat);
     return m;
   }
+}
+
+function imageAnswerText(pics) {
+  const n = pics.reduce((a, { tm }) => a + tm.images.length, 0);
+  const prompt = pics[0].call?.arguments?.prompt || pics[0].tm.images[0]?.prompt || '';
+  return `Here ${n > 1 ? `are the ${n} images` : 'is the image'}${prompt ? ` of “${String(prompt).slice(0, 200)}”` : ''}.`;
+}
+
+function toolSummaryText(list) {
+  const parts = list.map(({ tm }) => {
+    const text = String(tm.content || '').replace(/\s+/g, ' ').trim();
+    const short = text.length > 200 ? `${text.slice(0, 199)}…` : text;
+    return tm.isError ? `${tm.toolName} failed (${short || 'no details'})` : `${tm.toolName}: ${short || 'done'}`;
+  });
+  return `Tool results — ${parts.join('; ')}`;
 }
 
 function statsPayload(messageId, iteration, u, numCtx) {

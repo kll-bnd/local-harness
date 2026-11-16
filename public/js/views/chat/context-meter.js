@@ -2,7 +2,8 @@
 // The bar spans the whole window (numCtx): coloured segments for each prompt component, empty prompt
 // budget, a hatched reply reserve at the end, and a tick where auto-summarization kicks in.
 import { h, add } from '../../lib/dom.js';
-import { fmtInt, fmtTokens, fmtBytes, fmtPercent } from '../../lib/format.js';
+import { fmtInt, fmtTokens, fmtBytes, fmtPercent, modelShort } from '../../lib/format.js';
+import { icon } from '../../lib/icons.js';
 
 export const SEGMENTS = [
   { key: 'system', label: 'System prompt', help: 'Preset / persona instructions' },
@@ -89,6 +90,7 @@ export function contextPanel(ctx, plan, opts = {}) {
       h('h3.section-title', 'Why this size'),
       h(`div.callout${warn ? '.warn' : ''}.ctx-explain`, h('span', plan.explanation)),
       plan.contextNote ? h('p.faint.small', plan.contextNote) : null,
+      warningList(plan, opts),
       opts.onMode ? modeControl(plan, opts) : null,
       opts.maxPlan ? maxCost(plan, opts.maxPlan) : null,
       plan.memory ? memoryTable(plan) : null,
@@ -107,6 +109,17 @@ export function contextPanel(ctx, plan, opts = {}) {
     ));
   }
   return h('div.ctx-panel', parts);
+}
+
+/** Plan warnings (swapping, CPU offload, model too large…), each with the suggested fix when the API names one. */
+function warningList(plan, opts) {
+  const ws = (plan.warnings || []).filter((w) => w.message && w.message !== plan.explanation);
+  if (!ws.length) return null;
+  return h('ul.warn-list', ws.map((w) => {
+    const suggested = w.suggestedModel || w.suggestion?.model || w.details?.suggestedModel || null;
+    return h('li', icon('warning', { size: 13 }), h('div.grow', h('div', w.message),
+      suggested && opts.onSwitchModel ? h('button.btn.btn-small', { type: 'button', on: { click: () => opts.onSwitchModel(suggested, w) } }, `Switch to ${modelShort(typeof suggested === 'string' ? suggested : suggested.model, 32)}`) : null));
+  }));
 }
 
 function modeControl(plan, opts) {

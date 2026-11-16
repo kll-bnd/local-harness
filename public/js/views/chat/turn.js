@@ -4,7 +4,7 @@
 import { h, copyText, mount, add } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
 import { StreamingMarkdown, renderMarkdown, renderUserMarkdown } from '../../lib/markdown.js';
-import { fmtTime, fmtFull, fmtInt, fmt1, fmtMs, fmtBytes, modelLabel, plural, truncate } from '../../lib/format.js';
+import { fmtTime, fmtFull, fmtInt, fmt1, fmtMs, fmtBytes, modelLabel, modelShort, plural, truncate } from '../../lib/format.js';
 import { openMenu, toast } from '../../ui/overlays.js';
 import { openLightbox } from '../../ui/lightbox.js';
 import { explainError } from '../../errors.js';
@@ -32,7 +32,7 @@ function modelName(ref) {
   if (!ref) return 'Assistant';
   if (ref.kind === 'image') return ref.model ? `Image · ${modelLabel(ref.model.replace(/\s*\[[^\]]+\]$/, ''))}` : 'Image';
   const known = (store.get('models') || []).find((m) => m.model === ref.model);
-  return modelLabel(known?.name || ref.model);
+  return modelShort(known?.name || ref.model, 44);
 }
 
 function branchSwitcher(msg, ctx, label) {
@@ -286,7 +286,8 @@ export class TurnView {
     if (!this.materialized) return;
     const isLast = this.ctx.view.isLastTurn(this.key);
     const live = isLast ? this.ctx.model.live : null;
-    const liveSig = live ? `${live.phase}:${live.compaction?.status}:${live.modelStatus?.phase}:${[...this.ctx.model.tool.values()].map((t) => `${t.phase}${t.progress}${t.images.length}${t.status}`).join()}` : '';
+    const liveD = live ? describeLive(this.ctx.model) : null;
+    const liveSig = live ? `${live.phase}:${live.compaction?.status}:${live.modelStatus?.phase}:${liveD?.label}:${[...this.ctx.model.tool.values()].map((t) => `${t.phase}${t.progress}${t.images.length}${t.status}`).join()}` : '';
     const trailN = turn.chain.reduce((n, m) => n + (this.ctx.model.trail.get(m.id)?.length || 0), 0);
     const s = `${sig(turn.user)}|${turn.chain.map(sig).join('|')}|${liveSig}|${isLast}|${this.ctx.model.generating}|${this.ctx.view.editing || ''}|${trailN}`;
     if (!force && s === this.sigs) return;
@@ -370,6 +371,7 @@ export class TurnView {
     mount(this.statusEl,
       ...trail.map((t) => h('span.status-line.done', icon(t.icon, { size: 13 }), t.text)),
       d ? h(`span.status-line.phase-${d.phase}`, h('span.spinner.small'), d.label) : null,
+      d?.hint ? h('span.status-hint', d.hint) : null,
     );
     this.statusEl.hidden = !this.statusEl.childNodes.length;
 
@@ -382,6 +384,13 @@ export class TurnView {
         h('button.btn.btn-small', { type: 'button', dataset: { action: 'regenerate', id: last.id } }, icon('regenerate', { size: 13 }), 'Retry')));
     } else if (last?.status === 'aborted' && !(isLast && model.live)) {
       notes.push(h('div.note-line', icon('stop', { size: 11 }), 'Stopped'));
+    }
+    // A turn that is only tool work (e.g. the image *is* the answer) should read as finished, not empty.
+    const anyText = chain.some((m) => m.role === 'assistant' && (m.content || '').trim());
+    const toolMsgsAll = chain.filter((m) => m.role === 'tool');
+    if (!anyText && toolMsgsAll.length && last?.status === 'complete' && !(isLast && model.live)) {
+      const nImg = toolMsgsAll.reduce((n, m) => n + (m.images?.length || 0), 0);
+      notes.push(h('div.note-line.done-line', icon('check', { size: 13 }), nImg ? `Done — ${plural(nImg, 'image')} above.` : `Done — ${plural(toolMsgsAll.length, 'tool')} used.`));
     }
     if (last?.finishReason === 'length') notes.push(h('div.note-line', icon('info', { size: 13 }), 'Cut off at the reply length limit.'));
     if (last?.finishReason === 'tool_limit') notes.push(h('div.note-line', icon('info', { size: 13 }), 'Stopped after reaching the tool-call limit for one turn.'));

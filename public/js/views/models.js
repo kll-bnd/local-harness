@@ -68,7 +68,7 @@ export class ModelsView {
             const caps = m.capabilities || [];
             const prov = providers.find((p) => p.id === m.providerId);
             return h('tr', { dataset: { model: m.model } },
-              h('td', h('div.row', m.loaded ? h('span.dot.ok', { title: 'Loaded' }) : h('span.dot', { title: 'Not loaded' }), h('div.grow', h('div.model-name', modelLabel(m.name)), h('div.faint.small', [m.parameterSize, m.quantization, m.family].filter(Boolean).join(' · '))),
+              h('td', h('div.row', m.loaded ? h('span.dot.ok', { title: 'Loaded' }) : h('span.dot', { title: 'Not loaded' }), h('div.grow', h('div.model-name', { title: m.model }, modelLabel(m.name)), m.model.length > 28 ? h('div.faint.small.mono.ellipsis.model-id', { title: m.model }, m.model) : null, h('div.faint.small', [m.parameterSize, m.quantization, m.family].filter(Boolean).join(' · '))),
                 isDef ? h('span.badge.accent', { title: explicitDefault ? 'Default model' : 'Chosen automatically' }, explicitDefault ? 'default' : 'default (auto)') : null)),
               h('td.hide-narrow.num', fmtBytes(m.sizeBytes)),
               h('td.num', m.contextLength ? fmtTokens(m.contextLength) : '—'),

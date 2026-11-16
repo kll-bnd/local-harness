@@ -25,7 +25,8 @@ export class SetupView {
   async show() {
     this.render();
     loadSystem({ refresh: true }).catch(() => {});
-    loadRecommended().catch(() => {});
+    this.recError = null;
+    loadRecommended().catch((e) => { this.recError = e; this.render(); });
   }
 
   toolbar() { return { title: h('div.tb-title.page-title', h('span.title-text', 'Setup & health')), actions: [h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Check again')] }; }
@@ -70,7 +71,9 @@ export class SetupView {
       const def = store.get('defaultModel');
       modelBody = h('div.stack',
         hasModel ? h('p', `${models.length} chat model${models.length === 1 ? '' : 's'} installed. Default: `, h('b', def ? modelLabel(def.model) : '—'), '.') : h('p', 'No chat model installed yet. This one is suggested for this machine:'),
-        rec ? this.recommendations(rec, hasModel) : h('div.muted.small', h('span.spinner.small'), ' Checking what fits…'));
+        rec ? this.recommendations(rec, hasModel)
+          : this.recError ? h('div.callout.warn', icon('warning'), h('div.grow', "Couldn't load the recommendations: ", this.recError.message), h('button.btn.btn-small', { type: 'button', on: { click: () => this.show() } }, 'Try again'))
+            : h('div.muted.small', h('span.spinner.small'), ' Checking what fits…'));
     }
 
     // machine
@@ -130,7 +133,7 @@ export function recCard(r, machine) {
     return h(`div.variant${v.model === r.suggestedVariant ? '.suggested' : ''}`,
       h('div.grow',
         h('div.row', h('b', v.label), v.model === r.suggestedVariant ? h('span.badge.accent', 'best fit') : null, !v.estimate.fits ? h('span.badge.warn', 'too large') : null, v.installed ? h('span.badge', 'installed') : null, isDefault ? h('span.badge.outline', 'default') : null),
-        h('div.faint.small.mono.ellipsis', v.model),
+        h('div.faint.small.mono.ellipsis', { title: v.model }, v.model),
         h('div.small.muted', `${fmtBytes(v.approxSizeBytes)} · ${fmtTokens(v.estimate.numCtx)} context here`),
         h('div.small.variant-expl', v.estimate.explanation)),
       p && !p.done ? pullProgress(p)

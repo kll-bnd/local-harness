@@ -3,9 +3,9 @@
 // (per-chat overrides: preset, system prompt, sampling, tools).
 import { h, debounce, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
-import { fmtInt, fmtFull, fmtRelative, plural, truncate, modelLabel } from '../lib/format.js';
+import { fmtInt, fmtFull, fmtRelative, plural, truncate, modelLabel, modelShort } from '../lib/format.js';
 import { renderMarkdown } from '../lib/markdown.js';
-import { store, setUiPref, uiPrefs, findModel } from '../state.js';
+import { store, setUiPref, uiPrefs, findModel, patchSettings } from '../state.js';
 import * as api from '../api.js';
 import { contextPanel } from './chat/context-meter.js';
 import { compactNow } from '../chat/session.js';
@@ -113,6 +113,11 @@ export class Inspector {
       compactionEnabled,
       onToggleCompaction: (on) => this.patch({ settings: { compaction: { enabled: on } } }),
       onCompact: () => compactNow(m).then(() => this.render()),
+      onSwitchModel: (suggested) => {
+        const ref = typeof suggested === 'string' ? { model: suggested } : { providerId: suggested.providerId, model: suggested.model };
+        this.patch({ settings: { model: ref } });
+        toast({ kind: 'success', message: `This chat now uses ${modelShort(ref.model, 40)}`, action: { label: 'Make default', run: () => patchSettings({ defaultModel: ref }).catch((e) => showError(e)) } });
+      },
       busy: m.generating || m.compacting || !m.path.length,
       compacting: m.compacting,
     });
@@ -254,7 +259,7 @@ export class Inspector {
       ...presets.map((x) => h('option', { value: x.id, selected: cs.presetId === x.id }, x.name)));
     const think = cs.reasoning?.think ?? null;
     const thinkCtl = h('div.segmented', { role: 'radiogroup', 'aria-label': 'Thinking' },
-      ...[['', 'Default'], ['off', 'Off'], ['low', 'Low'], ['medium', 'Med'], ['high', 'High']].map(([v, l]) => h('button', { type: 'button', role: 'radio', 'aria-checked': String((think ?? '') === v), on: { click: () => this.patch({ settings: { reasoning: v ? { think: v } : null } }) } }, l)));
+      ...[['off', 'Off'], ['on', 'On'], ['low', 'Low'], ['medium', 'Med'], ['high', 'High']].map(([v, l]) => h('button', { type: 'button', role: 'radio', 'aria-checked': String((think === 'auto' || !think ? 'off' : think) === v), on: { click: () => this.patch({ settings: { reasoning: { think: v } } }) } }, l)));
     const tools = s?.tools?.builtin || {};
     const ctools = cs.tools?.builtin || {};
     const toolNames = Object.keys(tools);

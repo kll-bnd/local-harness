@@ -11,6 +11,8 @@ import { ChatStore } from './store/chats.mjs';
 import { AttachmentStore } from './store/attachments.mjs';
 import { Calibrator } from './context/tokens.mjs';
 import { MeasurementStore } from './context/measurements.mjs';
+import { LoadFailures } from './providers/load-failure.mjs';
+import { ModelCopies } from './providers/text-only.mjs';
 import { ProviderRegistry } from './providers/registry.mjs';
 import { OllamaProcess } from './providers/ollama-process.mjs';
 import { Embedder } from './memory/embedder.mjs';
@@ -88,6 +90,8 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.gallery = await new Gallery({ dataDir, bus }).load();
   app.imageProviders = new ImageProviderRegistry({ settings: app.settings, bus, autodetect });
   app.modelState = new ModelState(app);
+  app.loadFailures = new LoadFailures();
+  app.modelCopies = await new ModelCopies(dataDir).load();
   app.engine = new ChatEngine(app);
   app.llm = new LLM(app);
   app.images = new ImageService(app);

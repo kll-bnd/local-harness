@@ -22,7 +22,7 @@ const patchFor = (path, value) => {
 };
 const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
-const THINK = [['auto', 'Auto'], ['on', 'On'], ['off', 'Off'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']];
+const THINK = [['auto', 'Off'], ['on', 'On'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']];
 
 /** Field descriptors per section. `adv: true` goes behind the "Advanced" disclosure. */
 function fieldsFor(section) {
@@ -39,7 +39,7 @@ function fieldsFor(section) {
       { path: 'titles.model', label: 'Model for titles', adv: true, ...modelOpt('Same as the chat') },
     ];
     case 'model': return [
-      { path: 'reasoning.think', label: 'Thinking', help: 'For models that can reason before answering. Auto/On think when the model supports it.', type: 'segmented', options: THINK },
+      { path: 'reasoning.think', label: 'Thinking by default', help: 'For models that can reason before answering: slower first token, often better answers. Each chat can switch it from the composer.', type: 'segmented', options: THINK },
       { path: 'context.mode', label: 'Context window', type: 'contextMode', help: 'Auto picks the largest window that safely fits in memory on this machine.' },
       { path: 'keepAlive', label: 'Keep model loaded', type: 'select', options: [['5m', '5 minutes'], ['30m', '30 minutes'], ['2h', '2 hours'], ['-1', 'Always'], ['0', 'Unload after each reply']], help: 'How long Ollama keeps the model in memory after a reply.' },
       { path: 'systemPrompt', label: 'System prompt override', type: 'textarea', nullable: true, placeholder: 'Empty: use the preset’s instructions', help: 'Applies to every chat unless the chat sets its own.' },
@@ -250,6 +250,7 @@ export class SettingsView {
       case 'switch':
         return h('button.switch', { id, type: 'button', role: 'switch', 'aria-checked': String(!!v), on: { click: () => this.save(f, !v) } });
       case 'segmented':
+        if (f.path === 'reasoning.think' && v === 'off') v = 'auto';
         return h('div.segmented', { id, role: 'radiogroup', attrs: { 'aria-label': f.label } }, f.options.map(([val, label]) => h('button', { type: 'button', role: 'radio', 'aria-checked': String(v === val), on: { click: () => this.save(f, val) } }, label)));
       case 'select': {
         const sel = h('select.select', { id, on: { change: (e) => this.save(f, e.target.value) } }, f.options.map(([val, label]) => h('option', { value: val, selected: String(v) === String(val) }, label)));

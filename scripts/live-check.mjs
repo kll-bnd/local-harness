@@ -293,7 +293,7 @@ const SRC = {
   resolveThink: ['server/chat/engine.mjs', 'export function resolveThink', 'resolveThink'],
   retryThink: ['server/chat/engine.mjs', "'thinking_unsupported' && useThink", 'ChatEngine.streamOnce (retry without think)'],
   retryTools: ['server/chat/engine.mjs', "'tools_unsupported' && useTools", 'ChatEngine.streamOnce (retry without tools)'],
-  llmThinkFalse: ['server/chat/llm.mjs', "includes('thinking') ? false", 'LLM.completeWith (think:false)'],
+  llmThinkFalse: ['server/chat/llm.mjs', 'let think =', 'LLM.completeWith (think:false)'],
   llmFormat: ['server/chat/llm.mjs', 'format|schema|grammar', 'LLM.completeWith (format retry)'],
   extractor: ['server/memory/extractor.mjs', 'format: MEMORY_SCHEMA', 'extractMemories (format)'],
   parseJsonLoose: ['server/chat/llm.mjs', 'export function parseJsonLoose', 'parseJsonLoose'],
@@ -454,6 +454,7 @@ def('ollama.unload.chat', 'raw', 'POST /api/generate {model, keep_alive:0} → d
 def('ollama.think.on', 'raw', 'think:true on a thinking model streams message.thinking separately from message.content', ['ollamaThinking', 'resolveThink']);
 def('ollama.think.off', 'raw', 'think:false on a thinking model suppresses thinking (internal tasks rely on it)', ['llmThinkFalse']);
 def('ollama.think.level', 'raw', 'think:"low" (settings reasoning.think low/medium/high) is accepted, or rejected with a text the retry logic handles', ['resolveThink', 'retryThink', 'classifyThink']);
+def('ollama.think.false_on_plain', 'raw', 'think:false on a model WITHOUT thinking is accepted (LLM.completeWith sends think:false on every Ollama call for summaries, memory extraction, titles)', ['llmThinkFalse', 'retryThink']);
 def('ollama.think.unsupported_error', 'raw', 'think:true on a model without thinking → HTTP 400 whose text matches /does not support thinking|think.*not supported/ (triggers the retry without think)', ['classifyThink', 'retryThink']);
 def('ollama.tools.call', 'raw', 'A tool-capable model returns message.tool_calls[{function:{name, arguments}}] with arguments as a JSON object', ['ollamaToolCalls', 'parseArgs']);
 def('ollama.tools.result_roundtrip', 'raw', 'Sending the call back (assistant tool_calls + role "tool" with tool_name) yields a final text answer', ['toOllamaMessage']);
@@ -1572,6 +1573,16 @@ async function ollamaGroup(run, B) {
   }, { timeoutMs: 300000 });
 
   const NT = usable(picks.noThink)?.name;
+  await run.check('ollama.think.false_on_plain', async ({ sample }) => {
+    need(NT, 'every installed chat model has "thinking"', NEED.noThink);
+    const q = await chat(chatBody(NT, [{ role: 'user', content: 'Say OK.' }], { think: false, options: { num_predict: 2 } }));
+    sample(`ollama /api/chat think:false on ${NT} (no thinking)`, { status: q.r.status, body: q.r.ok ? q.p.objs.slice(-1) : (q.r.json ?? q.r.bodyText) });
+    if (q.r.ok) return PASS(`accepted (${NT})`);
+    const code = classifyCode(q.r.status, q.p.errorText);
+    if (code === 'thinking_unsupported') return WARN(`rejected: ${hs(q.r)} "${excerpt(q.p.errorText, 160)}" — LLM.completeWith retries without think, so every internal call on this model costs an extra round trip`, { fix: 'Send think:false only to models whose capabilities include "thinking" (LLM.completeWith).' });
+    return FAIL(`rejected: ${hs(q.r)} "${excerpt(q.p.errorText, 160)}" → ${code}: summaries, memory extraction and titles fail on this model`, { actual: q.p.errorText, fix: 'Only send think:false to thinking-capable models in LLM.completeWith, or classify this error as thinking_unsupported.' });
+  }, { timeoutMs: 300000 });
+
   await run.check('ollama.think.unsupported_error', async ({ sample }) => {
     need(NT, 'every installed chat model has "thinking"', NEED.noThink);
     const q = await chat(chatBody(NT, [{ role: 'user', content: 'hi' }], { think: true, options: { num_predict: 1 } }));

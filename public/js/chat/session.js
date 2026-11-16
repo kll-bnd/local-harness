@@ -13,6 +13,7 @@
 import * as api from '../api.js';
 import { Emitter } from '../lib/store.js';
 import { store, refreshChatsSoon, bus } from '../state.js';
+import { modelShort } from '../lib/format.js';
 import { toast } from '../ui/overlays.js';
 import { showError, explainError } from '../errors.js';
 import { runAction } from '../actions.js';
@@ -162,11 +163,22 @@ export function describeLive(model) {
     if (t.phase === 'saving') return { label: 'Saving image…', phase: 'image', progress: 1 };
     if (t.name) return { label: `Running ${t.name}…`, phase: 'tool' };
   }
-  if (l.modelStatus?.phase === 'loading') return { label: 'Reloading chat model…', phase: 'loading' };
+  const since = (t) => Math.max(0, Math.round((Date.now() - (t || l.startedAt)) / 1000));
+  const mac = /darwin/.test(store.get('system')?.machine?.platform || '') ? 'this Mac' : 'this machine';
+  if (l.modelStatus?.phase === 'loading') {
+    const s = since(l.modelStatus.at);
+    return { label: `${l.modelStatus.message?.replace(/…$/, '') || 'Reloading the chat model'}… ${s} s`, phase: 'loading', hint: s >= 5 ? `Loading a model into memory takes 20–60 s on ${mac}. This is normal.` : null };
+  }
   const m = model.byId.get(l.assistantId);
   if (l.kind === 'image') return { label: 'Preparing image…', phase: 'image' };
   if (m && !m.content && m.reasoning) return { label: 'Thinking…', phase: 'thinking' };
   if (m && m.content) return { label: 'Writing…', phase: 'writing' };
+  // No output yet: the model is either loading or reading the prompt. Say which, and for how long.
+  const s = since(l.stepStartedAt);
+  const ref = l.modelInfo;
+  const loaded = !ref || (store.get('system')?.loadedModels || []).some((x) => x.model === ref.model);
+  if (!loaded) return { label: `Loading ${modelShort(ref.model, 28)}… ${s} s`, phase: 'loading', hint: s >= 5 ? `The first reply after loading takes 20–60 s on ${mac}. This is normal.` : null };
+  if (s >= 2) return { label: `Reading the conversation… ${s} s`, phase: 'prompt', hint: s >= 8 ? `Long conversations take a while to read on ${mac}; the reply starts as soon as it's done.` : null };
   return { label: 'Waiting for the model…', phase: 'waiting' };
 }
 
@@ -180,7 +192,7 @@ function handleEvent(model, ev) {
       model.upsert(ev.assistantMessage);
       ids.push(ev.assistantMessage.id);
       model.timing.set(ev.assistantMessage.id, { start: Date.now() });
-      setLive(model, { generationId: ev.generationId, assistantId: ev.assistantMessage.id, modelInfo: ev.model, phase: 'waiting' });
+      setLive(model, { generationId: ev.generationId, assistantId: ev.assistantMessage.id, modelInfo: ev.model, phase: 'waiting', stepStartedAt: Date.now() });
       if (ev.contextPlan) model.plan = ev.contextPlan;
       model.emit('reset');
       changed(model, ...ids);
@@ -190,7 +202,7 @@ function handleEvent(model, ev) {
       const m = ev.message;
       const isNew = !model.byId.has(m.id);
       model.upsert(m);
-      if (isNew && m.role === 'assistant' && m.status === 'streaming') { model.timing.set(m.id, { start: Date.now() }); setLive(model, { assistantId: m.id }); }
+      if (isNew && m.role === 'assistant' && m.status === 'streaming') { model.timing.set(m.id, { start: Date.now() }); setLive(model, { assistantId: m.id, stepStartedAt: Date.now() }); }
       if (model.live?.kind === 'image' && m.kind === 'image_result') setLive(model, { assistantId: m.id });
       if (isNew) model.emit('reset');
       changed(model, m.id);
@@ -244,7 +256,7 @@ function handleEvent(model, ev) {
         const secs = model.reloadStarted ? (Date.now() - model.reloadStarted) / 1000 : null;
         addTrail(model, { key: 'reload', icon: 'regenerate', text: `Reloaded the chat model after the image${secs != null && secs >= 0.1 ? ` (${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s)` : ''}` });
       }
-      setLive(model, { modelStatus: ev.phase === 'loading' ? ev : null });
+      setLive(model, { modelStatus: ev.phase === 'loading' ? { ...ev, at: Date.now() } : null, ...(ev.phase === 'ready' ? { stepStartedAt: Date.now() } : {}) });
       changed(model, model.live?.assistantId);
       break;
     }

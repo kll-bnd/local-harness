@@ -13,6 +13,7 @@ import { pathToFileURL } from 'node:url';
 //   "recall <query>"             → recall {query}
 //   "loop forever"               → get_current_time on every turn (tests the iteration cap)
 //   "use tool <name> <json>"     → any tool with JSON arguments
+// "silent after tools" / "always silent" → empty final answer after tool results.
 // Other behaviours: "long answer N" → N words; thinking models think first; deepseek-r1 uses inline
 // <think> tags; replies after tool results quote the result.
 
@@ -111,6 +112,9 @@ export function respond({ model, messages, tools, think, capabilities = [] }) {
 
   // ---- after tool results
   if (last.role === 'tool') {
+    // "silent after tools": like Nemotron after generate_image — an EMPTY final message (no text, no tool calls)
+    // while tools are offered; "always silent" also stays empty when asked again without tools.
+    if (/silent after tools/i.test(userText) && (tools?.length || /always silent/i.test(userText))) return { thinking: '', content: '', toolCalls: [] };
     const results = [];
     for (let i = messages.length - 1; i >= 0 && messages[i].role === 'tool'; i--) results.unshift(messages[i]);
     const loop = /loop forever/i.test(userText) && toolNames.has('get_current_time');

@@ -101,13 +101,54 @@ export function plural(n, one, many = `${one}s`) {
   return `${fmtInt(n)} ${n === 1 ? one : many}`;
 }
 
-/** Friendly display name for a model id: "hf.co/unsloth/X-GGUF:Q4_K_M" → "X-GGUF · Q4_K_M". */
-export function modelLabel(name) {
-  if (!name) return 'No model';
-  let s = String(name);
-  if (s.startsWith('hf.co/')) s = s.split('/').slice(2).join('/');
-  const [base, tag] = s.split(':');
-  return tag && tag !== 'latest' ? `${base} · ${tag}` : base;
+// Friendly model names. Real model ids can be very long ("hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL"),
+// so the UI shows the catalog's name where it knows the model, else a cleaned-up id, and keeps the full id for
+// hover/details. registerModelNames() is fed from GET /api/models/recommended (and model info display names).
+const knownNames = new Map(); // model id → { name, tag }
+export function registerModelNames(entries) {
+  for (const [id, v] of entries) if (id && v?.name) knownNames.set(id, v);
+}
+
+function quantOf(tag) {
+  if (!tag || tag === 'latest') return '';
+  return tag.replace(/^(gguf|GGUF)[-_]?/, '');
+}
+
+/** { name, tag } for a model id. */
+export function modelParts(id) {
+  if (!id) return { name: 'No model', tag: '' };
+  const s = String(id);
+  const k = knownNames.get(s);
+  const [base, tag = ''] = s.replace(/^hf\.co\/[^/]+\//, '').split(/:(?=[^:]*$)/);
+  if (k) return { name: k.name, tag: k.tag ?? quantOf(tag) };
+  if (s.startsWith('hf.co/')) return { name: base.replace(/[-_]GGUF$/i, '').replace(/-/g, ' '), tag: quantOf(tag) };
+  return { name: base, tag: quantOf(tag) };
+}
+
+/** "Name · TAG" (full). */
+export function modelLabel(id) {
+  const { name, tag } = modelParts(id);
+  return tag ? `${name} · ${tag}` : name;
+}
+
+/** Shorten in the middle so both the family and the quantization stay visible. */
+export function middleTruncate(s, max = 32) {
+  s = String(s ?? '');
+  if (s.length <= max) return s;
+  const keepEnd = Math.min(Math.ceil(max * 0.4), 14);
+  return `${s.slice(0, max - keepEnd - 1).trimEnd()}…${s.slice(-keepEnd).trimStart()}`;
+}
+
+/** Label for tight places (pickers, pills): keeps the quantization tag, shortens the name. */
+export function modelShort(id, max = 30) {
+  const { name, tag } = modelParts(id);
+  const full = tag ? `${name} · ${tag}` : name;
+  if (full.length <= max) return full;
+  const n0 = name.replace(/^NVIDIA\s+/, '');
+  const room = max - (tag ? tag.length + 3 : 0);
+  if (room < 8) return middleTruncate(full, max);
+  const n = n0.length > room ? `${n0.slice(0, room - 1).trimEnd()}…` : n0;
+  return tag ? `${n} · ${tag}` : n;
 }
 
 export function truncate(s, n) {

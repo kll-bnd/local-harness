@@ -10,6 +10,8 @@ export const DEFAULT_FALLBACK_CTX = 8192;
 
 /** Bytes per K/V element for Ollama's OLLAMA_KV_CACHE_TYPE values (q8_0: 34 bytes per 32 values). */
 export const KV_BYTES = { f16: 2, q8_0: 34 / 32, q4_0: 18 / 32 };
+/** Extra cells llama.cpp adds to a sliding-window KV cache (its default micro-batch). */
+export const SWA_UBATCH = 512;
 
 export function ramTier(totalMem) {
   const gb = totalMem / GiB;
@@ -91,8 +93,10 @@ export function kvCacheModel(arch = {}, profile = {}, kvCacheType = 'f16') {
     swaLayers = effectiveLayers - fullLayers;
   }
   const perToken = Math.round(fullLayers * perLayer);
-  const fixedFor = (ctx) => Math.round(swaLayers * perLayerSwa * Math.min(window || 0, ctx));
-  return { perToken, fixedFor, fullLayers, swaLayers, window: swaLayers ? window : null, source: swaLayers ? 'metadata+swa' : 'metadata' };
+  // llama.cpp sizes the sliding-window cache at window + one micro-batch (512) cells, whatever the context.
+  const swaCells = (ctx) => Math.min((window || 0) + SWA_UBATCH, ctx);
+  const fixedFor = (ctx) => Math.round(swaLayers * perLayerSwa * swaCells(ctx));
+  return { perToken, fixedFor, fullLayers, swaLayers, window: swaLayers ? window : null, swaCells: swaLayers ? swaCells(Number.MAX_SAFE_INTEGER) : null, source: swaLayers ? 'metadata+swa' : 'metadata' };
 }
 
 export function roundCtx(n) {

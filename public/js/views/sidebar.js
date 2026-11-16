@@ -2,7 +2,7 @@
 // grouped by recency (pinned first), per-chat actions, archive, and a live "machine" status block.
 import { h, debounce, delegate, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
-import { recencyGroup, modelLabel, fmtBytes, fmtWhen, fmtTokens } from '../lib/format.js';
+import { recencyGroup, modelShort, fmtBytes, fmtWhen, fmtTokens } from '../lib/format.js';
 import { store, loadArchived, ollamaStatus } from '../state.js';
 import * as api from '../api.js';
 import { runAction, keyLabel, getAction } from '../actions.js';
@@ -108,7 +108,7 @@ export class Sidebar {
     else {
       lines.push(h('span.m-line', h(`span.dot${running ? '.ok' : '.err'}`), h('span.m-label', h('b', 'Ollama'), running ? ` ${provider?.version || ''}`.trimEnd() : ' not running', others.length ? ` · +${others.length} server${others.length > 1 ? 's' : ''}` : '')));
       if (unloadedForImage) lines.push(h('span.m-line', h('span.dot.warn'), h('span.m-label', 'Chat model unloaded for images')));
-      else if (loaded.length) lines.push(h('span.m-line', h('span.dot.ok'), h('span.m-label', { title: loaded.map((m) => `${m.model} — ${fmtBytes(m.sizeBytes)}${m.contextLength ? `, ${fmtTokens(m.contextLength)} context` : ''}`).join('\n') }, h('b', modelLabel(loaded[0].model)), ` · ${fmtBytes(loaded[0].vramBytes || loaded[0].sizeBytes)}`, loaded.length > 1 ? ` +${loaded.length - 1}` : '')));
+      else if (loaded.length) lines.push(h('span.m-line', h('span.dot.ok'), h('span.m-label', { title: loaded.map((m) => `${m.model} — ${fmtBytes(m.sizeBytes)}${m.contextLength ? `, ${fmtTokens(m.contextLength)} context` : ''}`).join('\n') }, h('b', modelShort(loaded[0].model, 24)), ` · ${fmtBytes(loaded[0].vramBytes || loaded[0].sizeBytes)}`, loaded.length > 1 ? ` +${loaded.length - 1}` : '')));
       else if (running) lines.push(h('span.m-line', h('span.dot'), h('span.m-label', 'No model loaded')));
       lines.push(h('span.m-line', h(`span.dot${img ? '.ok' : ''}`), h('span.m-label', img ? h('span', h('b', img.name.replace(/\s*\(.*\)$/, '')), ' ready') : 'No image backend')));
       if (ram) lines.push(h('span.m-line', icon('chip', { size: 12 }), h('span.m-label.faint', `${Math.round(ram / 1024 ** 3)} GB RAM${sys.machine.appleSilicon ? ` · ${sys.machine.chip}` : ''}`)));

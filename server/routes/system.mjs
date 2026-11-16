@@ -30,7 +30,7 @@ export function registerSystemRoutes(r, app) {
       },
       providers,
       loadedModels: loaded,
-      ollama: app.ollamaProcess.info(),
+      ollama: { ...app.ollamaProcess.info(), protections: app.ollamaProcess.protections({ running: !!providers.find((x) => x.id === 'ollama' && x.status === 'running') }) },
       imageProviders,
       embeddings,
       modelState: app.modelState.status(),

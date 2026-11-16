@@ -2,7 +2,7 @@
 // toggles, slash commands, per-chat drafts, send/stop, and the always-visible context meter.
 import { h, autosize, pickFiles, debounce, mount, add } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
-import { fmtBytes, fmtTokens, modelLabel, isMac } from '../../lib/format.js';
+import { fmtBytes, fmtTokens, modelLabel, modelShort } from '../../lib/format.js';
 import { store, chatModels, findModel, sameRef, modelInfo, uiPrefs } from '../../state.js';
 import * as api from '../../api.js';
 import { openPopover, openMenu, toast } from '../../ui/overlays.js';
@@ -121,14 +121,15 @@ export class Composer {
     const presetId = cs.presetId || s.defaultPresetId || 'default';
     const preset = presets.find((p) => p.id === presetId);
     const toolsOn = cs.tools?.enabled ?? s.tools?.enabled ?? true;
+    // 'auto' and 'off' both mean no thinking (the server always sends an explicit think:false then).
     const think = cs.reasoning?.think ?? s.reasoning?.think ?? 'auto';
-    const thinkOn = think !== 'off';
+    const thinkOn = ['on', 'low', 'medium', 'high'].includes(think);
     const incog = this.incognito();
     const memOn = !incog && (cs.memory?.enabled ?? s.memory?.enabled ?? true);
     const noModel = !ref;
 
-    const modelBtn = h('button.picker', { type: 'button', title: 'Model for this chat', 'aria-haspopup': 'dialog', on: { click: (e) => this.openModelPicker(e.currentTarget) } },
-      icon('cube', { size: 14 }), h('span.picker-label', noModel ? 'No model' : modelLabel(info?.name || ref.model)), icon('chevronDown', { size: 11 }));
+    const modelBtn = h('button.picker', { type: 'button', title: noModel ? 'Model for this chat' : `Model for this chat: ${ref.model}`, 'aria-haspopup': 'dialog', on: { click: (e) => this.openModelPicker(e.currentTarget) } },
+      icon('cube', { size: 14 }), h('span.picker-label', noModel ? 'No model' : modelShort(info?.name || ref.model, 30)), icon('chevronDown', { size: 11 }));
     const presetBtn = h('button.picker.preset-picker', { type: 'button', title: 'Preset / persona', 'aria-haspopup': 'menu', on: { click: (e) => this.openPresetMenu(e.currentTarget) } },
       icon('book', { size: 14 }), h('span.picker-label', preset?.name || 'Assistant'), icon('chevronDown', { size: 11 }));
     const toggle = (label, iconName, on, title, run, extra = {}) => h('button.toggle', { type: 'button', 'aria-pressed': String(!!on), title, on: { click: run }, ...extra }, icon(iconName, { size: 14 }), h('span.toggle-label', label));
@@ -202,7 +203,7 @@ export class Composer {
         ...ms.map((m) => {
           const sel = sameRef(current, m) || (current && !current.providerId && current.model === m.model);
           const caps = m.capabilities || [];
-          return h('button.model-option', { type: 'button', role: 'option', 'aria-selected': String(!!sel), on: { click: () => { pop.close(true); this.patchChat({ settings: { model: { providerId: m.providerId, model: m.model } } }); } } },
+          return h('button.model-option', { type: 'button', role: 'option', title: m.model, 'aria-selected': String(!!sel), on: { click: () => { pop.close(true); this.patchChat({ settings: { model: { providerId: m.providerId, model: m.model } } }); } } },
             h('span.menu-check', sel ? icon('check', { size: 14 }) : null),
             h('span.mo-main', h('span.mo-name', modelLabel(m.name)), h('span.mo-meta.num', [m.parameterSize, m.quantization, m.sizeBytes ? fmtBytes(m.sizeBytes) : null, m.contextLength ? `${fmtTokens(m.contextLength)} ctx` : null].filter(Boolean).join(' · '))),
             h('span.mo-caps', caps.includes('vision') ? h('span.badge', { title: 'Can see images' }, 'vision') : null, caps.includes('thinking') ? h('span.badge', { title: 'Can think before answering' }, 'think') : null, caps.includes('tools') ? null : h('span.badge.warn', { title: 'Cannot call tools' }, 'no tools')),

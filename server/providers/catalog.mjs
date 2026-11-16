@@ -30,15 +30,15 @@ export const MODEL_PROFILES = [
     label: 'NVIDIA Nemotron 3.5 Bolt',
     // = the model file's general.sampling.* (temp 1, top_k 64, top_p 0.95), which is read and preferred when present.
     sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 },
-    // gemma4 layout: 42 layers, the last 18 share KV (no cache of their own); 1 in 5 of the rest is global
-    // (the 1:5 ratio is an assumption — metadata has no sliding_window_pattern), sliding layers keep 512 tokens.
-    swa: { globalEvery: 5, window: 512 },
+    // gemma4 layout (llama.cpp's own log): 42 blocks, 18 share KV (no cache of their own), the other 24 are
+    // 4 global + 20 sliding-window (1 in 6 global; a sliding_window_pattern array in the metadata wins).
+    swa: { globalEvery: 6, window: 512 },
     imageTokens: 280,
     // Measured: 13,499 characters of English prompt = 3,020 tokens (≈4.5 chars/token).
     charsPerToken: 4.5,
     notes: 'Gemma-4 based (7.5B parameters, "E4B") tuned for multi-turn tool use. Trained for 64K context.',
   },
-  { id: 'gemma4', match: /gemma-?4/i, family: 'gemma4', sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 }, swa: { globalEvery: 5, window: 512 }, imageTokens: 280 },
+  { id: 'gemma4', match: /gemma-?4/i, family: 'gemma4', sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 }, swa: { globalEvery: 6, window: 512 }, imageTokens: 280 },
   { id: 'gemma3n', match: /gemma-?3n/i, family: 'gemma3n', sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 }, swa: { globalEvery: 5, window: 512 }, imageTokens: 256 },
   { id: 'gemma3', match: /gemma-?3/i, family: 'gemma3', sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 }, swa: { globalEvery: 6, window: 1024 }, imageTokens: 256 },
   { id: 'gemma2', match: /gemma-?2/i, family: 'gemma2', sampling: { temperature: 0.7, top_p: 0.95 } },
@@ -125,6 +125,9 @@ export const RECOMMENDED_MODELS = [
       { model: `${NEMOTRON_HF_REPO}:latest`, reason: 'The 14 GB BF16 file.' },
       { model: `${NEMOTRON_HF_REPO}:Q4_K_M`, reason: 'This tag does not exist in the repository (use UD-Q4_K_XL).' },
       { model: `${NEMOTRON_HF_REPO}:Q3_K_M`, reason: 'This tag does not exist in the repository (use UD-Q3_K_XL).' },
+      { model: `${NEMOTRON_HF_REPO}:Q3_K_XL`, reason: 'Alias without "UD-": the manifest exists but the download fails ("file does not exist"). Use UD-Q3_K_XL.' },
+      { model: `${NEMOTRON_HF_REPO}:Q4_K_XL`, reason: 'Alias without "UD-" — only the UD-* tags download. Use UD-Q4_K_XL.' },
+      { model: `${NEMOTRON_HF_REPO}:Q2_K_XL`, reason: 'Alias without "UD-" — only the UD-* tags download. Use UD-Q2_K_XL.' },
     ],
   },
   {

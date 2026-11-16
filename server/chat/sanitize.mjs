@@ -47,6 +47,13 @@ function modelRef(v) {
   return out;
 }
 
+/** Tool-call arguments are stored (and replayed to Ollama) as an object; OpenAI-style JSON strings are parsed. */
+function argsOf(a) {
+  let v = a;
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch { v = { value: v.slice(0, 2000) }; } }
+  return isPlainObject(v) ? (jsonSmall(v) ?? {}) : {};
+}
+
 function jsonSmall(v, max = 20000) {
   try { const s = JSON.stringify(v); return s !== undefined && s.length <= max ? JSON.parse(s) : undefined; } catch { return undefined; }
 }
@@ -85,7 +92,7 @@ function toolCalls(list) {
   const out = [];
   for (const c of list.slice(0, 32)) {
     if (!isPlainObject(c) || typeof c.name !== 'string') continue;
-    out.push({ id: str(c.id, 100) || newId('call'), name: c.name.slice(0, 100), arguments: isPlainObject(c.arguments) ? (jsonSmall(c.arguments) ?? {}) : {} });
+    out.push({ id: str(c.id, 100) || newId('call'), name: c.name.slice(0, 100), arguments: argsOf(c.arguments) });
   }
   return out.length ? out : undefined;
 }
@@ -120,6 +127,9 @@ function cleanMessage(raw, fallbackDate) {
     if (tc) m.toolCalls = tc;
     if (['length', 'tool_limit', 'aborted'].includes(raw.finishReason)) m.finishReason = raw.finishReason;
     if (typeof raw.error === 'string') m.error = raw.error.slice(0, 2000);
+    if (typeof raw.errorCode === 'string' && /^[a-z_]{1,40}$/.test(raw.errorCode)) m.errorCode = raw.errorCode;
+    if (Array.isArray(raw.nextSteps)) { const ns = jsonSmall(raw.nextSteps.slice(0, 5), 4000); if (ns) m.nextSteps = ns; }
+    if (['image', 'tool_summary'].includes(raw.fallback)) m.fallback = raw.fallback;
     if (m.kind === 'image_result') m.images = raw.images;
     for (const k of ['usage', 'stats', 'context']) { const v = isPlainObject(raw[k]) ? jsonSmall(raw[k], 20000) : undefined; if (v) m[k] = v; }
   }

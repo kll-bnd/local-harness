@@ -80,6 +80,7 @@ export class ChatView {
     this.conv = new ConversationView(model, { onEmpty: (empty) => { this.el.classList.toggle('is-empty', empty); } });
     mount(this.body, this.conv.el);
     this.conv.el.addEventListener('transcript-scroll', (e) => this.shell.setScrolled(e.detail.top > 4));
+    this.conv.el.addEventListener('live-tick', () => this.shell.updateToolbar());
     this.modelOffs = [
       model.on('meta', () => this.shell.updateToolbar()),
       model.on('live', () => this.shell.updateToolbar()),

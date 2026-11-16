@@ -146,8 +146,8 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
   function httpError(status, message) { return Object.assign(new Error(message), { status }); }
 
   function markLoaded(name, keepAlive, numCtx, options = {}) {
-    if (typeof keepAlive === 'string' && !/^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(keepAlive)) {
-      // Real Ollama parses string durations with Go's time.ParseDuration ("-1" / "30" are rejected).
+    if (typeof keepAlive === 'string' && keepAlive !== '0' && !/^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(keepAlive)) {
+      // Real Ollama parses string durations with Go's time.ParseDuration: "-1" / "30" are rejected, "0" is accepted.
       throw httpError(400, `time: missing unit in duration "${keepAlive}"`);
     }
     if (keepAlive === 0 || keepAlive === '0' || keepAlive === '0s') {

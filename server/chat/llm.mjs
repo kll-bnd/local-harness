@@ -1,7 +1,7 @@
 // Non-streaming LLM helper for internal tasks (summaries, memory extraction, titles).
 // Uses the same num_ctx / keep_alive as chat requests so Ollama never reloads the model for them.
 import { stripThinking } from './reasoning.mjs';
-import { HttpError } from '../lib/errors.mjs';
+import { HttpError, ProviderError } from '../lib/errors.mjs';
 
 export class LLM {
   constructor(app) { this.app = app; }
@@ -31,6 +31,10 @@ export class LLM {
   }
 
   async completeWith(t, messages, { maxTokens, temperature = 0.2, format, signal } = {}) {
+    // A model whose runner just crashed while loading is not retried by background work (each attempt can take a
+    // minute and fail the same way); the next chat turn tries again and clears this on success.
+    const lf = this.app.loadFailures?.get(t.provider.id, t.model);
+    if (lf) throw new ProviderError(`Skipped: ${t.model} failed to load recently (${lf.message})`, { code: 'model_load_failed', providerId: t.provider.id });
     const options = { temperature };
     if (t.provider.kind === 'ollama') options.num_ctx = t.numCtx;
     if (maxTokens) options.num_predict = maxTokens;
@@ -52,8 +56,10 @@ export class LLM {
           this.app.calibrator.observe(t.provider.id, t.model, { estimatedRaw: raw, actual: usage.promptTokens, numCtx: t.numCtx });
         }
         this.app.modelState?.markReloaded();
+        this.app.loadFailures?.clear(t.provider.id, t.model);
         return stripThinking(text);
       } catch (e) {
+        if (e.code === 'model_load_failed') this.app.loadFailures?.record(t.provider.id, t.model, { message: e.message });
         if (e.code === 'thinking_unsupported' && think !== undefined) { think = undefined; continue; }
         if (fmt && /format|schema|grammar/i.test(e.message)) { fmt = undefined; continue; }
         throw e;

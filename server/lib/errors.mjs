@@ -35,7 +35,8 @@ export function toErrorPayload(e) {
   if (e instanceof HttpError) return { status: e.status, body: { error: { code: e.code, message: e.message, ...(e.details ? { details: e.details } : {}) } } };
   if (e instanceof ProviderError) {
     const status = e.code === 'model_not_found' || e.status === 404 ? 404 : e.code === 'connection_failed' ? 503 : e.code === 'timeout' ? 504 : e.status === 400 ? 400 : 502;
-    return { status, body: { error: { code: e.code, message: e.message, ...(e.providerId ? { details: { providerId: e.providerId } } : {}) } } };
+    const details = { ...(e.providerId ? { providerId: e.providerId } : {}), ...(e.nextSteps ? { nextSteps: e.nextSteps } : {}) };
+    return { status, body: { error: { code: e.code, message: e.message, ...(Object.keys(details).length ? { details } : {}) } } };
   }
   return { status: 500, body: { error: { code: 'internal_error', message: e?.message || String(e) } } };
 }

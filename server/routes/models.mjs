@@ -2,9 +2,12 @@
 import { HttpError, badRequest, notFound } from '../lib/errors.mjs';
 import { openSse, readJson } from '../http/http.mjs';
 import { newId } from '../lib/ids.mjs';
-import { RECOMMENDED_MODELS, RECOMMENDED_EMBEDDING, profileFor } from '../providers/catalog.mjs';
+import { RECOMMENDED_MODELS, RECOMMENDED_EMBEDDING, profileFor, textOnlyName, avoidedTag } from '../providers/catalog.mjs';
+import { createTextOnlyCopy } from '../providers/text-only.mjs';
+import { loadFailureError } from '../providers/load-failure.mjs';
 import { computeContextPlan, budgetsFor, memoryBudget, ramTier } from '../context/sizing.mjs';
 import { qBool, created, requireString } from './common.mjs';
+import { formatBytes } from '../lib/util.mjs';
 
 function modelParams(query) {
   const model = query.get('model');
@@ -152,15 +155,24 @@ export function registerModelRoutes(r, app) {
         const copy = rec.textOnly?.supported ? textOnlyName(v.model) : null;
         const hit = installed.find((m) => m.model === v.model || (v.model.includes(':') ? false : m.model.startsWith(`${v.model}:`)));
         const copyHit = copy ? installed.find((m) => m.model === copy) : null;
-        const estimate = estimateFor(rec, profile, v.approxSizeBytes);
-        const textOnly = copy && v.textOnlyBytes ? { model: copy, approxSizeBytes: v.textOnlyBytes, installed: !!copyHit, recommended: !!(lowRam && rec.textOnly.recommendedOnLowRam), estimate: estimateFor(rec, profile, v.textOnlyBytes) } : null;
-        // The plain estimate explains RAM; the variant note says what the file is and how it behaves on this Mac.
-        if (v.note && (lowRam || !v.lowRam)) estimate.explanation = `${v.note} ${estimate.explanation}`;
-        if (textOnly?.recommended && v.note) textOnly.estimate.explanation = `${v.note} ${textOnly.estimate.explanation}`;
+        const asPulled = estimateFor(rec, profile, v.approxSizeBytes);
+        const recommendTextOnly = !!(copy && v.textOnlyBytes && lowRam && rec.textOnly.recommendedOnLowRam);
+        const textOnly = copy && v.textOnlyBytes ? { model: copy, approxSizeBytes: v.textOnlyBytes, installed: !!copyHit, recommended: recommendTextOnly, estimate: estimateFor(rec, profile, v.textOnlyBytes) } : null;
+        // `estimate` describes the recommended way to run this file here: on ≤ 8 GB that is the text-only copy
+        // (the as-pulled numbers stay available in `asPulledEstimate`). The variant note says what the file is.
+        let estimate = asPulled;
+        if (recommendTextOnly) {
+          estimate = { ...textOnly.estimate, basis: 'text_only_copy', explanation: `As a text-only copy (no image/audio input, ${formatBytes(v.textOnlyBytes)}): ${textOnly.estimate.explanation}` };
+        }
+        if (v.note && (lowRam || !v.lowRam)) estimate = { ...estimate, explanation: `${v.note} ${estimate.explanation}` };
         const { minRamBytes, ...pubV } = v;
-        return { ...pubV, installed: !!hit, providerId: hit?.providerId || copyHit?.providerId || null, estimate, textOnly, ...(minRamBytes && sys.totalMem < minRamBytes ? { notForThisMachine: true } : {}) };
+        return {
+          ...pubV, installed: !!hit || !!(recommendTextOnly && copyHit), providerId: hit?.providerId || copyHit?.providerId || null, estimate, textOnly,
+          ...(recommendTextOnly ? { asPulledEstimate: asPulled } : {}),
+          ...(minRamBytes && sys.totalMem < minRamBytes ? { notForThisMachine: true } : {}),
+        };
       });
-      const usable = (v) => (lowRam && v.textOnly?.recommended ? v.textOnly.estimate : v.estimate);
+      const usable = (v) => v.estimate;
       let pick;
       let largest = null;
       if (lowRam && rec.lowRamAdvice) {
@@ -192,7 +204,8 @@ export function registerModelRoutes(r, app) {
     if (!st.ok) throw new HttpError(503, 'connection_failed', `${provider.name} is not running`);
     const sse = openSse(req, res);
     const pullId = newId('pull');
-    sse.send('start', { pullId, providerId: provider.id, model });
+    const avoid = avoidedTag(model);
+    sse.send('start', { pullId, providerId: provider.id, model, ...(avoid ? { warning: { code: 'not_recommended', message: `${model}: ${avoid.reason}` } } : {}) });
     app.bus.publish('model.pull', { pullId, providerId: provider.id, model, status: 'started' });
     let last = 0;
     try {
@@ -239,10 +252,42 @@ export function registerModelRoutes(r, app) {
     if (provider.kind !== 'ollama') throw new HttpError(400, 'unsupported', 'Preloading is only supported for Ollama');
     const s = app.engine.globalEffectiveSettings();
     const plan = await app.registry.contextPlan(provider, model, s);
-    await provider.load(model, { keepAlive: s.keepAlive, options: { num_ctx: plan.numCtx } });
+    try {
+      await provider.load(model, { keepAlive: s.keepAlive, options: { num_ctx: plan.numCtx } });
+    } catch (e) {
+      if (e.code !== 'model_load_failed') throw e;
+      app.loadFailures.record(provider.id, model, { message: e.message });
+      const info = await app.registry.modelInfo(provider, model).catch(() => ({}));
+      throw loadFailureError(e, { model, providerId: provider.id, info, totalMem: app.system.totalMem });
+    }
+    app.loadFailures.clear(provider.id, model);
     app.engine.loadedCtx.set(`${provider.id}/${model}`, plan.numCtx);
     app.modelState.markReloaded();
     return { ok: true, numCtx: plan.numCtx };
+  });
+
+  // Text-only copies (same weights, no vision/audio projector) — see server/providers/text-only.mjs.
+  r.get('/api/models/text-only', async () => ({ copies: app.modelCopies.list() }));
+
+  r.post('/api/models/text-only', async ({ req }) => {
+    const body = await readJson(req);
+    const source = requireString(body.model, 'model', { max: 300 });
+    const provider = app.registry.require(body.providerId || 'ollama');
+    if (body.name !== undefined && typeof body.name !== 'string') throw badRequest('name must be a string');
+    const out = await createTextOnlyCopy(app, provider, source, { name: body.name || undefined });
+    return out.created ? created(out) : out;
+  });
+
+  r.delete('/api/models/text-only', async ({ query }) => {
+    const ref = modelParams(query);
+    const provider = app.registry.require(ref.providerId || 'ollama');
+    if (!app.modelCopies.get(provider.id, ref.model)) throw notFound('Text-only copy');
+    await provider.deleteModel(ref.model).catch((e) => { if (e.code !== 'model_not_found') throw e; });
+    await app.modelCopies.remove(provider.id, ref.model);
+    app.registry.dropInfo(provider.id, ref.model);
+    app.registry.invalidate();
+    app.bus.publish('model.deleted', { providerId: provider.id, model: ref.model });
+    return { ok: true };
   });
 
   r.get('/api/models/measurements', async ({ query }) => {

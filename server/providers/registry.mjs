@@ -137,7 +137,7 @@ export class ProviderRegistry {
   async resolve(ref) {
     if (!ref || !ref.model) {
       const def = await this.defaultChatModel();
-      if (!def) throw new HttpError(409, 'no_model', 'No chat model is available. Start Ollama (or another local server) and pull a model, e.g. nemotron-3.5-bolt:e4b.');
+      if (!def) throw new HttpError(409, 'no_model', 'No chat model is available. Start Ollama (or another local server) and pull a model — GET /api/models/recommended lists the right file for this machine.');
       ref = def;
     }
     let providerId = ref.providerId;

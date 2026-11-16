@@ -55,8 +55,15 @@ test('reasoning: thinking model shows a collapsible "Thought for" block', async 
     const { page } = app;
     await page.locator('.picker').first().click();
     await page.locator('.model-option', { hasText: 'qwen3' }).click();
-    await page.waitForFunction(() => /qwen3/.test(document.querySelector('.picker-label')?.textContent || ''));
+    await page.waitForFunction(() => /qwen3/i.test(document.querySelector('.picker-label')?.textContent || ''));
+    // Thinking is off by default; the toggle appears for thinking-capable models and is remembered per chat.
+    const think = page.locator('button.toggle', { hasText: 'Think' });
+    assert.equal(await think.getAttribute('aria-pressed'), 'false');
+    await think.click();
+    await page.waitForSelector('button.toggle[aria-pressed="true"]:has-text("Think")');
     await send(page, 'Why is the sky blue?');
+    const chatId = page.url().split('/chat/')[1];
+    assert.equal((await stack.api('GET', `/api/chats/${chatId}`)).data.chat.settings.reasoning.think, 'on');
     const toggle = lastTurn(page).locator('.reasoning-toggle');
     assert.match(await toggle.textContent(), /Thought for|Reasoning/);
     assert.equal(await toggle.getAttribute('aria-expanded'), 'false');

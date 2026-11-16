@@ -2,6 +2,7 @@
 import { createStore, Emitter } from './lib/store.js';
 import * as api from './api.js';
 import { debounce } from './lib/dom.js';
+import { registerModelNames } from './lib/format.js';
 
 export const store = createStore({
   connection: 'connecting', // connecting | online | offline
@@ -66,6 +67,8 @@ export async function loadArchived() {
 
 export async function loadRecommended() {
   const r = await api.models.recommended();
+  // Teach the formatter the catalog's friendly names for every known variant.
+  registerModelNames(r.models.flatMap((m) => m.variants.map((v) => [v.model, { name: m.name, tag: (v.label || '').replace(/\s*\(.*\)$/, '').replace(/^Default quant$/i, '') }])));
   store.set('recommended', r);
   return r;
 }
@@ -139,7 +142,10 @@ export async function modelInfo(ref, { refresh = false } = {}) {
   if (!ref?.model) return null;
   const key = `${ref.providerId || ''}|${ref.model}`;
   if (!refresh && infoCache.has(key)) return infoCache.get(key);
-  const p = api.models.info(ref).catch((e) => { infoCache.delete(key); throw e; });
+  const p = api.models.info(ref).then((r) => {
+    if (r?.info?.displayName) registerModelNames([[ref.model, { name: r.info.displayName.replace(/^NVIDIA\s+/, ''), tag: undefined }]]);
+    return r;
+  }).catch((e) => { infoCache.delete(key); throw e; });
   infoCache.set(key, p);
   return p;
 }

@@ -2,7 +2,7 @@
 // chat-level actions (rename, pin, fork, export, archive, delete with undo) and the reconnect banner.
 import { h, mount, download, add } from './lib/dom.js';
 import { icon } from './lib/icons.js';
-import { fmtTokens, modelLabel, fmtUntil } from './lib/format.js';
+import { fmtTokens, modelLabel, modelShort, fmtUntil } from './lib/format.js';
 import { store, uiPrefs, setUiPref, localPref, findModel, modelInfo, loadChats, loadArchived } from './state.js';
 import * as api from './api.js';
 import { Sidebar } from './views/sidebar.js';
@@ -185,7 +185,8 @@ export class Shell {
     else stateText = 'not loaded';
     pill.title = ollamaDown ? 'Ollama is not running — click for setup' : loaded ? `Loaded in memory${loaded.expiresAt ? ` ${fmtUntil(loaded.expiresAt)}` : ''}${loaded.contextLength ? ` with a ${fmtTokens(loaded.contextLength)} window` : ''}` : unloadedForImage ? 'Unloaded to free memory for image generation; reloads on the next message' : 'Loads on the next message (the first reply takes longer)';
     if (ollamaDown) pill.addEventListener('click', (e) => { e.stopImmediatePropagation(); runAction('open-setup'); }, { capture: true });
-    add(pill, h(`span.${dot}`), h('span.label', modelLabel(info?.name || ref.model)), stateText ? h('span.faint.hide-narrow', stateText) : null, ctxSpan);
+    pill.title = `${ref.model}\n${pill.title}`;
+    add(pill, h(`span.${dot}`), h('span.label', modelShort(info?.name || ref.model, 34)), stateText ? h('span.faint.hide-narrow', stateText) : null, ctxSpan);
     const m = this.chatView.model;
     const plan = m?.plan;
     if (plan?.numCtx) ctxSpan.textContent = `· ${fmtTokens(plan.numCtx)}`;

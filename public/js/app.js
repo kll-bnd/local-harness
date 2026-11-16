@@ -4,6 +4,7 @@ import { h, isTypingTarget, pickFiles, download, mount, add } from './lib/dom.js
 import { icon } from './lib/icons.js';
 import { truncate, isMac } from './lib/format.js';
 import * as api from './api.js';
+import { loadRecommended } from './state.js';
 import { store, bus, loadSettings, loadPresets, loadSystem, loadModels, loadChats, loadArchived, refreshSystemSoon, refreshModelsSoon, refreshChatsSoon, setUiPref, uiPrefs, chatModels, dropModelInfo, flushUiPrefs } from './state.js';
 import { defineAction, runAction, runActionFrom, chordOf, actionForChord, allActions } from './actions.js';
 import { Shell } from './shell.js';
@@ -292,12 +293,16 @@ async function resync() {
   if (m && !m.live) m.load({ force: true }).catch(() => {});
 }
 
+// Friendly names arrive with the catalog: refresh the places that show model names.
+store.on('recommended', () => { shell.updateToolbar(); shell.sidebar.renderFoot(); shell.chatView.composer.renderBar(); });
+
 // Keep the machine status fresh (loaded models expire, Ollama can stop) without hammering the server.
 setInterval(() => { if (!document.hidden && store.get('connection') === 'online') loadSystem().catch(() => {}); }, 20000);
 
 // ------------------------------------------------------------------------------------------------ boot
 async function boot() {
   connectEvents();
+  loadRecommended().catch(() => {}); // friendly model names; not needed to start
   const results = await Promise.allSettled([loadSettings(), loadPresets(), loadSystem(), loadModels(), loadChats(), refreshMemoryCount()]);
   const failed = results.filter((r) => r.status === 'rejected');
   if (failed.length === results.length) {

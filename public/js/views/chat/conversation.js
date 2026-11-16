@@ -59,13 +59,20 @@ export class ConversationView {
     this.offs = [
       model.on('reset', () => this.reconcile()),
       model.on('change', (ids) => this.markChanged(ids)),
-      model.on('live', () => this.markLast()),
+      model.on('live', () => { this.markLast(); this.syncTicker(); }),
       model.on('summary', () => this.renderDivider()),
     ];
     this.reconcile(true);
   }
 
+  /** While the model produces nothing visible (loading / reading), re-render once a second so the elapsed time moves. */
+  syncTicker() {
+    if (this.model.live && !this.ticker) this.ticker = setInterval(() => { if (!this.model.live) { this.syncTicker(); return; } this.markLast(); this.el.dispatchEvent(new CustomEvent('live-tick', { bubbles: true })); }, 1000);
+    else if (!this.model.live && this.ticker) { clearInterval(this.ticker); this.ticker = null; }
+  }
+
   destroy() {
+    clearInterval(this.ticker);
     this.offs.forEach((o) => o());
     this.io.disconnect();
     this.ro.disconnect();
