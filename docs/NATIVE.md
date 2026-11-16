@@ -199,13 +199,13 @@ the same data folder brings the first window forward.
 | `Harness.app` on disk | **120 MB** (Node.js 117 MB, app binary 0.7 MB, `server/`+`public/` 2 MB) | 309 MB |
 | download | 39 MB zip | 129 MB dmg |
 | processes at idle | app, `node` backend, WebKit WebContent, WebKit Networking | main (with the backend in it), renderer, GPU and network helpers |
-| resident memory (RSS), idle | **240 MB** (app 89, node 74, WebContent 57, Networking 20) | 418 MB (main 170, helpers 89 + 52, renderer 107) |
-| physical footprint, idle | **96 MB** (app 21, node 31, WebContent 39, Networking 5) | 108 MB (main 51, helpers 21 + 8, renderer 28) |
+| resident memory (RSS), idle | **240 MB** (app 90, node 74, WebContent 56, Networking 20) | 417 MB (main 170, helpers 89 + 52, renderer 106) |
+| physical footprint, idle | **92 MB** (app 22, node 31, WebContent 34, Networking 5) | 106 MB (main 50, helpers 20 + 8, renderer 28) |
 
 Both measured 15–20 s after start on a fresh data folder, at the UI's first-run password screen, with
 `ps -o rss` and macOS's `footprint` (`native/test/run-selftest.mjs`, `native/ci/electron-memory.mjs`); Ollama is the
 same in both and not included. RSS counts shared system-framework pages once per process, so the footprint is the
-better measure of what the app costs the Mac: the native app saves about 12 MB of footprint and ~180 MB of RSS at
+better measure of what the app costs the Mac: the native app saves about 14 MB of footprint and ~180 MB of RSS at
 idle, ~190 MB of disk, and Chromium entirely. Most of the remaining cost is the backend (the same Node.js process in
 every mode) and the web content; the chat model (~4 GB) dwarfs both. After a few chats the backend grows (165 MB
 footprint was measured mid-test with a model loaded), as it does in every mode.
@@ -237,9 +237,9 @@ real page, `native/Sources/SelfTest.swift` on the native side).
   it; the window frame restored at the next launch; a clean quit both times, no process left behind. Neither the app
   nor the backend held any socket (`lsof`: no TCP, no UDP, no Unix socket).
 * **Against the real backend** (`node server/index.mjs --bridge`, password mode, fresh data folder, real Ollama with
-  `qwen3:0.6b`, three launches; 19 checks + 3 clean quits): `ready.locked`, every data route 423 until setup; setup
+  `qwen3:0.6b`, three launches; 21 checks + 3 clean quits, run against the finished 0.2 backend): `ready.locked`, every data route 423 until setup; setup
   with a throw-away password (never printed), recovery key returned; a real chat streaming through the bridge (13
-  pieces over 12 s); App Nap held during the stream and released after it; a PNG uploaded as a `File` and shown from
+  pieces over 16 s); App Nap held during the stream and released after it; a PNG uploaded as a `File` and shown from
   `harness://app/api/attachments/…/content`; a chat export saved through the bridge; **the chat's marker string not
   found in any file of the data folder**; with internet blocked `GET /api/network` reports `osEnforced: true,
   osScope: "ollama"`, a pull through Harness is refused (403 `offline_lock`) and a pull sent straight to the sandboxed
@@ -251,7 +251,12 @@ real page, `native/Sources/SelfTest.swift` on the native side).
   the app starts the backend again without the key → locked → the password opens it; leaving keychain mode deletes
   the item. No listening socket in the app or the backend at any point; the backend's only TCP socket is its client
   connection to Ollama on 127.0.0.1:11434, and only Ollama listens (on 127.0.0.1).
-* **Offline-lock profile**: see `docs/BRIDGE.md` ("Offline lock") for the measured blocks and their limit.
+* **Offline-lock profile**: see `docs/BRIDGE.md` ("Offline lock") for the measured blocks and their limit. The
+  backend's own `POST /api/network/test` under the lock reported the code layer blocking huggingface.co,
+  ollama.com and registry.ollama.ai before any name lookup and the OS layer refusing a direct TCP connection to
+  1.1.1.1:443 with `EPERM`.
+* The last full run: workflow run 43821667376 (commit 94b1d4b on top of the finished backend): mock 34/34, real
+  backend 21/21 + clean quits, idle memory as in the table above.
 
 ## Not verified
 
