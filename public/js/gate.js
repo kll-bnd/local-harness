@@ -5,7 +5,7 @@ import { h, mount, add, dragRegion } from './lib/dom.js';
 import { icon } from './lib/icons.js';
 import * as api from './api.js';
 import { looksLikeRecoveryKey } from './lib/password.js';
-import { passwordField, strengthMeter, recoveryKeyPanel, retryCountdown, migrationProgress, RECOVERY_WARNING, clearOnEdit } from './security-ui.js';
+import { passwordField, strengthMeter, recoveryKeyPanel, retryCountdown, migrationProgress, RECOVERY_WARNING, clearOnEdit, KEYCHAIN_NOT_ENABLED_GATE } from './security-ui.js';
 
 const root = () => document.getElementById('app');
 let passwordReset = null; // { until } after unlocking with the recovery key
@@ -119,9 +119,12 @@ function lockFlow(sec) {
     const keychainBtn = keychainFirst
       ? h('button.btn.btn-primary.btn-large', { type: 'button', on: { click: () => attempt({}) } }, icon('key', { size: 15 }), 'Open Harness')
       : null;
-    const keychainNote = mode === 'keychain' && sec.unlock?.keychainError
-      ? h('p.gate-note', `The Keychain did not open Harness: ${sec.unlock.keychainError.message || sec.unlock.keychainError.code}. Your password works too.`)
-      : null;
+    const kcErr = sec.unlock?.keychainError;
+    const keychainNote = kcErr?.code === 'keychain_not_enabled'
+      ? h('p.gate-note', KEYCHAIN_NOT_ENABLED_GATE)
+      : mode === 'keychain' && kcErr
+        ? h('p.gate-note', `The Keychain did not open Harness: ${(kcErr.message || kcErr.code).replace(/\.$/, '')}. Your password works too.`)
+        : null;
 
     const render = () => {
       err.textContent = '';
@@ -154,6 +157,7 @@ function lockFlow(sec) {
         else if (e?.code === 'wrong_recovery_key') err.textContent = "That recovery key doesn't open this Harness.";
         else if (e?.code === 'keychain_unavailable') err.textContent = `The Keychain didn't answer${e.details?.reason === 'denied' ? ' (access was denied)' : e.details?.reason === 'timeout' ? ' in time' : e.details?.reason === 'not_found' ? ' (no Harness key there)' : ''}. Use your password.`;
         else if (e?.code === 'wrong_key') err.textContent = "The key in the Keychain doesn't open this Harness. Use your password.";
+        else if (e?.code === 'keychain_not_enabled') err.textContent = KEYCHAIN_NOT_ENABLED_GATE;
         else if (e?.code === 'auth_required') err.textContent = 'Open Harness from its launcher, or use your password.';
         else if (e?.code === 'vault_corrupt' || e?.code === 'vault_missing') { resolve(); return; }
         else if (e?.code === 'unlock_throttled') err.textContent = '';
@@ -183,7 +187,10 @@ function lockFlow(sec) {
       h('h1.gate-title', notLocked && mode !== 'password' ? 'Open Harness from its launcher' : 'Harness is locked'),
       notLocked && mode !== 'password'
         ? h('p.gate-text', 'This window has not been signed in. Open Harness from the app or its launcher — or type your Harness password.')
-        : h('p.gate-text', mode === 'keychain' ? 'Your data is encrypted. This Mac keeps the key in your Keychain.' : 'Your chats are encrypted on this Mac. Enter your password to open them.'),
+        : h('p.gate-text', mode === 'keychain' ? 'Your data is encrypted. This Mac keeps the key in your Keychain.'
+          // Protection "Off" with a password: plain files, but Harness still starts locked (display only).
+          : sec.plainDataFound && sec.state === 'locked' ? 'Enter your password to open Harness.'
+            : 'Your chats are encrypted on this Mac. Enter your password to open them.'),
       keychainBtn ? h('div.gate-actions', keychainBtn) : null,
       keychainNote,
       keychainBtn ? h('div.gate-or', 'or') : null,

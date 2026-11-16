@@ -9,6 +9,7 @@ import { store } from '../state.js';
 import { openPopover, toast, confirmDialog } from '../ui/overlays.js';
 import { confirmWithPassword, fmtWait } from '../security-ui.js';
 import { navigate } from '../router.js';
+import { describeWhat } from '../errors.js';
 
 const DEFAULT_ALLOW = { method: 'POST', path: '/api/network/allow', body: { minutes: 15 }, needsPassword: true, label: 'Allow internet for 15 minutes' };
 
@@ -53,19 +54,7 @@ export function startNetworkClock() {
 }
 
 // ------------------------------------------------------------------------------------------------ explaining
-const WHAT = {
-  model_catalog: 'Browsing models online needs the internet.',
-  model_download: 'Downloading a model needs the internet.',
-  fetch_url: 'Reading a web page needs the internet.',
-  remote_provider: 'This model runs on a server outside this Mac.',
-  remote_image_provider: 'This image service runs outside this Mac.',
-  other: 'This needs the internet.',
-};
-
-export function describeWhat(details) {
-  const base = WHAT[details?.what] || WHAT.other;
-  return details?.host && !['model_catalog', 'model_download'].includes(details?.what) ? `${base} (${details.host})` : base;
-}
+export { describeWhat }; // "what was blocked" in words (errors.js: also used to explain a saved failed reply)
 
 const SCOPE = {
   backend: 'macOS also keeps all of Harness in a sandbox without internet access.',

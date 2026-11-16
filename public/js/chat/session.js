@@ -436,7 +436,7 @@ function handleEvent(model, ev) {
     }
     case 'error': {
       const m = ev.messageId ? model.byId.get(ev.messageId) : model.byId.get(model.live?.assistantId);
-      if (m) { m.status = ev.code === 'aborted' ? 'aborted' : 'error'; m.error = ev.message; m.errorCode = ev.code; if (ev.nextSteps) m.nextSteps = ev.nextSteps; }
+      if (m) { m.status = ev.code === 'aborted' ? 'aborted' : 'error'; m.error = ev.message; m.errorCode = ev.code; if (ev.nextSteps) m.nextSteps = ev.nextSteps; if (ev.details) m.errorDetails = ev.details; }
       model.lastError = ev;
       changed(model, m?.id);
       break;

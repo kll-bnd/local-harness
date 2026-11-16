@@ -278,6 +278,10 @@ export class ConversationView {
       } else if (a === 'regenerate') {
         this.pinned = true;
         await regenerate(model, el.dataset.id);
+      } else if (a === 'allow-retry') {
+        // A reply refused by the internet blocker: ask with its own details, then answer the message again.
+        const { requestInternet } = await import('../network.js');
+        if (await requestInternet(model.msg(el.dataset.id)?.errorDetails || {})) { this.pinned = true; await regenerate(model, el.dataset.id); }
       } else if (a === 'image-again') {
         const t = this.turnFor(el.dataset.id);
         const req = t?.user?.imageRequest;

@@ -53,12 +53,13 @@ export function freePort() {
  * @param {boolean} [o.secure=false]   0.2 defaults ON: password protection, API sessions and "Block all internet
  *                                     access" (the UI meets the setup screen first). Off = the explicit opt-out of
  *                                     docs/API.md 10.10, so flows that are not about security start in the app.
+ * @param {string}  [o.mode]           secure stacks: the protection mode a launcher asks for (HARNESS_ENCRYPTION), e.g. 'keychain'
  * @param {boolean} [o.offlineLock]    override the internet blocker (secure stacks default to on)
  * @param {(dir: string) => Promise} [o.prepare]  write files into the data dir before the server starts
  * @param {string} [o.reuseDataDir]    start on an existing data dir (e.g. one an opt-out stack left as 0.1 did)
  * @param {boolean} [o.catalog=false]  run a fake Hugging Face + ollama.com (the model catalogue's sources)
  */
-export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false, secure = false, offlineLock, prepare, reuseDataDir = null, catalog = false } = {}) {
+export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false, secure = false, mode, offlineLock, prepare, reuseDataDir = null, catalog = false } = {}) {
   const dataDir = reuseDataDir || await fs.mkdtemp(path.join(os.tmpdir(), 'harness-ui-'));
   const fake = ollama ? await startFakeOllama({ port: 0, delayMs, models, pullStepMs }) : null;
   const a1111 = image ? await startFakeA1111({ port: 0, stepMs, drawThings: true }) : null;
@@ -93,7 +94,7 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
   if (prepare) await prepare(dataDir);
   // Secure stacks use cheap scrypt parameters so unlocking in tests takes milliseconds, not half a second.
   const securityOpts = secure
-    ? { security: { kdf: { N: 1024, r: 8, p: 1 } }, ...(offlineLock === undefined ? {} : { offlineLock }) }
+    ? { security: { kdf: { N: 1024, r: 8, p: 1 }, ...(mode ? { mode } : {}) }, ...(offlineLock === undefined ? {} : { offlineLock }) }
     : { security: { mode: 'off', apiAuth: false }, offlineLock: offlineLock ?? false };
   const sys = { totalMem: ram * GiB, platform: 'darwin', arch: 'arm64' };
   const srv = await startServer({ port: 0, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false, keychain: 'file', ...securityOpts });

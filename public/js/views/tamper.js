@@ -35,7 +35,7 @@ export const TAMPER_TITLE = 'Harness’s security settings were changed from out
 export function tamperText(t, { mode = 'password' } = {}) {
   const items = tamperItems(t?.fields || []);
   const kept = mode === 'off' ? 'Harness ignored the change and restored your settings.' : 'Harness ignored the change and restored your settings; your chats stayed encrypted.';
-  return `While Harness was closed, one of its start-up files was edited to weaken its protection${items.length ? ` (${list(items)})` : ''}. ${kept} If you did not restore an old copy of the Harness folder yourself, another program on this Mac may have tried to tamper with it.`;
+  return `While Harness was closed or locked, one of its start-up files was edited to weaken its protection${items.length ? ` (${list(items)})` : ''}. ${kept} If you did not restore an old copy of the Harness folder yourself, another program on this Mac may have tried to tamper with it.`;
 }
 
 export async function dismissTamper() {

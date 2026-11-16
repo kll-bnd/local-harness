@@ -392,9 +392,13 @@ export class TurnView {
         h('div', h('b', x.title)), h('div.small', last.error),
         h('div.row-wrap', nextStepButtons(last.nextSteps, { chat: model, messageId: last.id })))));
     } else if (last?.status === 'error') {
-      const x = explainError({ code: last.errorCode || 'provider_error', message: last.error });
+      // errorDetails (saved with the reply): for offline_lock, what was blocked and the exact allow request.
+      const x = explainError({ code: last.errorCode || 'provider_error', message: last.error, details: last.errorDetails || null });
+      const allow = last.errorCode === 'offline_lock';
       notes.push(h('div.callout.danger.msg-error', icon('error'), h('div.grow', h('div', h('b', x.title)), x.detail ? h('div.small', x.detail) : null),
-        x.action ? h('button.btn.btn-small', { type: 'button', on: { click: x.action.run } }, x.action.label) : null,
+        // Blocked: allow (the prompt says what and for how long), then answer the same message again.
+        allow ? h('button.btn.btn-small', { type: 'button', dataset: { action: 'allow-retry', id: last.id } }, x.action.label)
+          : x.action ? h('button.btn.btn-small', { type: 'button', on: { click: x.action.run } }, x.action.label) : null,
         h('button.btn.btn-small', { type: 'button', dataset: { action: 'regenerate', id: last.id } }, icon('regenerate', { size: 13 }), 'Retry')));
     } else if (last?.status === 'aborted' && !(isLast && model.live)) {
       notes.push(h('div.note-line', icon('stop', { size: 11 }), 'Stopped'));

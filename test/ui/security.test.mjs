@@ -449,7 +449,7 @@ test('protection mode: "Don\'t ask on this Mac" needs the password; the lock scr
   } finally { await app.close(); await stack.close(); }
 });
 
-test('no password yet (off mode): choosing "Ask for my password" sets one, shows the recovery key and encrypts', async () => {
+test('no password yet (off mode): choosing "Ask for my password" sets one, shows the recovery key and encrypts; Off again still asks for it', async () => {
   const stack = await startStack({ offlineLock: false }); // the development opt-out: plain data, no password
   await stack.api('POST', '/api/chats/import', { title: 'Plain chat', messages: [{ role: 'user', content: 'The lighthouse keeper writes in teal ink.' }] });
   const app = await openApp(stack, { hash: '#/settings/privacy' });
@@ -476,6 +476,46 @@ test('no password yet (off mode): choosing "Ask for my password" sets one, shows
     };
     await walk(stack.dataDir);
     assert.deepEqual(hits, []);
+
+    // Back to Off, now with a password: the choice and its confirmation say Harness will still ask for it.
+    const STILL_ASKS = 'Harness still asks for your password when it opens — that is how it knows this setting is really yours.';
+    assert.equal((await page.locator('.mode-card[data-mode="off"] .mode-text').textContent()).trim(), `Your data is stored as plain files that anyone who can read this Mac’s disk can read. ${STILL_ASKS}`);
+    await page.locator('.mode-card[data-mode="off"]').click();
+    await page.waitForSelector('dialog.confirm-pw');
+    assert.ok((await page.locator('dialog.confirm-pw').textContent()).includes(`readable by anyone who can read this Mac’s disk. ${STILL_ASKS}`));
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions button', { hasText: 'Turn off encryption' }).click();
+    await page.waitForSelector('.mode-card[data-mode="off"][aria-checked="true"]', { timeout: 20000 });
+    await waitFor(async () => { hits.length = 0; await walk(stack.dataDir); return hits.length > 0; }, { timeout: 20000 });
+    // Next start: plain files, yet locked — the lock screen does not claim the chats are encrypted.
+    await stack.stopServer();
+    await stack.startServerAgain();
+    await page.goto(`${stack.url}/#/settings/privacy`);
+    await page.waitForSelector('.gate input[name="password"]');
+    const sec = await page.evaluate(async () => (await fetch('/api/security')).json());
+    assert.deepEqual([sec.state, sec.mode, sec.passwordSet], ['locked', 'password', true]);
+    const neutral = async () => {
+      const gate = await page.locator('.gate').textContent();
+      assert.match(gate, /Enter your password to open Harness\./);
+      assert.doesNotMatch(gate, /encrypted/);
+    };
+    // docs/API.md 10.2: plainDataFound on such a locked folder. Until the backend reports it there, the sentence is
+    // checked with that one field set on the real answer.
+    if (sec.plainDataFound) await neutral();
+    else {
+      await page.route('**/api/security', async (route) => {
+        const res = await route.fetch();
+        await route.fulfill({ response: res, json: { ...(await res.json()), plainDataFound: true } });
+      });
+      await page.reload();
+      await page.waitForSelector('.gate input[name="password"]');
+      await neutral();
+      await page.unroute('**/api/security');
+      await page.reload();
+      await page.waitForSelector('.gate input[name="password"]');
+    }
+    await unlockViaUi(page);
+    await page.waitForSelector('.mode-card[data-mode="off"][aria-checked="true"]');
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });
@@ -653,7 +693,7 @@ test('start-up files weakened while Harness was closed: one calm notice, restore
     await page.waitForSelector('.tamper-notice');
     const notice = await page.locator('.tamper-notice').textContent();
     assert.match(notice, /Harness’s security settings were changed from outside/);
-    assert.match(notice, /While Harness was closed, one of its start-up files was edited to weaken its protection \(open without your password and switch off the internet blocker\)\. Harness ignored the change and restored your settings; your chats stayed encrypted\./);
+    assert.match(notice, /While Harness was closed or locked, one of its start-up files was edited to weaken its protection \(open without your password and switch off the internet blocker\)\. Harness ignored the change and restored your settings; your chats stayed encrypted\./);
     assert.match(notice, /If you did not restore an old copy of the Harness folder yourself, another program on this Mac may have tried to tamper with it\./);
     assert.match(notice, /Noticed /);
     assert.doesNotMatch(notice, /launch\.json/);
@@ -698,6 +738,126 @@ test('the plain-language list covers every documented field (unknown ones shown 
     assert.deepEqual(items, ['open without your password', 'switch off the internet blocker', 'allow internet access', 'store your chats unencrypted', 'an older or foreign copy of the key file', 'something new: field']);
     // In off mode (plain chats by the owner's choice) it does not claim the chats stayed encrypted.
     const off = await app.page.evaluate(async () => (await import('/js/views/tamper.js')).tamperText({ fields: ['launch.json: offlineLock'] }, { mode: 'off' }));
-    assert.equal(off, 'While Harness was closed, one of its start-up files was edited to weaken its protection (switch off the internet blocker). Harness ignored the change and restored your settings. If you did not restore an old copy of the Harness folder yourself, another program on this Mac may have tried to tamper with it.');
+    assert.equal(off, 'While Harness was closed or locked, one of its start-up files was edited to weaken its protection (switch off the internet blocker). Harness ignored the change and restored your settings. If you did not restore an old copy of the Harness folder yourself, another program on this Mac may have tried to tamper with it.');
   } finally { await app.close(); await stack.close(); }
+});
+
+// ------------------------------------------------------------------------------------------------ the Keychain
+const KC_FILE = '.dev-keychain'; // the development stand-in for the macOS Keychain (one base64 key)
+const kcNote = (page) => page.locator('.privacy .keychain-note');
+
+test('Keychain: a different Harness key already there, then no key at all — Settings and the lock screen say why', async () => {
+  // A Keychain that already holds another installation's key, and a launcher asking for keychain mode at setup.
+  const stack = await startStack({ secure: true, mode: 'keychain', prepare: async (dir) => {
+    await fs.writeFile(path.join(dir, KC_FILE), `${Buffer.alloc(32, 5).toString('base64')}\n`);
+    await fs.writeFile(path.join(dir, 'launch.json'), JSON.stringify({ version: 1, encryption: 'keychain' }));
+  } });
+  let app = null;
+  try {
+  await stack.setupPassword(PASSWORD);
+  assert.equal((await stack.api('GET', '/api/security')).data.unlock.keychainError?.code, 'keychain_item_exists');
+  app = await openApp(stack, { hash: '#/settings/privacy' });
+  try {
+    const { page } = app;
+    await unlockViaUi(page);
+    await page.waitForSelector('.privacy .keychain-note');
+    assert.equal((await kcNote(page).textContent()).trim(), 'The Keychain already holds a different Harness key, so “Don’t ask on this Mac” was not switched on. Choosing it again replaces that key (Harness asks for your password first).');
+    assert.equal(await page.locator('.mode-card[aria-checked="true"]').getAttribute('data-mode'), 'password');
+    // Choosing it (with the password) replaces the foreign key; the note goes.
+    await page.locator('.mode-card[data-mode="keychain"]').click();
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
+    await page.waitForSelector('.mode-card[data-mode="keychain"][aria-checked="true"]');
+    await page.waitForSelector('.privacy .keychain-note', { state: 'detached' });
+    assert.notEqual((await fs.readFile(path.join(stack.dataDir, KC_FILE), 'utf8')).trim(), Buffer.alloc(32, 5).toString('base64'));
+  } finally { await app.close(); }
+  // The Keychain item disappears while Harness is closed: the lock screen says so, the password opens it.
+  await stack.stopServer();
+  await fs.rm(path.join(stack.dataDir, KC_FILE));
+  await stack.startServerAgain();
+  app = await openApp(stack, { hash: '#/settings/privacy' });
+  try {
+    const { page } = app;
+    await page.waitForSelector('.gate .gate-note');
+    assert.match(await page.locator('.gate').textContent(), /The Keychain did not open Harness: The Keychain holds no Harness key\. Enter the password instead\. Your password works too\./);
+    await unlockViaUi(page);
+    await page.waitForSelector('.privacy .keychain-note');
+    const note = await kcNote(page).textContent();
+    assert.match(note, /^Harness could not get its key from the Keychain, so it asks for your password when it opens\./);
+    assert.match(note, /The Keychain holds no Harness key/, "the backend's message as the detail");
+    await app.assertClean(assert);
+  } finally { await app.close(); }
+  } finally { await stack.close(); }
+});
+
+test('Keychain: an older key file put back — its Keychain key is not used; the lock screen and Settings say so in words', async () => {
+  const stack = await startStack({ secure: true });
+  try {
+  await stack.setupPassword(PASSWORD);
+  const dir = stack.dataDir;
+  // Keychain mode (the key file gets a Keychain wrap), a copy of that key file and the Keychain item…
+  assert.equal((await stack.api('POST', '/api/security/mode', { mode: 'keychain', password: PASSWORD })).status, 200);
+  const oldVault = await fs.readFile(path.join(dir, 'vault.json'));
+  const oldItem = await fs.readFile(path.join(dir, KC_FILE));
+  // …then back to the password (the wrap and the item go, the security record says password).
+  assert.equal((await stack.api('POST', '/api/security/mode', { mode: 'password', password: PASSWORD })).status, 200);
+  await stack.stopServer();
+  // While Harness is closed, the older key file and the item are put back and launch.json asks for keychain mode.
+  await fs.writeFile(path.join(dir, 'vault.json'), oldVault);
+  await fs.writeFile(path.join(dir, KC_FILE), oldItem);
+  const launch = JSON.parse(await fs.readFile(path.join(dir, 'launch.json'), 'utf8'));
+  await fs.writeFile(path.join(dir, 'launch.json'), JSON.stringify({ ...launch, encryption: 'keychain' }));
+  await stack.startServerAgain();
+  const app = await openApp(stack, { hash: '#/settings/privacy' });
+  try {
+    const { page } = app;
+    const sec = await page.evaluate(async () => (await fetch('/api/security')).json());
+    assert.equal(sec.state, 'locked');
+    assert.equal(sec.unlock.keychainError?.code, 'keychain_not_enabled');
+    // The lock screen: one short sentence of its own (not the backend's message), nothing about tampering.
+    await page.waitForSelector('.gate .gate-note');
+    const gate = await page.locator('.gate').textContent();
+    assert.match(gate, /This Harness is not set to open without your password, so the key in the Keychain was not used\. Enter your password\./);
+    assert.doesNotMatch(gate, /Keychain mode is not on for this data|changed from outside/);
+    await unlockViaUi(page);
+    await page.waitForSelector('.privacy .keychain-note');
+    assert.equal((await kcNote(page).textContent()).trim(), 'This data is not set to open without your password, so Harness did not use the key in the Keychain. Choose “Don’t ask on this Mac” if you want that.');
+    assert.equal(await page.locator('.mode-card[aria-checked="true"]').getAttribute('data-mode'), 'password');
+    await app.shot('42-keychain-not-enabled');
+    await app.assertClean(assert);
+  } finally { await app.close(); }
+  } finally { await stack.close(); }
+});
+
+test('a saved reply refused by the internet blocker says what was blocked and asks for exactly that, then answers again', async () => {
+  const stack = await startStack({ secure: true });
+  try {
+  await stack.setupPassword(PASSWORD);
+  // A reply that failed with offline_lock, as the backend saves it (errorCode + errorDetails), brought in by an import.
+  const details = { what: 'remote_provider', host: 'llm.example.net', allow: { method: 'POST', path: '/api/network/allow', body: { minutes: 15 }, needsPassword: true, label: 'Allow internet for 15 minutes' } };
+  const imp = await stack.api('POST', '/api/chats/import', { format: 'harness.chat', chat: { title: 'Remote model chat', messages: {
+    m1: { id: 'm1', parentId: null, role: 'user', content: 'hello there', createdAt: '2026-11-16T10:00:00Z', status: 'complete' },
+    m2: { id: 'm2', parentId: 'm1', role: 'assistant', content: '', createdAt: '2026-11-16T10:00:01Z', status: 'error', error: 'Internet access is blocked in Harness (remote provider would contact llm.example.net). Allow it for a few minutes to continue.', errorCode: 'offline_lock', errorDetails: details } } } });
+  assert.equal(imp.status, 201);
+  const app = await openApp(stack, { hash: `#/chat/${imp.data.chats[0].id}` });
+  try {
+    const { page } = app;
+    await unlockViaUi(page);
+    await page.waitForSelector('.msg-error');
+    const callout = await page.locator('.msg-error').textContent();
+    assert.match(callout, /Internet access is blocked/);
+    assert.match(callout, /This model runs on a server outside this Mac \(llm\.example\.net\)\. Harness keeps everything on this Mac until you allow it\./);
+    await page.locator('.msg-error button', { hasText: 'Allow internet for 15 minutes' }).click();
+    await page.waitForSelector('dialog.confirm-pw');
+    assert.match(await page.locator('dialog.confirm-pw').textContent(), /This model runs on a server outside this Mac \(llm\.example\.net\)\. Internet access is blocked in Harness\./);
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
+    await page.waitForSelector('dialog.confirm-pw', { state: 'detached' });
+    await page.waitForSelector('.net-shield-wrap[data-state="allowed"]');
+    // The same message is answered again (here by the local model the imported chat falls back to).
+    await page.waitForFunction(() => /You said: hello there/.test(document.querySelector('.turn:last-child .msg-assistant')?.textContent || ''), null, { timeout: 20000 });
+    assert.equal(await page.locator('.msg-error').count(), 0);
+    await app.assertClean(assert);
+  } finally { await app.close(); }
+  } finally { await stack.close(); }
 });

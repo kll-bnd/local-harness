@@ -4,6 +4,21 @@ import { runAction } from './actions.js';
 import { store, ollamaStatus } from './state.js';
 import { isLockingDown, isLockError } from './lockdown.js';
 
+// What the internet blocker refused (offline_lock `details.what` / `host`), in words.
+const WHAT = {
+  model_catalog: 'Browsing models online needs the internet.',
+  model_download: 'Downloading a model needs the internet.',
+  fetch_url: 'Reading a web page needs the internet.',
+  remote_provider: 'This model runs on a server outside this Mac.',
+  remote_image_provider: 'This image service runs outside this Mac.',
+  other: 'This needs the internet.',
+};
+
+export function describeWhat(details) {
+  const base = WHAT[details?.what] || WHAT.other;
+  return details?.host && !['model_catalog', 'model_download'].includes(details?.what) ? `${base.replace(/\.$/, '')} (${details.host}).` : base;
+}
+
 /** → { title, detail, action?: {label, run} } */
 export function explainError(err, context = '') {
   const code = err?.code || 'unknown';
@@ -95,7 +110,7 @@ export function explainError(err, context = '') {
     case 'offline_lock':
       return {
         title: 'Internet access is blocked',
-        detail: 'Harness keeps everything on this Mac until you allow it.',
+        detail: `${err.details?.what ? `${describeWhat(err.details)} ` : ''}Harness keeps everything on this Mac until you allow it.`,
         action: { label: err.details?.allow?.label || 'Allow internet for 15 minutes', run: () => import('./views/network.js').then((m) => m.requestInternet(err.details || {})) },
       };
     case 'confirmation_required':

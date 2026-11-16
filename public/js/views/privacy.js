@@ -9,7 +9,7 @@ import { store, patchSettings, loadChats, loadSettings, loadPresets } from '../s
 import { openDialog, toast } from '../ui/overlays.js';
 import { showError } from '../errors.js';
 import { runAction, keyLabel, getAction } from '../actions.js';
-import { confirmWithPassword, passwordField, strengthMeter, recoveryKeyPanel, migrationProgress, RECOVERY_WARNING, setSecurityContext, confirmationHeader, clearOnEdit } from '../security-ui.js';
+import { confirmWithPassword, passwordField, strengthMeter, recoveryKeyPanel, migrationProgress, RECOVERY_WARNING, setSecurityContext, confirmationHeader, clearOnEdit, keychainErrorText } from '../security-ui.js';
 import { networkState, scopeNote, allowFor, blockNow, setBlocker, selfTest } from './network.js';
 import { lockdown, holdLockdown } from '../lockdown.js';
 import { tamperCallout } from './tamper.js';
@@ -19,6 +19,9 @@ const MODES = [
   { id: 'keychain', label: "Don't ask on this Mac", text: 'Harness opens without asking: the key is also kept in your login Keychain, so other apps running as you could ask for it.' },
   { id: 'off', label: 'Off', text: 'Your data is stored as plain files that anyone who can read this Mac’s disk can read.' },
 ];
+// Off with a password (the usual way there): the files are plain, but the key store stays and Harness starts locked —
+// without the password it cannot know that "off" was really the owner's choice.
+const OFF_STILL_ASKS = 'Harness still asks for your password when it opens — that is how it knows this setting is really yours.';
 
 const IDLE = [[5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, '1 hour'], [120, '2 hours'], [240, '4 hours'], [0, 'Never']];
 
@@ -49,15 +52,20 @@ export function privacySection(view) {
   // ---- protection mode
   const modeList = h('div.mode-list', { role: 'radiogroup', attrs: { 'aria-label': 'How Harness protects your data' } }, MODES.map((m) => {
     const on = m.id === mode;
+    const text = m.id === 'off' && sec.passwordSet !== false ? `${m.text} ${OFF_STILL_ASKS}` : m.text;
     return h('button.mode-card', { type: 'button', role: 'radio', 'aria-checked': String(on), dataset: { mode: m.id }, on: { click: () => { if (!on) changeMode(m.id, view); } } },
       h('span.mode-radio'),
-      h('span.mode-body', h('span.mode-label', m.label, m.recommended ? h('span.badge.accent', 'Recommended') : null), h('span.mode-text', m.text)));
+      h('span.mode-body', h('span.mode-label', m.label, m.recommended ? h('span.badge.accent', 'Recommended') : null), h('span.mode-text', text)));
   }));
   const migEl = migrationProgress();
   migEl.update(sec.state === 'migrating' ? sec.migration : null);
+  // Why "Don't ask on this Mac" is not in force, when the Keychain did not work out (unlock.keychainError).
+  const kc = keychainErrorText(sec.unlock?.keychainError);
+  const kcNote = kc ? h('div.callout.warn.keychain-note', { role: 'status' }, icon('key'),
+    h('div.grow.stack', h('span', kc.text), kc.detail ? h('span.faint.small', kc.detail) : null)) : null;
   add(wrap, h('section.form-block',
     h('h3.h3', 'Protection'),
-    modeList, migEl.el));
+    modeList, kcNote, migEl.el));
 
   // ---- password + recovery key (+ re-keying after the Keychain held the key)
   const rk = sec.recoveryKey;
@@ -225,7 +233,7 @@ async function changeMode(next, view) {
     } else {
       r = await confirmWithPassword({
         title: next === 'password' ? 'Ask for the password again?' : next === 'keychain' ? 'Open Harness without asking on this Mac?' : 'Turn encryption off?',
-        message: next === 'off' ? 'Harness decrypts every file. Your chats, memories and images will be readable by anyone who can read this Mac’s disk.' : m.text,
+        message: next === 'off' ? `Harness decrypts every file. Your chats, memories and images will be readable by anyone who can read this Mac’s disk. ${OFF_STILL_ASKS}` : m.text,
         confirmLabel: next === 'off' ? 'Turn off encryption' : 'Change',
         danger: next === 'off',
         run: (password) => api.security.setMode({ password, mode: next }),

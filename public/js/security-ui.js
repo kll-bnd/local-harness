@@ -128,6 +128,25 @@ export function recoveryKeyPanel(key, { createdAt = new Date().toISOString(), on
 
 export const RECOVERY_WARNING = 'This key is shown only now: Harness does not keep a copy and cannot show it again. If you lose both your password and this key, your data is gone for good — nobody can recover it.';
 
+// ------------------------------------------------------------------------------------------------ the Keychain
+/** Lock screen: the Keychain's key opened the data, but this data is not set to open without the password. */
+export const KEYCHAIN_NOT_ENABLED_GATE = 'This Harness is not set to open without your password, so the key in the Keychain was not used. Enter your password.';
+
+/**
+ * Settings, after an unlock: why "Don't ask on this Mac" is not in force (`unlock.keychainError`), in plain words.
+ * → { text, detail } — `detail` is the backend's own message where the sentence is general.
+ */
+export function keychainErrorText(err) {
+  if (!err) return null;
+  if (err.code === 'keychain_item_exists') {
+    return { text: 'The Keychain already holds a different Harness key, so “Don’t ask on this Mac” was not switched on. Choosing it again replaces that key (Harness asks for your password first).', detail: null };
+  }
+  if (err.code === 'keychain_not_enabled') {
+    return { text: 'This data is not set to open without your password, so Harness did not use the key in the Keychain. Choose “Don’t ask on this Mac” if you want that.', detail: null };
+  }
+  return { text: 'Harness could not get its key from the Keychain, so it asks for your password when it opens.', detail: err.message || null };
+}
+
 // ------------------------------------------------------------------------------------------------ confirm
 /**
  * Ask for the password before an action that lowers protection, then run it.
