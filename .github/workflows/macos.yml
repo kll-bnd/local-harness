@@ -13,7 +13,7 @@ on:
         description: "Which jobs to run"
         type: choice
         default: all
-        options: [all, backend, desktop, ui, native, live, e2e, hub, ollama, nemotron]
+        options: [all, backend, desktop, ui, native, live, sandbox, e2e, hub, ollama, nemotron]
       live_groups:
         description: "live-check groups to run"
         type: string
@@ -197,6 +197,33 @@ jobs:
             --json /tmp/harness-live.json --markdown /tmp/harness-live.md || echo "live-check exit code $?"
           # Prints every check that did not pass and exits non-zero when any check FAILed (warnings do not fail the job).
           node scripts/ci/summarize-live-check.mjs /tmp/harness-live.json "${{ inputs.live_samples }}"
+
+  sandbox:
+    name: Harness starts Ollama inside the sandbox, repeated
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'sandbox' }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install and start an external Ollama, pull tiny models
+        run: |
+          set -euo pipefail
+          brew install ollama > /dev/null
+          OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 nohup ollama serve > /tmp/harness-ci-ollama.log 2>&1 &
+          for _ in $(seq 1 100); do
+            curl -fsS "$O/api/version" > /dev/null 2>&1 && break
+            sleep 0.3
+          done
+          ollama pull qwen3:0.6b > /dev/null 2>&1
+          ollama pull gemma3:270m > /dev/null 2>&1
+          ollama pull all-minilm > /dev/null 2>&1
+      - name: Ten starts on a busy machine - every one must be confined
+        # A throw-away Harness per round (temporary data folder, random password) starts its own Ollama on a spare
+        # port while internet access is blocked; a model pull sent straight to that Ollama must fail every time.
+        run: node scripts/ci/sandbox-ollama-repeat.mjs 10
 
   e2e:
     name: Real Nemotron through Harness, end to end
