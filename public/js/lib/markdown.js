@@ -15,10 +15,13 @@
 import { Marked } from '../../vendor/marked/marked.esm.js';
 import DOMPurify from '../../vendor/dompurify/purify.es.mjs';
 import hljs from '../../vendor/highlight/highlight.min.js';
-import { h } from './dom.js';
+import { h, mount, add } from './dom.js';
 import { icon } from './icons.js';
 
 const marked = new Marked({ gfm: true, breaks: false, async: false });
+// What you type is shown as you typed it: markdown structure (code fences, lists) renders, but raw HTML is
+// displayed as text and single newlines are kept.
+const userMarked = new Marked({ gfm: true, breaks: true, async: false, renderer: { html({ text }) { return escapeHtml(text); } } });
 
 const ALLOWED_TAGS = ['a', 'abbr', 'b', 'blockquote', 'br', 'caption', 'code', 'dd', 'del', 'details', 'div', 'dl', 'dt', 'em', 'figcaption', 'figure',
   'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'i', 'img', 'input', 'ins', 'kbd', 'li', 'mark', 'ol', 'p', 'pre', 'q', 's', 'samp', 'small', 'span',
@@ -98,7 +101,7 @@ function highlightCode(codeEl) {
     const out = hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
     const tpl = document.createElement('template');
     tpl.innerHTML = purify.sanitize(out, HL_PURIFY);
-    codeEl.replaceChildren(tpl.content);
+    mount(codeEl, tpl.content);
     codeEl.classList.add('hljs');
   } catch { /* leave plain */ }
   return lang;
@@ -113,7 +116,7 @@ export function codeBlockShell(pre, lang, { streaming = false } = {}) {
       h('button.code-copy', { type: 'button', title: 'Copy code', dataset: { action: 'copy-code' }, disabled: streaming, 'aria-label': `Copy ${label} code` }, icon('copy', { size: 14 }), h('span', 'Copy'))),
   );
   pre.replaceWith(wrap);
-  wrap.append(pre);
+  add(wrap, pre);
   return wrap;
 }
 
@@ -136,7 +139,7 @@ function enhance(frag, { highlight = true } = {}) {
   for (const t of frag.querySelectorAll('table')) {
     const wrap = h('div.table-wrap');
     t.replaceWith(wrap);
-    wrap.append(t);
+    add(wrap, t);
   }
   return frag;
 }
@@ -161,7 +164,7 @@ export function renderMarkdown(text, { cacheKey = null } = {}) {
   const frag = enhance(toFragment(html));
   if (cacheKey) {
     const tpl = document.createElement('template');
-    tpl.content.append(frag.cloneNode(true));
+    add(tpl.content, frag.cloneNode(true));
     cache.set(cacheKey, { text, tpl });
     if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
   }
@@ -191,7 +194,7 @@ export class StreamingMarkdown {
   reset() {
     this.stable = h('div.md-stable');
     this.tail = h('div.md-tail');
-    this.el.replaceChildren(this.stable, this.tail);
+    mount(this.el, this.stable, this.tail);
     this.stableLen = 0;
     this.scanPos = 0;
     this.fence = null; // { char, len, start, bodyStart }
@@ -226,10 +229,10 @@ export class StreamingMarkdown {
     this.text = text;
     this._scan(text);
     if (this.safe > this.stableLen) {
-      this.stable.append(renderMarkdown(text.slice(this.stableLen, this.safe)));
+      add(this.stable, renderMarkdown(text.slice(this.stableLen, this.safe)));
       this.stableLen = this.safe;
       this.open = null;
-      this.tail.replaceChildren();
+      mount(this.tail);
     }
     const tail = text.slice(this.stableLen);
     if (this.fence && this.fence.start >= this.stableLen) {
@@ -241,25 +244,43 @@ export class StreamingMarkdown {
         return;
       }
       const frag = document.createDocumentFragment();
-      if (pre.trim()) frag.append(renderMarkdown(pre));
+      if (pre.trim()) add(frag, renderMarkdown(pre));
       const lang = (this.fence.info || '').split(/\s+/)[0].toLowerCase();
       const node = document.createTextNode(body);
       const pre2 = h('pre', h('code', node));
-      frag.append(pre2);
-      this.tail.replaceChildren(frag);
+      add(frag, pre2);
+      mount(this.tail, frag);
       codeBlockShell(pre2, lang, { streaming: true });
       this.open = { start: this.fence.start, pre, body, node };
       return;
     }
     this.open = null;
-    this.tail.replaceChildren(tail ? renderMarkdown(tail) : '');
+    mount(this.tail, tail ? renderMarkdown(tail) : '');
   }
 
   finish(text) {
     this.text = text;
     this.finished = true;
-    this.el.replaceChildren(renderMarkdown(text, { cacheKey: this.cacheKey }));
+    mount(this.el, renderMarkdown(text, { cacheKey: this.cacheKey }));
   }
+}
+
+/** Render a user's message (markdown structure, raw HTML shown literally). */
+export function renderUserMarkdown(text, { cacheKey = null } = {}) {
+  text = String(text ?? '');
+  if (cacheKey) {
+    const hit = cache.get(cacheKey);
+    if (hit && hit.text === text) return hit.tpl.content.cloneNode(true);
+  }
+  let html;
+  try { html = userMarked.parse(text); } catch { html = `<p>${escapeHtml(text)}</p>`; }
+  const frag = enhance(toFragment(html));
+  if (cacheKey) {
+    const tpl = document.createElement('template');
+    add(tpl.content, frag.cloneNode(true));
+    cache.set(cacheKey, { text, tpl });
+  }
+  return frag;
 }
 
 /** Plain text → paragraphs (for user messages: no markdown interpretation, preserves whitespace). */

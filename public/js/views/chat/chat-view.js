@@ -1,6 +1,6 @@
 // Chat route view: the conversation (or the new-chat intro), the composer, drag & drop, and the toolbar
 // contents for a chat (title, live status, actions).
-import { h } from '../../lib/dom.js';
+import { h, mount, add } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
 import { fmtTokens, fmtBytes, modelLabel } from '../../lib/format.js';
 import { store, findModel, modelInfo, loadRecommended, chatModels } from '../../state.js';
@@ -63,11 +63,11 @@ export class ChatView {
     this.model = model;
     this.composer.bind(model);
     if (!model.loaded) {
-      this.body.replaceChildren(h('div.loading-chat', h('span.spinner'), h('span.muted', 'Opening chat…')));
+      mount(this.body, h('div.loading-chat', h('span.spinner'), h('span.muted', 'Opening chat…')));
       this.shell.updateToolbar();
       try { await model.load(); } catch (e) {
         if (this.model !== model) return;
-        this.body.replaceChildren(h('div.empty', icon('warning', { size: 22 }), h('div.empty-title', e.code === 'not_found' ? 'This chat no longer exists' : "Couldn't open this chat"), h('div', e.code === 'not_found' ? 'It may have been deleted in another window.' : e.message), h('button.btn', { type: 'button', on: { click: () => runAction('new-chat') } }, 'New chat')));
+        mount(this.body, h('div.empty', icon('warning', { size: 22 }), h('div.empty-title', e.code === 'not_found' ? 'This chat no longer exists' : "Couldn't open this chat"), h('div', e.code === 'not_found' ? 'It may have been deleted in another window.' : e.message), h('button.btn', { type: 'button', on: { click: () => runAction('new-chat') } }, 'New chat')));
         return;
       }
       if (this.model !== model) return;
@@ -78,7 +78,7 @@ export class ChatView {
 
   mountConversation(model) {
     this.conv = new ConversationView(model, { onEmpty: (empty) => { this.el.classList.toggle('is-empty', empty); } });
-    this.body.replaceChildren(this.conv.el);
+    mount(this.body, this.conv.el);
     this.conv.el.addEventListener('transcript-scroll', (e) => this.shell.setScrolled(e.detail.top > 4));
     this.modelOffs = [
       model.on('meta', () => this.shell.updateToolbar()),
@@ -145,38 +145,40 @@ export class ChatView {
     const intro = h('div.intro');
     const models = store.get('models');
     if (models && !chatModels().length) {
-      intro.append(h('div.intro-inner',
+      add(intro, h('div.intro-inner',
         h('div.intro-mark', 'Harness'),
         h('h1.intro-title', 'No chat model yet'),
         h('p.lede', 'Harness runs models entirely on this Mac. Download one to get started — the setup suggests a size that fits your memory.'),
         h('button.btn.btn-primary.btn-large', { type: 'button', on: { click: () => runAction('open-setup') } }, 'Set up a model')));
-      this.body.replaceChildren(intro);
+      mount(this.body, intro);
       return;
     }
     const planLine = h('span.intro-plan.num');
+    const nameEl = h('span.who', ref ? modelLabel(info?.name || ref.model) : 'No model selected');
     const advice = h('div.intro-advice');
     if (ref) {
       modelInfo(ref).then(async (r) => {
         const plan = r?.contextPlan;
         if (!plan) return;
+        if (r.info?.displayName) nameEl.textContent = r.info.displayName;
         planLine.textContent = `${fmtTokens(plan.numCtx)} context${ram ? ` on this ${Math.round(ram / 1024 ** 3)} GB ${sys.machine.appleSilicon || sys.machine.platform === 'darwin' ? 'Mac' : 'machine'}` : ''}`;
         if (plan.warnings?.some((w) => w.code === 'model_exceeds_budget')) {
           const rec = store.get('recommended') || await loadRecommended().catch(() => null);
           const better = rec?.models?.flatMap((m) => m.variants).find((v) => v.installed && v.estimate?.fits && v.model !== ref.model && v.estimate.numCtx > plan.numCtx);
-          advice.replaceChildren(h('div.callout.warn', icon('warning'), h('div.grow',
+          mount(advice, h('div.callout.warn', icon('warning'), h('div.grow',
             h('div', h('b', `${modelLabel(info?.name || ref.model)} is too large for this Mac's memory.`)),
             h('div.small', better ? `${modelLabel(better.model)} is installed and fits with a ${fmtTokens(better.estimate.numCtx)} window.` : plan.explanation)),
           better ? h('button.btn.btn-small', { type: 'button', on: { click: async () => {
             try { const { patchSettings } = await import('../../state.js'); await patchSettings({ defaultModel: { providerId: better.providerId || 'ollama', model: better.model } }); toast({ kind: 'success', message: `Default model: ${modelLabel(better.model)}` }); } catch (e) { showError(e, 'change the default model'); }
           } } }, 'Use it by default') : h('button.btn.btn-small', { type: 'button', on: { click: () => runAction('open-models') } }, 'Models')));
-        } else advice.replaceChildren();
+        } else mount(advice);
       }).catch(() => {});
     }
     const img = (sys?.imageProviders || []).find((p) => p.status === 'running');
     const card = (ic, title, desc, run) => h('button.intro-card', { type: 'button', on: { click: run } }, h('span.intro-card-icon', icon(ic)), h('span.intro-card-text', h('b', title), h('span', desc)));
-    intro.append(h('div.intro-inner',
+    add(intro, h('div.intro-inner',
       h('div.intro-mark', pending.incognito ? h('span.row', icon('incognito', { size: 14 }), 'Incognito chat') : 'Harness'),
-      h('div.intro-model', h('span.who', ref ? modelLabel(info?.name || ref.model) : 'No model selected'), planLine),
+      h('div.intro-model', nameEl, planLine),
       advice,
       h('div.intro-cards',
         card('paperclip', 'Ask about a file', 'PDF, text or code — or drop it anywhere', () => this.composer.pick()),
@@ -185,7 +187,7 @@ export class ChatView {
         card('incognito', pending.incognito ? 'Normal chat' : 'Incognito chat', pending.incognito ? 'Remembered and searchable' : 'Nothing remembered or recalled', () => this.composer.patchChat({ incognito: !pending.incognito })),
       ),
     ));
-    this.body.replaceChildren(intro);
+    mount(this.body, intro);
   }
 
   // ------------------------------------------------------------------------------------------ drag & drop

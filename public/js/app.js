@@ -1,6 +1,6 @@
 // Harness web UI entry point: boots the data layer, the global event bus (with reconnect), the command
 // registry (keyboard shortcuts, command palette and the Electron menu all share it) and the shell.
-import { h, isTypingTarget, pickFiles, download } from './lib/dom.js';
+import { h, isTypingTarget, pickFiles, download, mount, add } from './lib/dom.js';
 import { icon } from './lib/icons.js';
 import { truncate } from './lib/format.js';
 import * as api from './api.js';
@@ -171,7 +171,7 @@ function setConnection(state) {
   banner = null;
   if (state === 'offline') {
     banner = h('div.conn-banner', { role: 'status' }, h('span.spinner.small'), 'Reconnecting to Harness…');
-    document.body.append(banner);
+    add(document.body, banner);
   }
 }
 
@@ -293,7 +293,7 @@ async function boot() {
   const failed = results.filter((r) => r.status === 'rejected');
   if (failed.length === results.length) {
     setConnection('offline');
-    root.replaceChildren(h('div.boot-error', icon('warning', { size: 24 }), h('h1.h2', "Can't reach Harness"), h('p.muted', failed[0].reason?.message || ''), h('button.btn', { type: 'button', on: { click: () => location.reload() } }, 'Try again')));
+    mount(root, h('div.boot-error', icon('warning', { size: 24 }), h('h1.h2', "Can't reach Harness"), h('p.muted', failed[0].reason?.message || ''), h('button.btn', { type: 'button', on: { click: () => location.reload() } }, 'Try again')));
     return;
   }
   for (const f of failed) console.warn('[harness] initial load failed', f.reason);

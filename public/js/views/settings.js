@@ -1,7 +1,7 @@
 // Settings: every key of the settings schema, grouped into sections with the essentials first and the
 // rest behind "Advanced". Each control saves immediately (text fields on change), shows the server's
 // validation message inline, and offers "Reset" when it differs from the default.
-import { h, debounce, download, pickFiles } from '../lib/dom.js';
+import { h, debounce, download, pickFiles, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtTokens, modelLabel, fmtFull, isMac } from '../lib/format.js';
 import { store, patchSettings, setUiPref, uiPrefs, chatModels, loadSettings, loadPresets, loadSystem, loadModels, loadChats } from '../state.js';
@@ -166,31 +166,31 @@ export class SettingsView {
     this.renderNow();
   }
 
-  toolbar() { return { title: h('div.tb-title', h('span.title-text', 'Settings')), actions: [] }; }
+  toolbar() { return { title: h('div.tb-title.page-title', h('span.title-text', 'Settings')), actions: [] }; }
 
   renderNow() {
     const s = store.get('settings');
     if (!s) return;
-    this.nav.replaceChildren(...SETTINGS_SECTIONS.map((x) => h('a.settings-nav-item', { href: `#/settings/${x.id}`, attrs: { 'aria-current': x.id === this.section ? 'page' : null } }, icon(x.icon, { size: 15 }), x.label)));
+    mount(this.nav, ...SETTINGS_SECTIONS.map((x) => h('a.settings-nav-item', { href: `#/settings/${x.id}`, attrs: { 'aria-current': x.id === this.section ? 'page' : null } }, icon(x.icon, { size: 15 }), x.label)));
     const sec = SETTINGS_SECTIONS.find((x) => x.id === this.section);
     const body = h('div.settings-section');
-    body.append(h('h1.h1', sec.label));
-    if (this.section === 'presets') body.append(this.presetsSection());
-    else if (this.section === 'data') body.append(this.dataSection());
-    else if (this.section === 'about') body.append(this.aboutSection());
+    add(body, h('h1.h1', sec.label));
+    if (this.section === 'presets') add(body, this.presetsSection());
+    else if (this.section === 'data') add(body, this.dataSection());
+    else if (this.section === 'about') add(body, this.aboutSection());
     else {
       const fields = fieldsFor(this.section);
       const basic = fields.filter((f) => !f.adv);
       const adv = fields.filter((f) => f.adv);
-      body.append(h('div.form', basic.map((f) => this.field(f))));
+      add(body, h('div.form', basic.map((f) => this.field(f))));
       if (adv.length) {
         const open = this.showAdvanced.has(this.section);
-        body.append(h('button.disclosure.adv-toggle', { type: 'button', 'aria-expanded': String(open), on: { click: () => { if (open) this.showAdvanced.delete(this.section); else this.showAdvanced.add(this.section); this.renderNow(); } } }, icon('chevronRight', { size: 12 }), 'Advanced'));
-        if (open) body.append(h('div.form.form-adv', adv.map((f) => this.field(f))));
+        add(body, h('button.disclosure.adv-toggle', { type: 'button', 'aria-expanded': String(open), on: { click: () => { if (open) this.showAdvanced.delete(this.section); else this.showAdvanced.add(this.section); this.renderNow(); } } }, icon('chevronRight', { size: 12 }), 'Advanced'));
+        if (open) add(body, h('div.form.form-adv', adv.map((f) => this.field(f))));
       }
-      if (this.section === 'general') body.append(h('div.row.reset-all', h('span.spacer'), h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => this.resetAll() } }, 'Reset all settings…')));
+      if (this.section === 'general') add(body, h('div.row.reset-all', h('span.spacer'), h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => this.resetAll() } }, 'Reset all settings…')));
     }
-    this.content.replaceChildren(body);
+    mount(this.content, body);
   }
 
   async resetAll() {
@@ -308,7 +308,7 @@ export class SettingsView {
         const sel = h('select.select', { id, on: { change: (e) => { const val = e.target.value; if (!val) { this.save(f, null); return; } const [providerId, ...rest] = val.split('|'); this.save(f, { providerId: providerId || undefined, model: rest.join('|') }); } } },
           h('option', { value: '' }, f.nullLabel || 'Default'),
           ...models.map((m) => h('option', { value: `${m.providerId}|${m.model}`, selected: cur === `${m.providerId}|${m.model}` || (v && !v.providerId && v.model === m.model) }, `${modelLabel(m.name)}${m.providerId !== 'ollama' ? ` (${m.providerName})` : ''}`)));
-        if (v && !models.some((m) => m.model === v.model)) sel.append(h('option', { value: cur, selected: true }, `${modelLabel(v.model)} (not installed)`));
+        if (v && !models.some((m) => m.model === v.model)) add(sel, h('option', { value: cur, selected: true }, `${modelLabel(v.model)} (not installed)`));
         return sel;
       }
       case 'preset': {
@@ -325,7 +325,7 @@ export class SettingsView {
         if (ref) {
           Promise.all([api.models.context(ref).catch(() => null), api.models.context(ref, 'max').catch(() => null)]).then(([a, m]) => {
             if (!a) return;
-            preview.replaceChildren(h('div', h('b', `${modelLabel(ref.model)}: `), a.contextPlan.explanation),
+            mount(preview, h('div', h('b', `${modelLabel(ref.model)}: `), a.contextPlan.explanation),
               m && m.contextPlan.numCtx !== a.contextPlan.numCtx ? h('div', `Max (${fmtTokens(m.contextPlan.numCtx)}) would need about ${fmtBytes(m.contextPlan.memory?.estimatedTotalBytes)}${m.contextPlan.fits ? '' : ' — more than the safe budget'}.`) : null);
           });
         }
@@ -352,15 +352,15 @@ export class SettingsView {
         const sel = h('select.select', { id, on: { change: (e) => this.save(f, e.target.value || null) } },
           h('option', { value: '' }, 'First available'),
           ...provs.map((p) => h('option', { value: p.id, selected: p.id === v }, `${p.name}${p.status === 'running' ? '' : ' (not reachable)'}`)));
-        if (v && !provs.some((p) => p.id === v)) sel.append(h('option', { value: v, selected: true }, `${v} (not detected)`));
+        if (v && !provs.some((p) => p.id === v)) add(sel, h('option', { value: v, selected: true }, `${v} (not detected)`));
         return sel;
       }
       case 'imageModel': {
         const sel = h('select.select', { id, on: { change: (e) => this.save(f, e.target.value || null) } }, h('option', { value: '' }, 'Backend’s current model'));
-        if (v) sel.append(h('option', { value: v, selected: true }, v));
+        if (v) add(sel, h('option', { value: v, selected: true }, v));
         api.images.models({ providerId: store.get('settings').image?.providerId || undefined }).then((r) => {
-          for (const m of r.models) if (m.id !== v) sel.append(h('option', { value: m.id }, `${m.name}${m.current ? ' (current)' : ''}`));
-        }).catch(() => { sel.append(h('option', { disabled: true }, 'No image backend reachable')); });
+          for (const m of r.models) if (m.id !== v) add(sel, h('option', { value: m.id }, `${m.name}${m.current ? ' (current)' : ''}`));
+        }).catch(() => { add(sel, h('option', { disabled: true }, 'No image backend reachable')); });
         return sel;
       }
       default: return h('span.muted', '—');
@@ -405,18 +405,18 @@ export class SettingsView {
     const kind = h('select.select', { attrs: { 'aria-label': 'Kind' } }, h('option', { value: 'openai' }, 'OpenAI-compatible (llama.cpp, LM Studio, vLLM, MLX…)'), h('option', { value: 'ollama' }, 'Ollama'));
     const result = h('div.small');
     const test = async (create) => {
-      result.replaceChildren(h('span.spinner.small'), ' Testing…');
+      mount(result, h('span.spinner.small'), ' Testing…');
       try {
         const { provider } = await api.providers.create({ name: name.value.trim() || 'Custom server', kind: kind.value, baseUrl: url.value.trim(), apiKey: key.value || undefined });
         if (provider.status === 'running') {
-          result.replaceChildren(h('span', { class: 'ok-text' }, icon('check', { size: 12 }), ` Connected${provider.version ? ` · ${provider.version}` : ''}`));
+          mount(result, h('span', { class: 'ok-text' }, icon('check', { size: 12 }), ` Connected${provider.version ? ` · ${provider.version}` : ''}`));
           await Promise.all([loadSettings(), loadSystem({ refresh: true }), loadModels({ refresh: true })]);
           return true;
         }
-        result.replaceChildren(h('span.field-error', `Saved, but not reachable: ${provider.error || 'no response'}`));
+        mount(result, h('span.field-error', `Saved, but not reachable: ${provider.error || 'no response'}`));
         await Promise.all([loadSettings(), loadSystem({ refresh: true })]);
         return create;
-      } catch (e) { result.replaceChildren(h('span.field-error', e.message)); return false; }
+      } catch (e) { mount(result, h('span.field-error', e.message)); return false; }
     };
     openDialog({
       title: 'Add a model server',
@@ -457,9 +457,9 @@ export class SettingsView {
           const { provider } = await api.images.createProvider({ name: name.value.trim() || 'Image backend', kind: kind.value, baseUrl: url.value.trim(), apiKey: key.value || undefined });
           await Promise.all([loadSettings(), loadSystem({ refresh: true })]);
           if (provider.status === 'running') { toast({ kind: 'success', message: `${provider.name} connected` }); return true; }
-          result.replaceChildren(h('span.field-error', `Saved, but not reachable: ${provider.error || 'no response'}`));
+          mount(result, h('span.field-error', `Saved, but not reachable: ${provider.error || 'no response'}`));
           return false;
-        } catch (e) { result.replaceChildren(h('span.field-error', e.message)); return false; }
+        } catch (e) { mount(result, h('span.field-error', e.message)); return false; }
       } }],
     });
   }

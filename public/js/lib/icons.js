@@ -3,7 +3,7 @@
 //   'M…'                     → <path d>
 //   ['c', cx, cy, r, fill?]  → <circle>
 //   ['r', x, y, w, h, rx, fill?] → <rect>
-import { svg } from './dom.js';
+import { svg, add } from './dom.js';
 
 const I = {
   plus: ['M8 3.2v9.6M3.2 8h9.6'],
@@ -89,10 +89,10 @@ export function icon(name, { size = 16, cls = '' } = {}) {
   const spec = I[name] || [];
   const el = svg('svg', { ...ATTRS, width: size, height: size, class: `icon icon-${name}${cls ? ` ${cls}` : ''}` });
   for (const p of spec) {
-    if (typeof p === 'string') el.append(svg('path', { d: p }));
-    else if (p[0] === 'c') el.append(svg('circle', { cx: p[1], cy: p[2], r: p[3], ...(p[4] ? { fill: 'currentColor', stroke: 'none' } : {}) }));
-    else if (p[0] === 'r') el.append(svg('rect', { x: p[1], y: p[2], width: p[3], height: p[4], rx: p[5] || 0, ...(p[6] ? { fill: 'currentColor', stroke: 'none' } : {}) }));
-    else if (p[0] === 'f') el.append(svg('path', { d: p[1], fill: 'currentColor' }));
+    if (typeof p === 'string') add(el, svg('path', { d: p }));
+    else if (p[0] === 'c') add(el, svg('circle', { cx: p[1], cy: p[2], r: p[3], ...(p[4] ? { fill: 'currentColor', stroke: 'none' } : {}) }));
+    else if (p[0] === 'r') add(el, svg('rect', { x: p[1], y: p[2], width: p[3], height: p[4], rx: p[5] || 0, ...(p[6] ? { fill: 'currentColor', stroke: 'none' } : {}) }));
+    else if (p[0] === 'f') add(el, svg('path', { d: p[1], fill: 'currentColor' }));
   }
   return el;
 }

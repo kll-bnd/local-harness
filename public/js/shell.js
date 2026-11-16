@@ -1,6 +1,6 @@
 // The window: sidebar | main (title bar + current view) | inspector. Owns view switching, the title bar,
 // chat-level actions (rename, pin, fork, export, archive, delete with undo) and the reconnect banner.
-import { h, mount, download } from './lib/dom.js';
+import { h, mount, download, add } from './lib/dom.js';
 import { icon } from './lib/icons.js';
 import { fmtTokens, modelLabel, fmtUntil } from './lib/format.js';
 import { store, uiPrefs, setUiPref, localPref, findModel, modelInfo, loadChats, loadArchived } from './state.js';
@@ -68,7 +68,7 @@ export class Shell {
     this.backdrop = null;
     if (this.narrow.matches && sb) {
       this.backdrop = h('div.backdrop', { on: { click: () => this.toggleSidebar(false) } });
-      this.app.append(this.backdrop);
+      add(this.app, this.backdrop);
     }
     if (ins) this.inspector.renderNow();
     this.updateToolbar();
@@ -129,7 +129,7 @@ export class Shell {
     if (!view) return;
     if (this.current !== view) {
       this.current?.hide?.();
-      this.viewHost.replaceChildren(view.el);
+      mount(this.viewHost, view.el);
       this.current = view;
       this.setScrolled(false);
     }
@@ -150,7 +150,7 @@ export class Shell {
     const view = this.current;
     const tb = view?.toolbar?.() || { title: null, status: null, actions: [] };
     const sbClosed = !this.sidebarOpen();
-    this.tb.replaceChildren(
+    mount(this.tb, 
       sbClosed ? h('button.icon-btn', { type: 'button', title: `Show sidebar (${keyLabel(getAction('toggle-sidebar')?.keys?.[0])})`, 'aria-label': 'Show sidebar', on: { click: () => runAction('toggle-sidebar') } }, icon('sidebar')) : null,
       sbClosed ? h('button.icon-btn', { type: 'button', title: 'New chat', 'aria-label': 'New chat', on: { click: () => runAction('new-chat') } }, icon('compose')) : null,
       tb.title,
@@ -182,7 +182,7 @@ export class Shell {
     else stateText = 'not loaded';
     pill.title = ollamaDown ? 'Ollama is not running — click for setup' : loaded ? `Loaded in memory${loaded.expiresAt ? ` ${fmtUntil(loaded.expiresAt)}` : ''}${loaded.contextLength ? ` with a ${fmtTokens(loaded.contextLength)} window` : ''}` : unloadedForImage ? 'Unloaded to free memory for image generation; reloads on the next message' : 'Loads on the next message (the first reply takes longer)';
     if (ollamaDown) pill.addEventListener('click', (e) => { e.stopImmediatePropagation(); runAction('open-setup'); }, { capture: true });
-    pill.append(h(`span.${dot}`), h('span.label', modelLabel(info?.name || ref.model)), stateText ? h('span.faint.hide-narrow', stateText) : null, ctxSpan);
+    add(pill, h(`span.${dot}`), h('span.label', modelLabel(info?.name || ref.model)), stateText ? h('span.faint.hide-narrow', stateText) : null, ctxSpan);
     const m = this.chatView.model;
     const plan = m?.plan;
     if (plan?.numCtx) ctxSpan.textContent = `· ${fmtTokens(plan.numCtx)}`;

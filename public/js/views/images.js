@@ -1,6 +1,6 @@
 // Image studio (direct generation with progress + cancel, img2img) and the gallery (metadata, reuse,
 // delete, open the originating chat). Live updates come from the global bus.
-import { h, debounce, pickFiles } from '../lib/dom.js';
+import { h, debounce, pickFiles, mount } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtRelative, plural, truncate } from '../lib/format.js';
 import { store, bus, loadSystem, patchSettings } from '../state.js';
@@ -59,10 +59,14 @@ export class ImagesView {
   }
 
   toolbar() {
-    return { title: h('div.tb-title', h('span.title-text', 'Image studio')), actions: [] };
+    return { title: h('div.tb-title.page-title', h('span.title-text', 'Image studio')), actions: [] };
   }
 
-  providers() { return (store.get('system')?.imageProviders || []).filter((p) => p.status === 'running'); }
+  providers() {
+    // Draw Things (A1111 API) first: it is what this app is tuned for; the server picks the same by default.
+    const rank = (p) => (p.id === 'a1111' ? 0 : p.builtin ? 1 : 2);
+    return (store.get('system')?.imageProviders || []).filter((p) => p.status === 'running').sort((a, b) => rank(a) - rank(b));
+  }
   provider() { const ps = this.providers(); return ps.find((p) => p.id === this.form.providerId) || ps[0] || null; }
 
   async loadModels() {
@@ -90,7 +94,7 @@ export class ImagesView {
     const refocus = focused && this.formEl.contains(focused) ? { name: focused.name, s: focused.selectionStart, e: focused.selectionEnd } : null;
 
     if (!enabled || !provs.length) {
-      this.formEl.replaceChildren(h('div.studio-empty.stack',
+      mount(this.formEl, h('div.studio-empty.stack',
         h('h1.h1', 'Image studio'),
         !enabled
           ? h('div.callout', icon('info'), h('div.grow', 'Image generation is turned off.'), h('button.btn.btn-small', { type: 'button', on: { click: async () => { try { await patchSettings({ image: { enabled: true } }); } catch (e) { showError(e); } } } }, 'Turn on'))
@@ -124,7 +128,7 @@ export class ImagesView {
       input.addEventListener('change', () => { f[name] = input.value === '' ? null : Number(input.value); if (name === 'width' || name === 'height') this.renderWarnings(); });
       return h('label.studio-num', h('span.small.muted', label), input);
     };
-    const seedInput = h('input.input.input-small.num', { name: 'seed', type: 'number', value: f.seed ?? '', placeholder: 'random', attrs: { 'aria-label': 'Seed' } });
+    const seedInput = h('input.input.input-small.num', { name: 'seed', type: 'number', value: f.seed ?? '', placeholder: 'auto', attrs: { 'aria-label': 'Seed (empty = random)' } });
     seedInput.addEventListener('change', () => { f.seed = seedInput.value === '' ? null : Number(seedInput.value); });
 
     const caps = p?.capabilities || {};
@@ -139,8 +143,8 @@ export class ImagesView {
     this.progressEl = h('div.studio-progress');
     this.activityEl = h('div.studio-activity');
 
-    this.formEl.replaceChildren(
-      h('div.studio-head', h('h1.h1', 'Image studio'), this.defaults?.family ? h('span.badge', { title: 'Detected model family' }, this.defaults.family.label) : null),
+    mount(this.formEl, 
+      h('div.studio-head', h('h1.h1', 'Image studio'), this.defaults?.family && this.defaults.family.id !== 'unknown' ? h('span.badge', { title: 'Detected model family — sets sensible steps and guidance' }, this.defaults.family.label) : null),
       prompt,
       h('details.neg', { open: !!f.negativePrompt }, h('summary.small.muted', 'Negative prompt'), neg),
       h('div.studio-grid',
@@ -176,14 +180,14 @@ export class ImagesView {
     const low = sys?.machine?.ramTier === 'low';
     const msgs = w.map((x) => x.message);
     if (low && this.form.customSize && (this.form.width || 0) * (this.form.height || 0) > 768 * 768) msgs.push('Large sizes are slow and may swap on 8 GB.');
-    this.warningsEl.replaceChildren(...(msgs.length ? [h('div.callout.warn.small', icon('warning'), h('div', msgs.join(' ')))] : []),
+    mount(this.warningsEl, ...(msgs.length ? [h('div.callout.warn.small', icon('warning'), h('div', msgs.join(' ')))] : []),
       low ? h('p.faint.small', 'On 8 GB Harness unloads the chat model while generating; it reloads with your next message.') : null);
   }
 
   renderProgress() {
     if (!this.progressEl) return;
     const j = this.job;
-    if (!j) { this.progressEl.replaceChildren(); return; }
+    if (!j) { mount(this.progressEl); return; }
     const parts = [];
     if (j.phase === 'error') {
       const x = explainError({ code: j.code, message: j.error });
@@ -198,13 +202,13 @@ export class ImagesView {
       const grid = h(`div.image-grid.n${Math.min(j.images.length, 4)}`, j.images.map((img, i) => h('button.gen-img', { type: 'button', on: { click: () => this.open(j.images, i) }, style: { aspectRatio: `${img.width} / ${img.height}` } }, h('img', { src: img.url, alt: img.prompt }))));
       parts.push(grid);
     }
-    this.progressEl.replaceChildren(...parts);
+    mount(this.progressEl, ...parts);
   }
 
   renderActivity() {
     if (!this.activityEl) return;
     const jobs = Object.values(store.get('imageJobs') || {}).filter((j) => !['done', 'error', 'aborted'].includes(j.status) && j.id !== this.job?.jobId);
-    this.activityEl.replaceChildren(...jobs.map((j) => h('div.callout.small', h('span.spinner.small'), h('div.grow', `${j.source === 'tool' ? 'A chat is generating' : 'Generating'} “${truncate(j.prompt || '', 60)}”${j.status ? ` — ${j.status}` : ''}`),
+    mount(this.activityEl, ...jobs.map((j) => h('div.callout.small', h('span.spinner.small'), h('div.grow', `${j.source === 'tool' ? 'A chat is generating' : 'Generating'} “${truncate(j.prompt || '', 60)}”${j.status ? ` — ${j.status}` : ''}`),
       j.chatId ? h('a.btn.btn-small', { href: `#/chat/${j.chatId}` }, 'Open chat') : null,
       h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => api.images.cancel(j.id).catch((e) => showError(e)) } }, 'Cancel'))));
   }
@@ -322,7 +326,7 @@ export class ImagesView {
         h('button.g-thumb', { type: 'button', title: img.prompt, on: { click: () => this.open(this.images, i) }, style: { aspectRatio: `${img.width} / ${img.height}` } }, h('img', { src: img.url, alt: img.prompt || 'Image', loading: 'lazy', width: img.width, height: img.height })),
         h('figcaption', h('span.g-prompt', img.prompt || 'Untitled'), h('span.g-meta.faint.num', [`${img.width}×${img.height}`, img.source === 'tool' ? 'chat' : null, fmtRelative(img.createdAt)].filter(Boolean).join(' · '))))))
       : h('div.empty', icon('image', { size: 22 }), h('div.empty-title', this.filter.q || this.filter.source ? 'No matching images' : 'No images yet'), h('div', 'Generated images from the studio and from chats appear here.'));
-    this.galleryEl.replaceChildren(
+    mount(this.galleryEl, 
       h('div.gallery-head', h('h2.h2.grow', 'Gallery', h('span.muted.small.num', this.total ? ` ${plural(this.total, 'image')}` : '')), q, src),
       grid,
       this.images.length < this.total ? h('div.row', h('span.spacer'), h('button.btn.btn-small', { type: 'button', on: { click: () => this.loadGallery({ append: true }) } }, 'Load more'), h('span.spacer')) : null);

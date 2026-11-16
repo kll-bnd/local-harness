@@ -1,6 +1,6 @@
 // Models: what is loaded right now (and unload), installed models with details, downloads with
 // progress/cancel, pull by name, the recommended list for this machine, and embedding models.
-import { h } from '../lib/dom.js';
+import { h, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtTokens, modelLabel, fmtUntil, fmtWhen, plural } from '../lib/format.js';
 import { store, loadModels, loadSystem, loadRecommended, patchSettings, sameRef, dropModelInfo } from '../state.js';
@@ -29,7 +29,7 @@ export class ModelsView {
     loadRecommended().catch(() => {});
   }
 
-  toolbar() { return { title: h('div.tb-title', h('span.title-text', 'Models')), actions: [h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Refresh')] }; }
+  toolbar() { return { title: h('div.tb-title.page-title', h('span.title-text', 'Models')), actions: [h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Refresh')] }; }
 
   render() {
     const models = store.get('models');
@@ -77,14 +77,14 @@ export class ModelsView {
                 h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => this.details(m) } }, 'Details'),
                 !m.embedding && !isDef ? h('button.btn.btn-small.btn-ghost.hide-narrow', { type: 'button', on: { click: () => this.makeDefault(m) } }, 'Make default') : null,
                 prov?.capabilities?.delete ? h('button.icon-btn.small', { type: 'button', title: 'Delete', 'aria-label': `Delete ${m.model}`, on: { click: () => this.remove(m) } }, icon('trash', { size: 14 })) : null)));
-          }))))));
+          })))))));
     }
 
     const name = h('input.input', { placeholder: 'e.g. qwen3:4b or hf.co/user/repo:Q4_K_M', attrs: { 'aria-label': 'Model to download' } });
     const pullBtn = h('button.btn', { type: 'button', disabled: !canPull, on: { click: () => { const v = name.value.trim(); if (v) { pullModel({ model: v }); name.value = ''; } } } }, icon('download', { size: 14 }), 'Download');
     name.addEventListener('keydown', (e) => { if (e.key === 'Enter') pullBtn.click(); });
 
-    this.page.replaceChildren(
+    mount(this.page, 
       h('div.page-head', h('h1.h1', 'Models'), models ? h('span.muted', plural(models.length, 'model')) : null),
       loadedSec,
       downloads,
@@ -134,7 +134,7 @@ export class ModelsView {
       const plan = r.contextPlan;
       const caps = info.capabilities || [];
       const params = { ...(info.modelfileParameters || {}) };
-      body.replaceChildren(
+      mount(body, 
         h('dl.kv',
           h('dt', 'Name'), h('dd', info.displayName || info.model),
           h('dt', 'Model id'), h('dd.mono.small', info.model),
@@ -156,7 +156,7 @@ export class ModelsView {
           ...Object.entries(r.suggestedParams || {}).flatMap(([k, v]) => [h('dt', k), h('dd.mono.small', `${JSON.stringify(v)} (Harness suggestion)`)]))) : null,
         info.profile?.notes ? h('p.small.muted', info.profile.notes) : null,
       );
-    } catch (e) { body.replaceChildren(h('div.callout.danger', icon('error'), h('span', e.message))); }
+    } catch (e) { mount(body, h('div.callout.danger', icon('error'), h('span', e.message))); }
   }
 }
 

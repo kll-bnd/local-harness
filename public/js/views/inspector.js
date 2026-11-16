@@ -1,7 +1,7 @@
 // Inspector (right panel) for the current chat: Context (meter, why this size, mode, compaction),
 // Memory (what was used, per-chat switches, pinned memories), Summary (view/edit/history) and Chat
 // (per-chat overrides: preset, system prompt, sampling, tools).
-import { h, debounce } from '../lib/dom.js';
+import { h, debounce, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtInt, fmtFull, fmtRelative, plural, truncate, modelLabel } from '../lib/format.js';
 import { renderMarkdown } from '../lib/markdown.js';
@@ -73,7 +73,7 @@ export class Inspector {
   renderNow() {
     if (!this.shell.inspectorOpen()) return;
     const tab = this.tab;
-    this.tabsEl.replaceChildren(...TABS.map((t) => h('button', { type: 'button', role: 'tab', id: `itab-${t.id}`, tabIndex: t.id === tab ? 0 : -1, 'aria-selected': String(t.id === tab), attrs: { 'aria-controls': 'inspector-panel' }, dataset: { tab: t.id }, on: { click: () => this.setTab(t.id) } }, t.label)));
+    mount(this.tabsEl, ...TABS.map((t) => h('button', { type: 'button', role: 'tab', id: `itab-${t.id}`, tabIndex: t.id === tab ? 0 : -1, 'aria-selected': String(t.id === tab), attrs: { 'aria-controls': 'inspector-panel' }, dataset: { tab: t.id }, on: { click: () => this.setTab(t.id) } }, t.label)));
     this.body.id = 'inspector-panel';
     this.body.setAttribute('aria-labelledby', `itab-${tab}`);
     const m = this.model;
@@ -83,7 +83,7 @@ export class Inspector {
     else if (tab === 'memory') content = this.memoryTab(m);
     else if (tab === 'summary') content = this.summaryTab(m);
     else content = this.chatTab(m);
-    this.body.replaceChildren(content);
+    mount(this.body, content);
     this.body.scrollTop = scroll;
   }
 
@@ -151,7 +151,7 @@ export class Inspector {
       h('button.switch', { type: 'button', role: 'switch', 'aria-checked': String(!!on), 'aria-label': label, disabled, on: { click: run } }));
     const patch = (body) => (m ? this.patch(body) : this.shell.chatView?.composer?.patchChat(body).then(() => this.renderNow()));
 
-    wrap.append(h('section.stack',
+    add(wrap, h('section.stack',
       h('h3.section-title', 'This chat'),
       !globalOn ? h('div.callout.warn', icon('info'), h('div.grow', 'Memory is turned off for all chats.', ' ', h('a', { href: '#/settings/memory' }, 'Settings'))) : null,
       sw('Use memory', incog ? 'Off in incognito chats.' : 'Add relevant memories to the prompt and save new facts after each turn.', memOn && !incog && globalOn, () => patch({ settings: { memory: { enabled: !memOn } } }), incog || !globalOn),
@@ -165,12 +165,12 @@ export class Inspector {
 
     // what was used
     const usedSec = h('section.stack', h('h3.section-title', 'Used for the last reply'), h('div.faint.small', 'Loading…'));
-    wrap.append(usedSec);
+    add(wrap, usedSec);
     const focus = this.focusRetrieval && m?.msg(this.focusRetrieval);
     const last = focus || (m ? [...m.pathMessages()].reverse().find((x) => x.role === 'assistant' && x.retrieval) : null);
     const liveRet = !focus ? m?.lastRetrieval : null;
     const pinnedSec = h('section.stack', h('h3.section-title', 'Always included (pinned)'));
-    wrap.append(pinnedSec);
+    add(wrap, pinnedSec);
     this.memories().then(({ list }) => {
       const byId = new Map(list.map((x) => [x.id, x]));
       const ret = last?.retrieval;
@@ -178,7 +178,7 @@ export class Inspector {
       const items = usedIds.map((id) => byId.get(id) || { id, content: liveRet?.memories?.find((x) => x.id === id)?.content || '(deleted memory)' });
       const docs = liveRet?.documents || [];
       const recall = liveRet?.recall || [];
-      usedSec.replaceChildren(h('h3.section-title', focus ? 'Used for this reply' : 'Used for the last reply'),
+      mount(usedSec, h('h3.section-title', focus ? 'Used for this reply' : 'Used for the last reply'),
         !ret && !liveRet ? h('div.faint.small', 'Nothing yet.') : null,
         ret && !items.length && !(ret.documentChunks || []).length && !(ret.recallChunkIds || []).length ? h('div.faint.small', 'No memories, documents or past chats were added.') : null,
         ...items.map((x) => memoryRow(x, (ret?.pinnedMemoryIds || []).includes(x.id))),
@@ -186,10 +186,10 @@ export class Inspector {
         recall.length ? h('div.stack', recall.map((r) => h('a.small', { href: `#/chat/${r.chatId}` }, icon('history', { size: 12 }), ` ${r.chatTitle || 'Past chat'} · ${fmtRelative(r.date)}`))) : (ret?.recallChunkIds || []).length ? h('div.small.muted', `${plural(ret.recallChunkIds.length, 'excerpt')} from past chats`) : null,
         focus ? h('button.btn-link.small', { type: 'button', on: { click: () => { this.focusRetrieval = null; this.renderNow(); } } }, 'Show the last reply instead') : null);
       const pinned = list.filter((x) => x.pinned);
-      pinnedSec.replaceChildren(h('h3.section-title', 'Always included (pinned)'),
+      mount(pinnedSec, h('h3.section-title', 'Always included (pinned)'),
         pinned.length ? pinned.map((x) => memoryRow(x, true)) : h('div.faint.small', 'Pin a memory to include it in every chat.'),
         h('button.btn-link.small', { type: 'button', on: { click: () => runAction('open-memory') } }, `Manage all memories (${list.length})`));
-    }).catch(() => usedSec.replaceChildren(h('div.faint.small', 'Could not load memories.')));
+    }).catch(() => mount(usedSec, h('div.faint.small', 'Could not load memories.')));
     return wrap;
   }
 
@@ -200,15 +200,15 @@ export class Inspector {
     if (!info) { m.loadSummary().catch(() => {}); return h('div.faint.small', 'Loading…'); }
     const s = info.summary;
     const wrap = h('div.stack-lg');
-    if (!info.enabled) wrap.append(h('div.callout', icon('info'), h('span', 'Automatic summaries are off for this chat; older messages are dropped when the context is full.')));
-    if (info.lastError) wrap.append(h('div.callout.warn', icon('warning'), h('span', `Last summary attempt failed: ${info.lastError}`)));
+    if (!info.enabled) add(wrap, h('div.callout', icon('info'), h('span', 'Automatic summaries are off for this chat; older messages are dropped when the context is full.')));
+    if (info.lastError) add(wrap, h('div.callout.warn', icon('warning'), h('span', `Last summary attempt failed: ${info.lastError}`)));
     if (!s) {
-      wrap.append(h('p.muted', 'No summary yet — everything still fits in the context.'),
+      add(wrap, h('p.muted', 'No summary yet — everything still fits in the context.'),
         h('button.btn.btn-small', { type: 'button', disabled: m.generating || m.compacting || m.path.length < 3, on: { click: () => compactNow(m) } }, m.compacting ? 'Summarizing…' : 'Compact now'));
       return wrap;
     }
     const editing = this.summaryEditing;
-    wrap.append(h('div.stack',
+    add(wrap, h('div.stack',
       h('div.row', h('span.badge.accent', `${plural(info.compactedMessageCount, 'message')} summarized`), h('span.badge', `${fmtInt(s.tokens)} tokens`), s.editedByUser ? h('span.badge.outline', 'edited') : null, h('span.spacer'),
         !editing ? h('button.icon-btn.small', { type: 'button', title: 'Edit summary', 'aria-label': 'Edit summary', on: { click: () => { this.summaryEditing = true; this.renderNow(); } } }, icon('pencil', { size: 14 })) : null),
       editing ? this.summaryEditor(m, s) : h('div.prose.prose-small', renderMarkdown(s.content, { cacheKey: `s:${s.id}:${s.updatedAt}` })),
@@ -217,7 +217,7 @@ export class Inspector {
         h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => { this.shell.chatView?.conv?.scrollToMessage(s.upToMessageId); } } }, 'Show in chat')),
     ));
     if (info.history?.length > 1) {
-      wrap.append(h('section.stack', h('h3.section-title', 'Earlier summaries on this branch'),
+      add(wrap, h('section.stack', h('h3.section-title', 'Earlier summaries on this branch'),
         ...info.history.slice(0, -1).reverse().map((x) => h('details.history-item', h('summary', `${fmtFull(x.createdAt)} · ${fmtInt(x.tokens)} tokens · ${x.messagesCovered} messages`), h('div.prose.prose-small', renderMarkdown(x.content))))));
     }
     return wrap;

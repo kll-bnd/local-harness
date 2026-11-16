@@ -15,6 +15,7 @@ import { extractMemories } from '../memory/extractor.mjs';
 import { generateTitle, provisionalTitle } from './titles.mjs';
 import { embeddingProfileFor } from '../providers/catalog.mjs';
 import { ramTier, isCpuSplit, roundCtx } from '../context/sizing.mjs';
+import { normalizeUrl, URL_RE } from '../lib/url.mjs';
 
 const nonNull = (o) => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v !== null && v !== undefined));
 
@@ -104,6 +105,29 @@ export class ChatEngine {
   }
 
   busy(chatId) { return this.active.has(chatId); }
+
+  /**
+   * Reserve a chat for one operation (generation, chat-linked image job, compaction, extraction).
+   * Synchronous on purpose: callers reserve BEFORE their first await, so two concurrent requests can never
+   * both pass the busy check. Also pre-empts background model work so the user's turn goes first.
+   */
+  reserve(chatId, kind = 'chat') {
+    if (this.active.has(chatId)) throw new HttpError(409, 'chat_busy', 'A generation is already running for this chat');
+    const rec = { generationId: newId('gen'), controller: new AbortController(), startedAt: nowIso(), kind, assistantMessageId: null, released: false };
+    this.active.set(chatId, rec);
+    this.app.foreground++;
+    this.app.background?.preempt();
+    return rec;
+  }
+
+  /** Release a reservation (idempotent; only the owner's record is removed). */
+  release(chatId, rec) {
+    if (!rec || rec.released) return;
+    rec.released = true;
+    if (this.active.get(chatId) === rec) this.active.delete(chatId);
+    this.app.foreground = Math.max(0, this.app.foreground - 1);
+    this.app.background?.kick();
+  }
 
   stop(chatId) {
     const g = this.active.get(chatId);
@@ -273,50 +297,62 @@ export class ChatEngine {
 
   /**
    * Run one assistant turn answering `anchorId` (a user message). Streams events through `emit`.
-   * Resolves with the final assistant message (also on abort); rejects only on setup errors before
-   * the stream starts (validation / provider unreachable), which routes turn into JSON errors.
+   * `reservation` comes from reserve() (taken by the route before its first await); without it, run() reserves.
+   * Errors before the `start` event (setup: model/provider/anchor) are thrown — the route turns them into JSON
+   * errors; later failures end the stream with an `error` event. The reservation is always released.
    */
-  async run({ chat, anchorId, emit = () => {}, signal, modelRef = null, userMessage = null, prepared = null }) {
-    if (this.busy(chat.id)) throw new HttpError(409, 'chat_busy', 'A generation is already running for this chat');
-    const controller = new AbortController();
-    const generationId = newId('gen');
+  async run({ chat, anchorId, emit = () => {}, signal, modelRef = null, userMessage = null, prepared = null, reservation = null }) {
+    const rec = reservation || this.reserve(chat.id);
+    const { controller, generationId } = rec;
     const onAbort = () => controller.abort();
-    if (signal) signal.addEventListener('abort', onAbort, { once: true });
-    this.active.set(chat.id, { generationId, controller, startedAt: nowIso() });
-    this.app.foreground++;
+    if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+    const sig = controller.signal;
     const t0 = Date.now();
     const created = [];
     let asst = null;
-    let t;
-    try {
-      t = prepared || (await this.target(chat, modelRef));
-    } catch (e) {
-      this.active.delete(chat.id);
-      this.app.foreground--;
-      this.app.background.kick();
-      signal?.removeEventListener('abort', onAbort);
-      throw e;
-    }
-    const sig = controller.signal;
-    const s = t.s;
-    const modelInfo = { providerId: t.provider.id, model: t.model };
-    const newAssistant = (parentId) => {
-      const m = { id: newId('msg'), parentId, role: 'assistant', content: '', reasoning: '', status: 'streaming', model: modelInfo, createdAt: nowIso() };
-      addMessage(chat, m);
-      setActiveLeaf(chat, m.id);
-      created.push(m.id);
-      return m;
-    };
-    asst = newAssistant(anchorId);
-    this.active.get(chat.id).assistantMessageId = asst.id;
-    this.app.chats.touch(chat);
-    this.app.bus.publish('generation.started', { chatId: chat.id, generationId, assistantMessageId: asst.id });
-    emit('start', { generationId, chatId: chat.id, userMessage: userMessage ? publicMessage(userMessage) : null, assistantMessage: publicMessage(asst), model: { ...modelInfo, displayName: t.info.displayName, capabilities: t.info.capabilities }, contextPlan: t.plan });
-
+    let started = false;
+    let lease = null;
     const totals = { promptTokens: 0, completionTokens: 0, evalMs: 0, promptMs: 0, loadMs: 0, iterations: 0, toolCalls: 0 };
     let finalReason = 'stop';
     let lastUsage = null;
+    const finishUp = () => {
+      lease?.release();
+      lease = null;
+      signal?.removeEventListener('abort', onAbort);
+      this.release(chat.id, rec);
+      if (!started) return;
+      this.app.chats.touch(chat);
+      this.app.chats.saveNow(chat).catch(() => {});
+      this.app.bus.publish('generation.finished', { chatId: chat.id, generationId });
+    };
     try {
+      const t = prepared || (await this.target(chat, modelRef));
+      // Re-check after the awaits: the chat or the message may have been deleted meanwhile.
+      if (this.app.chats.chats.get(chat.id) !== chat) throw new HttpError(404, 'not_found', 'Chat not found (it was deleted)');
+      if (!chat.messages[anchorId]) throw new HttpError(409, 'message_deleted', 'The message to answer no longer exists');
+      const s = t.s;
+      const modelInfo = { providerId: t.provider.id, model: t.model };
+      const newAssistant = (parentId) => {
+        const m = { id: newId('msg'), parentId, role: 'assistant', content: '', reasoning: '', status: 'streaming', model: modelInfo, createdAt: nowIso() };
+        addMessage(chat, m);
+        setActiveLeaf(chat, m.id);
+        created.push(m.id);
+        return m;
+      };
+      asst = newAssistant(anchorId);
+      started = true;
+      rec.assistantMessageId = asst.id;
+      this.app.chats.touch(chat);
+      this.app.bus.publish('generation.started', { chatId: chat.id, generationId, assistantMessageId: asst.id });
+      emit('start', { generationId, chatId: chat.id, userMessage: userMessage ? publicMessage(userMessage) : null, assistantMessage: publicMessage(asst), model: { ...modelInfo, displayName: t.info.displayName, capabilities: t.info.capabilities }, contextPlan: t.plan });
+      // RAM lease: on low-RAM machines a chat turn never runs next to an image job (waits, visibly, abortable).
+      lease = await this.app.ram.acquire('llm', {
+        owner: rec.generationId,
+        signal: sig,
+        onWait: (w) => emit('model_status', { phase: 'waiting', reason: w.reason, message: w.message }),
+      });
+      if (lease.waited) emit('model_status', { phase: 'ready', reason: 'ram_available' });
+      rec.lease = lease;
       const anchor = chat.messages[anchorId];
       const path0 = pathTo(chat, anchorId);
       // Query for retrieval: the user message, plus the previous assistant reply when the message is short ("yes, do that").
@@ -416,7 +452,7 @@ export class ChatEngine {
             if (!def) result = { content: `Error: unknown tool "${call.name}". Available tools: ${toolDefs.map((d) => d.name).join(', ') || 'none'}.`, isError: true };
             else {
               try {
-                result = await def.run(call.arguments || {}, { app: this.app, chat, settings: s, emit, signal: sig, messageId: asst.id, toolMessageId: tm.id, toolCallId: call.id });
+                result = await def.run(call.arguments || {}, { app: this.app, chat, settings: s, emit, signal: sig, messageId: asst.id, toolMessageId: tm.id, toolCallId: call.id, tainted: turnTainted(asm), leaseOwner: rec.generationId, allowedUrls: userUrls(chat, anchorId) });
               } catch (e) {
                 if (sig.aborted || isAbortError(e)) throw e;
                 result = { content: `Error: ${e.message}`, isError: true };
@@ -446,48 +482,47 @@ export class ChatEngine {
       }
       asst.status = 'complete';
     } catch (e) {
+      if (!started) {
+        finishUp();
+        throw e;
+      }
       if (sig.aborted || isAbortError(e)) {
         finalReason = 'aborted';
-        if (asst) { asst.status = 'aborted'; }
+        if (asst) asst.status = 'aborted';
       } else {
         log.warn(`Generation failed for ${chat.id}: ${e.message}`);
         if (asst) { asst.status = 'error'; asst.error = e.message; asst.errorCode = e.code || 'internal_error'; }
         // Close any tool messages left running.
         for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'error'; m.content ||= `Error: ${e.message}`; m.isError = true; } }
-        this.finish(chat, generationId, signal, onAbort);
+        finishUp();
         emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId });
         return asst;
       }
+    } finally {
+      // Every exit path releases the chat, the RAM lease and the foreground count (idempotent).
+      finishUp();
     }
-    for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'aborted'; m.content ||= 'Aborted'; } }
-    const durationMs = Date.now() - t0;
-    asst.updatedAt = nowIso();
-    asst.usage = lastUsage;
-    asst.stats = {
-      durationMs,
-      iterations: totals.iterations,
-      toolCalls: totals.toolCalls,
-      promptTokens: totals.promptTokens,
-      completionTokens: totals.completionTokens,
-      tokensPerSecond: totals.evalMs ? Math.round((totals.completionTokens / totals.evalMs) * 10000) / 10 : null,
-      loadMs: totals.loadMs,
-    };
-    if (finalReason !== 'stop') asst.finishReason = finalReason;
-    if (lastUsage?.promptTokens && asst.context) asst.context.actual = { promptTokens: lastUsage.promptTokens, completionTokens: lastUsage.completionTokens, used: lastUsage.promptTokens + (lastUsage.completionTokens || 0) };
-    this.finish(chat, generationId, signal, onAbort);
+    {
+      for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'aborted'; m.content ||= 'Aborted'; } }
+      const durationMs = Date.now() - t0;
+      asst.updatedAt = nowIso();
+      asst.usage = lastUsage;
+      asst.stats = {
+        durationMs,
+        iterations: totals.iterations,
+        toolCalls: totals.toolCalls,
+        promptTokens: totals.promptTokens,
+        completionTokens: totals.completionTokens,
+        tokensPerSecond: totals.evalMs ? Math.round((totals.completionTokens / totals.evalMs) * 10000) / 10 : null,
+        loadMs: totals.loadMs,
+      };
+      if (finalReason !== 'stop') asst.finishReason = finalReason;
+      if (lastUsage?.promptTokens && asst.context) asst.context.actual = { promptTokens: lastUsage.promptTokens, completionTokens: lastUsage.completionTokens, used: lastUsage.promptTokens + (lastUsage.completionTokens || 0) };
+      this.app.chats.markDirty(chat);
+    }
     emit('done', { generationId, reason: finalReason, message: publicMessage(asst), createdMessageIds: created, chat: chatSummary(chat), context: asst.context || null, stats: asst.stats });
     if (finalReason !== 'aborted') this.afterTurn(chat);
     return asst;
-  }
-
-  finish(chat, generationId, signal, onAbort) {
-    this.active.delete(chat.id);
-    this.app.foreground--;
-    signal?.removeEventListener('abort', onAbort);
-    this.app.chats.touch(chat);
-    this.app.chats.saveNow(chat).catch(() => {});
-    this.app.bus.publish('generation.finished', { chatId: chat.id, generationId });
-    this.app.background.kick();
   }
 
   /** One model call with streaming; retries once without tools / think when the backend rejects them. */
@@ -545,17 +580,17 @@ export class ChatEngine {
     const s = this.effectiveSettings(chat);
     const bg = this.app.background;
     if (s.titles?.auto !== false && chat.titleSource !== 'user' && chat.titleSource !== 'auto') {
-      bg.schedule(`title:${chat.id}`, () => generateTitle(this.app, chat).catch((e) => { log.debug('title failed', e.message); }), { priority: 1, label: 'title' });
+      bg.schedule(`title:${chat.id}`, ({ signal } = {}) => generateTitle(this.app, chat, { signal }).catch((e) => { if (signal?.aborted) throw e; log.debug('title failed', e.message); }), { priority: 1, label: 'title' });
     }
     if (!chat.incognito && s.memory?.enabled !== false && s.memory?.autoExtract !== false) {
-      bg.schedule(`memory:${chat.id}`, () => this.app.chats.has(chat.id) && extractMemories(this.app, chat), { delayMs: s.memory?.extractDelayMs ?? 4000, priority: 5, label: 'memory_extraction' });
+      bg.schedule(`memory:${chat.id}`, ({ signal } = {}) => this.app.chats.has(chat.id) && extractMemories(this.app, chat, { signal }), { delayMs: s.memory?.extractDelayMs ?? 4000, priority: 5, label: 'memory_extraction' });
     }
     if (!chat.incognito && s.recall?.enabled !== false) {
       const embeds = ramTier(this.app.system.totalMem) !== 'low' || this.app.settings.get().embeddings?.model !== 'auto';
-      bg.schedule(`recall:${chat.id}`, async () => {
+      bg.schedule(`recall:${chat.id}`, async ({ signal } = {}) => {
         if (!this.app.chats.has(chat.id)) return;
         const n = this.app.recall.indexChat(chat);
-        if (n) await this.app.recall.index.ensureEmbeddings();
+        if (n) await this.app.recall.index.ensureEmbeddings({ signal });
       }, { delayMs: 1500, priority: 8, needsModel: embeds, label: 'recall_index' });
     }
   }
@@ -589,4 +624,22 @@ function statsPayload(messageId, iteration, u, numCtx) {
 function emptyUsage(t, tools) {
   const tok = t.counter.tools(tools);
   return { numCtx: t.budgets.numCtx, budget: t.budgets.input, replyReserve: t.budgets.replyReserve, compactAt: t.budgets.compactAt, used: tok, percent: 0, breakdown: { system: 0, tools: tok, memories: 0, summary: 0, documents: 0, recall: 0, history: 0 }, estimated: true, calibration: t.counter.factor };
+}
+
+/** True when the request contains text we did not write (files, documents, web pages, past-chat snippets). */
+export function turnTainted(asm) {
+  return !!asm?.untrusted;
+}
+
+/** URLs that literally appear in the user's own messages on this branch (what fetch_url may open). */
+export function userUrls(chat, anchorId) {
+  const set = new Set();
+  for (const m of pathTo(chat, anchorId)) {
+    if (m.role !== 'user' || typeof m.content !== 'string') continue;
+    for (const raw of m.content.match(URL_RE) || []) {
+      const n = normalizeUrl(raw.replace(/[.,;:!?]+$/, ''));
+      if (n) set.add(n);
+    }
+  }
+  return set;
 }

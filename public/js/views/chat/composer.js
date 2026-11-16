@@ -1,6 +1,6 @@
 // The composer: multiline input, attachments (picker / drop / paste), model + preset pickers, quick
 // toggles, slash commands, per-chat drafts, send/stop, and the always-visible context meter.
-import { h, autosize, pickFiles, debounce } from '../../lib/dom.js';
+import { h, autosize, pickFiles, debounce, mount, add } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
 import { fmtBytes, fmtTokens, modelLabel, isMac } from '../../lib/format.js';
 import { store, chatModels, findModel, sameRef, modelInfo, uiPrefs } from '../../state.js';
@@ -129,10 +129,10 @@ export class Composer {
 
     const modelBtn = h('button.picker', { type: 'button', title: 'Model for this chat', 'aria-haspopup': 'dialog', on: { click: (e) => this.openModelPicker(e.currentTarget) } },
       icon('cube', { size: 14 }), h('span.picker-label', noModel ? 'No model' : modelLabel(info?.name || ref.model)), icon('chevronDown', { size: 11 }));
-    const presetBtn = h('button.picker.hide-narrow', { type: 'button', title: 'Preset / persona', 'aria-haspopup': 'menu', on: { click: (e) => this.openPresetMenu(e.currentTarget) } },
+    const presetBtn = h('button.picker.preset-picker', { type: 'button', title: 'Preset / persona', 'aria-haspopup': 'menu', on: { click: (e) => this.openPresetMenu(e.currentTarget) } },
       icon('book', { size: 14 }), h('span.picker-label', preset?.name || 'Assistant'), icon('chevronDown', { size: 11 }));
     const toggle = (label, iconName, on, title, run, extra = {}) => h('button.toggle', { type: 'button', 'aria-pressed': String(!!on), title, on: { click: run }, ...extra }, icon(iconName, { size: 14 }), h('span.toggle-label', label));
-    this.pickers.replaceChildren(
+    mount(this.pickers, 
       h('button.icon-btn.attach-btn', { type: 'button', title: 'Attach files (images, PDFs, text, code)', 'aria-label': 'Attach files', on: { click: () => this.pick() } }, icon('paperclip')),
       modelBtn,
       presetBtn,
@@ -140,7 +140,7 @@ export class Composer {
       toggle('Tools', 'tools', toolsOn, toolsOn ? 'Tools on: calculator, time, memory, images… (click to turn off for this chat)' : 'Tools off for this chat', () => this.patchChat({ settings: { tools: { enabled: !toolsOn } } })),
       caps.includes('thinking') ? toggle('Think', 'think', thinkOn, thinkOn ? 'Thinking on: the model reasons before answering (slower, often better)' : 'Thinking off: faster answers', () => this.patchChat({ settings: { reasoning: { think: thinkOn ? 'off' : 'on' } } })) : null,
       toggle('Memory', 'memory', memOn, incog ? 'Memory is off in incognito chats' : memOn ? 'Memory on: relevant memories are added and new facts may be saved' : 'Memory off for this chat', () => this.patchChat({ settings: { memory: { enabled: !memOn } } }), { disabled: incog }),
-      toggle('Incognito', 'incognito', incog, incog ? 'Incognito: nothing from this chat is remembered or recalled' : 'Make this chat incognito (no memory, not recalled later)', () => this.patchChat({ incognito: !incog }), { class: 'toggle-incognito' }),
+      !this.host.getModel() || incog ? toggle('Incognito', 'incognito', incog, incog ? 'Incognito: nothing from this chat is remembered or recalled' : 'Make this chat incognito (no memory, not recalled later)', () => this.patchChat({ incognito: !incog }), { class: 'toggle-incognito' }) : null,
     );
     this.box.classList.toggle('incognito', incog);
     this.renderSend();
@@ -150,7 +150,7 @@ export class Composer {
 
   renderMeter() {
     const m = this.host.getModel();
-    this.meter.replaceChildren(miniMeter(m ? m.context : null, m ? m.plan : this.newChatPlan, () => runAction('show-context')));
+    mount(this.meter, miniMeter(m ? m.context : null, m ? m.plan : this.newChatPlan, () => runAction('show-context')));
     if (!m && !this.newChatPlan && this.effectiveModel()) {
       const ref = this.effectiveModel();
       const key = `${ref.providerId}|${ref.model}`;
@@ -164,7 +164,7 @@ export class Composer {
   renderHint() {
     const sendKey = uiPrefs().sendKey === 'mod-enter' ? `${keyLabel('Mod+Enter')} to send · ${keyLabel('Enter')} new line` : `${keyLabel('Enter')} to send · ${keyLabel('Shift+Enter')} new line`;
     const incog = this.incognito();
-    this.hint.replaceChildren(
+    mount(this.hint, 
       incog ? h('span.hint-incog', icon('incognito', { size: 12 }), 'Incognito — not remembered, not searchable by recall') : null,
       h('span.hint-keys', `${sendKey} · / for commands`),
     );
@@ -177,7 +177,7 @@ export class Composer {
     const hasContent = !!this.input.value.trim() || this.readyAttachments().length > 0;
     const uploading = this.attachments.some((a) => a.status === 'uploading');
     const noModel = !this.effectiveModel();
-    this.sendBtn.replaceChildren(icon(busy ? 'stop' : 'send', { size: busy ? 12 : 15 }));
+    mount(this.sendBtn, icon(busy ? 'stop' : 'send', { size: busy ? 12 : 15 }));
     this.sendBtn.classList.toggle('stop', busy);
     this.sendBtn.setAttribute('aria-label', busy ? 'Stop generating' : 'Send');
     this.sendBtn.title = busy ? `Stop (${keyLabel('Escape')})` : noModel ? 'Install a model first' : uploading ? 'Waiting for uploads…' : 'Send';
@@ -197,7 +197,7 @@ export class Composer {
       const items = list.filter((m) => !q || m.model.toLowerCase().includes(q) || (m.providerName || '').toLowerCase().includes(q));
       const groups = new Map();
       for (const m of items) { if (!groups.has(m.providerName)) groups.set(m.providerName, []); groups.get(m.providerName).push(m); }
-      ul.replaceChildren(...[...groups].flatMap(([prov, ms]) => [
+      mount(ul, ...[...groups].flatMap(([prov, ms]) => [
         h('div.menu-heading', prov),
         ...ms.map((m) => {
           const sel = sameRef(current, m) || (current && !current.providerId && current.model === m.model);
@@ -209,7 +209,7 @@ export class Composer {
             m.loaded ? h('span.dot.ok', { title: 'Loaded in memory' }) : null);
         }),
       ]));
-      if (!items.length) ul.append(h('div.empty.small', list.length ? 'No match' : 'No chat models installed'));
+      if (!items.length) add(ul, h('div.empty.small', list.length ? 'No match' : 'No chat models installed'));
     };
     filter.addEventListener('input', render);
     filter.addEventListener('keydown', (e) => {
@@ -286,7 +286,7 @@ export class Composer {
   renderAttachments() {
     this.attachRow.hidden = !this.attachments.length;
     const visionOk = (findModel(this.effectiveModel())?.capabilities || []).includes('vision');
-    this.attachRow.replaceChildren(...this.attachments.map((a) => {
+    mount(this.attachRow, ...this.attachments.map((a) => {
       const att = a.attachment;
       const isImg = (att?.kind || (a.preview ? 'image' : '')) === 'image';
       const meta = a.status === 'uploading' ? 'Uploading…' : a.status === 'error' ? (a.error || 'Unusable') : isImg ? `${att.width}×${att.height}${visionOk ? '' : ' · model can’t see images'}` : att?.source === 'pdf' ? `PDF · ${att.pages} pages · ~${fmtTokens(att.tokens)} tokens` : `~${fmtTokens(att?.tokens)} tokens${att?.chunks > 1 ? ' · searched by excerpt' : ''}`;
@@ -355,7 +355,7 @@ export class Composer {
   renderSlash(opts) {
     this.slashEl.hidden = false;
     this.input.setAttribute('aria-expanded', 'true');
-    this.slashEl.replaceChildren(...opts.map((c, i) => h('button.slash-item', {
+    mount(this.slashEl, ...opts.map((c, i) => h('button.slash-item', {
       type: 'button', role: 'option', id: `slash-${i}`, 'aria-selected': String(i === this.slashIndex),
       on: { mousedown: (e) => { e.preventDefault(); this.completeSlash(c); } },
     }, h('span.slash-cmd', c.cmd), c.args ? h('span.slash-args', c.args) : null, h('span.slash-desc', c.desc))));

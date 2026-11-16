@@ -1,14 +1,17 @@
 // Image generation jobs: parameter resolution, RAM coordination with the chat model (unload before
 // generating, lazy/eager reload), progress events, abort, gallery storage.
 import { newId } from '../lib/ids.mjs';
-import { nowIso, withTimeout, formatBytes } from '../lib/util.mjs';
-import { HttpError, isAbortError } from '../lib/errors.mjs';
+import { nowIso, withTimeout, formatBytes, sleep } from '../lib/util.mjs';
+import { HttpError, ProviderError, isAbortError } from '../lib/errors.mjs';
 import { ramTier } from '../context/sizing.mjs';
 import { resolveImageParams, imageFamilyFor } from './defaults.mjs';
 import { publicImage } from './gallery.mjs';
 import { log } from '../lib/log.mjs';
 
 export class ImageService {
+  /** Bounded wait for Ollama to free memory after an unload request. */
+  static unloadWaitMs = 20000;
+
   constructor(app) {
     this.app = app;
     this.jobs = new Map();
@@ -60,7 +63,7 @@ export class ImageService {
    * Run one generation. `emit(type, data)` receives image_* events. Jobs run one at a time.
    * @returns {Promise<{ job, images }>}
    */
-  async generate(req, { signal, emit = () => {}, chatId = null, messageId = null, source = 'user', toolCallId = null } = {}) {
+  async generate(req, { signal, emit = () => {}, chatId = null, messageId = null, source = 'user', toolCallId = null, leaseOwner = null } = {}) {
     if (!req?.prompt || !String(req.prompt).trim()) throw new HttpError(400, 'bad_request', 'prompt is required');
     if (this.settings.image?.enabled === false) throw new HttpError(409, 'image_disabled', 'Image generation is disabled in settings');
     const provider = await this.app.imageProviders.resolve(req.providerId);
@@ -76,9 +79,24 @@ export class ImageService {
     };
     const run = async () => {
       this.active++;
+      this.app.background?.preempt();
+      let lease = null;
       try {
+        // RAM lease: on low-RAM machines wait (visibly, abortably) until no chat turn / background model work runs.
+        lease = await this.app.ram.acquire('image', {
+          owner: leaseOwner,
+          signal: controller.signal,
+          onWait: (w) => { job.status = 'queued'; publish('image_status', { jobId: job.id, phase: 'queued', reason: w.reason, message: w.message }); },
+        }).catch((e) => {
+          job.status = 'aborted';
+          job.error = 'Aborted';
+          job.finishedAt = nowIso();
+          publish('image_error', { jobId: job.id, code: 'aborted', message: 'Aborted', job: publicJob(job) });
+          throw Object.assign(new Error('Image generation aborted'), { name: 'AbortError', cause: e });
+        });
         return await this._run(job, provider, req, controller.signal, publish);
       } finally {
+        lease?.release();
         this.active--;
         signal?.removeEventListener('abort', onAbort);
         this.app.background?.kick();
@@ -131,7 +149,10 @@ export class ImageService {
           try { await ollama.unload(m.model); job.memory.unloaded.push(m.model); } catch (e) { log.warn('unload failed', m.model, e.message); }
         }
         if (job.memory.unloaded.length) this.app.modelState.markUnloaded(job.memory.unloaded);
-        status('unloaded', { models: job.memory.unloaded });
+        // keep_alive: 0 returns before Ollama has actually freed the memory: wait until /api/ps no longer lists them.
+        const freed = await this._waitUnloaded(ollama, job.memory.unloaded, signal);
+        job.memory.confirmed = freed;
+        status('unloaded', { models: job.memory.unloaded, confirmed: freed, ...(freed ? {} : { message: 'Ollama did not report the models as unloaded in time; generating anyway.' }) });
       }
 
       // --- generate --------------------------------------------------------------------------
@@ -171,8 +192,10 @@ export class ImageService {
       return { job: publicJob(job), images: saved };
     } catch (e) {
       const aborted = signal.aborted || isAbortError(e);
+      const timedOut = !aborted && (e.code === 'timeout' || e.name === 'TimeoutError');
       job.status = aborted ? 'aborted' : 'error';
-      job.error = aborted ? 'Aborted' : e.message;
+      job.error = aborted ? 'Aborted' : timedOut ? `Timed out after ${s.image.timeoutSec || 600} s waiting for ${provider.name} to finish the image (image.timeoutSec)` : e.message;
+      if (timedOut) e = Object.assign(new ProviderError(job.error, { status: 504, code: 'timeout', providerId: provider.id }), { cause: e });
       job.finishedAt = nowIso();
       publish('image_error', { jobId: job.id, code: aborted ? 'aborted' : e.code || 'image_error', message: job.error, job: publicJob(job) });
       if (aborted) {
@@ -181,6 +204,18 @@ export class ImageService {
         throw err;
       }
       throw e;
+    }
+  }
+
+  /** Poll /api/ps until none of `models` is resident (bounded). */
+  async _waitUnloaded(ollama, models, signal, { timeoutMs = ImageService.unloadWaitMs, intervalMs = 200 } = {}) {
+    if (!models.length) return true;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const ps = await ollama.ps().catch(() => null);
+      if (ps && !ps.some((m) => models.includes(m.model) || models.includes(m.name))) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(intervalMs, signal);
     }
   }
 

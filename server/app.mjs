@@ -22,6 +22,7 @@ import { BackgroundQueue, ModelState } from './chat/background.mjs';
 import { ImageProviderRegistry } from './image/registry.mjs';
 import { ImageService } from './image/service.mjs';
 import { Gallery } from './image/gallery.mjs';
+import { RamLease } from './image/ram-lease.mjs';
 import { log } from './lib/log.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -91,6 +92,7 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.llm = new LLM(app);
   app.images = new ImageService(app);
   app.background = new BackgroundQueue(app);
+  app.ram = new RamLease(app);
 
   app.close = async () => {
     app.background.stop();

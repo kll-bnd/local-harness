@@ -75,18 +75,39 @@ export class BackgroundQueue {
     if (this.blockedReason(task)) return this.kick();
     this.tasks.delete(task.key);
     this.running = task;
+    task.controller = new AbortController();
+    task.preempted = false;
     const t0 = Date.now();
+    let lease = null;
     try {
-      await task.fn();
+      if (task.needsModel && this.app.ram) lease = await this.app.ram.acquire('llm', { signal: task.controller.signal });
+      await task.fn({ signal: task.controller.signal });
       this.history.push({ key: task.key, ok: true, ms: Date.now() - t0, at: new Date().toISOString() });
     } catch (e) {
-      log.warn(`Background task ${task.key} failed: ${e.message}`);
-      this.history.push({ key: task.key, ok: false, error: e.message, ms: Date.now() - t0, at: new Date().toISOString() });
+      if (task.preempted) {
+        // The user started something: give the backend back immediately and try again later.
+        this.history.push({ key: task.key, ok: false, preempted: true, ms: Date.now() - t0, at: new Date().toISOString() });
+        task.preemptions = (task.preemptions || 0) + 1;
+        if (!this.tasks.has(task.key) && task.preemptions <= 20) this.tasks.set(task.key, { ...task, controller: null, runAt: Date.now() + 1000 });
+      } else {
+        log.warn(`Background task ${task.key} failed: ${e.message}`);
+        this.history.push({ key: task.key, ok: false, error: e.message, ms: Date.now() - t0, at: new Date().toISOString() });
+      }
     } finally {
+      lease?.release();
       if (this.history.length > 50) this.history.splice(0, this.history.length - 50);
       this.running = null;
       this.kick();
     }
+  }
+
+  /** Abort the running task if it uses a model (a foreground turn / image job needs the backend now). */
+  preempt() {
+    const t = this.running;
+    if (!t || !t.needsModel || !t.controller || t.controller.signal.aborted) return false;
+    t.preempted = true;
+    t.controller.abort(Object.assign(new Error('Pre-empted by a foreground request'), { name: 'AbortError' }));
+    return true;
   }
 
   _resolveIdle() {
@@ -104,6 +125,7 @@ export class BackgroundQueue {
 
   stop() {
     this.stopped = true;
+    this.running?.controller?.abort();
     if (this.timer) clearTimeout(this.timer);
     this.tasks.clear();
     this._resolveIdle();

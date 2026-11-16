@@ -1,6 +1,6 @@
 // ⌘K command palette: actions, chats, models and settings pages in one fuzzy-searchable list.
 // Accessible as a combobox + listbox (aria-activedescendant), fully keyboard driven.
-import { h } from '../lib/dom.js';
+import { h, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { modelLabel, fmtWhen } from '../lib/format.js';
 import { allActions, runAction, keyLabel } from '../actions.js';
@@ -70,7 +70,7 @@ export function openPalette(shell) {
         h('span.pi-icon', icon(it.icon, { size: 15 })), h('span.pi-label', it.label), q ? h('span.pi-group', it.group) : null, it.hint ? h('span.pi-hint', it.hint) : null, it.kbd ? h('kbd', it.kbd) : null));
     });
     if (!items.length) frag.push(h('div.palette-empty', 'No matches'));
-    list.replaceChildren(...frag);
+    mount(list, ...frag);
     mark();
   };
   const mark = () => {
@@ -91,7 +91,7 @@ export function openPalette(shell) {
   });
   dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });
   dlg.addEventListener('mousedown', (e) => { if (e.target === dlg) close(); });
-  document.body.append(dlg);
+  add(document.body, dlg);
   dlg.showModal();
   open = { input, close };
   render();

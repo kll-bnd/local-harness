@@ -5,6 +5,7 @@ import { fetchUrl } from './fetch-url.mjs';
 import { ASPECTS } from '../image/defaults.mjs';
 import { imageRef } from '../image/gallery.mjs';
 import { isAbortError } from '../lib/errors.mjs';
+import { normalizeUrl } from '../lib/url.mjs';
 
 const memoryOn = (ctx) => ctx.settings.memory?.enabled !== false && !ctx.chat?.incognito;
 
@@ -24,9 +25,13 @@ export const BUILTIN_TOOLS = [
     available: memoryOn,
     async run(args, ctx) {
       if (!args.content) return { content: 'Error: content is required', isError: true };
-      const r = await ctx.app.memories.add({ content: args.content, category: args.category || 'other', origin: 'tool', source: { chatId: ctx.chat.id, messageId: ctx.messageId } });
+      // In a turn where untrusted text (web pages, documents, past snippets, tool output) is in the context, a
+      // memory may have been planted by that text: it is saved as "needs review" and not used until confirmed.
+      const r = await ctx.app.memories.add({ content: String(args.content), category: args.category || 'other', origin: 'tool', source: { chatId: ctx.chat.id, messageId: ctx.messageId }, needsReview: !!ctx.tainted });
+      if (r.action === 'rejected') return { content: 'Not saved: that looks like a password, key or other secret, and secrets are never stored in memory.', data: { action: 'rejected', reason: r.reason } };
       ctx.emit('memory', { action: r.action, memory: r.memory, origin: 'tool' });
-      return { content: r.action === 'added' ? `Saved to memory: "${r.memory.content}"` : r.action === 'updated' ? `Updated an existing memory: "${r.memory.content}"` : 'That is already in memory.', data: { action: r.action, memoryId: r.memory.id } };
+      const review = r.memory.needsReview ? ' It will be used once the user confirms it (it was saved while untrusted content was in the conversation).' : '';
+      return { content: r.action === 'added' ? `Saved to memory: "${r.memory.content}".${review}` : r.action === 'updated' ? `Updated an existing memory: "${r.memory.content}"` : 'That is already in memory.', data: { action: r.action, memoryId: r.memory.id, needsReview: !!r.memory.needsReview } };
     },
   },
   {
@@ -102,8 +107,16 @@ export const BUILTIN_TOOLS = [
     available: () => true,
     async run(args, ctx) {
       const cfg = ctx.settings.tools?.fetchUrl || {};
+      const raw = String(args.url || '');
+      // Enforced in code, not in the prompt: only links the user wrote in this chat can be opened, so text
+      // injected by a document / web page / tool result cannot make the model exfiltrate data via a URL.
+      if (raw.length > 2048) return { content: 'Error: URL is too long (max 2048 characters).', isError: true };
+      const norm = normalizeUrl(raw);
+      if (!norm) return { content: `Error: not a valid http(s) URL: ${raw.slice(0, 200)}`, isError: true };
+      if (new URL(norm).search.length > 1024) return { content: 'Error: URL query string is too long.', isError: true };
+      if (!ctx.allowedUrls?.has(norm)) return { content: 'Error: fetch_url can only open links that the user wrote in this conversation. Ask the user to paste the link if they want you to read it.', isError: true, data: { blocked: 'not_user_supplied' } };
       try {
-        const r = await fetchUrl(String(args.url || ''), { allowPrivateNetwork: !!cfg.allowPrivateNetwork, maxChars: cfg.maxChars || 20000, signal: ctx.signal });
+        const r = await fetchUrl(norm, { allowPrivateNetwork: !!cfg.allowPrivateNetwork, maxChars: cfg.maxChars || 20000, signal: ctx.signal });
         return { content: `${r.title ? `# ${r.title}\n` : ''}URL: ${r.url} (HTTP ${r.status})\n\n${r.text}`, data: { url: r.url, status: r.status, title: r.title, truncated: r.truncated } };
       } catch (e) {
         if (isAbortError(e) && ctx.signal?.aborted) throw e;
@@ -143,6 +156,7 @@ export const BUILTIN_TOOLS = [
           messageId: ctx.toolMessageId,
           source: 'tool',
           toolCallId: ctx.toolCallId,
+          leaseOwner: ctx.leaseOwner || null,
         });
         const p = job.params;
         const refs = images.map(imageRef);

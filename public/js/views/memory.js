@@ -1,6 +1,6 @@
 // Memory: browse / search / filter, add, edit inline, pin, delete (with undo), review unverified memories,
 // the global switches, and a "what would be recalled?" tester.
-import { h, debounce } from '../lib/dom.js';
+import { h, debounce, mount } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtRelative, plural, fmtFull, truncate } from '../lib/format.js';
 import { store, bus, patchSettings } from '../state.js';
@@ -38,7 +38,7 @@ export class MemoryView {
 
   show() { this.load(); }
 
-  toolbar() { return { title: h('div.tb-title', h('span.title-text', 'Memory')), actions: [] }; }
+  toolbar() { return { title: h('div.tb-title.page-title', h('span.title-text', 'Memory')), actions: [] }; }
 
   async load() {
     try {
@@ -69,7 +69,7 @@ export class MemoryView {
     const focused = document.activeElement === this.searchEl;
     this.searchEl = search;
 
-    this.page.replaceChildren(
+    mount(this.page, 
       h('div.page-head', h('h1.h1', 'Memory'), h('span.muted', plural(this.total, 'memory', 'memories')), h('button.btn.btn-primary.btn-small', { type: 'button', on: { click: () => { this.adding = true; this.render(); } } }, icon('plus', { size: 13 }), 'Add memory')),
       h('p.lede', 'Harness remembers durable facts and preferences across chats. Pinned memories go into every chat; others are added when they are relevant. Incognito chats never read or write memory.'),
       h('section.panel-section.memory-switches',
@@ -168,12 +168,12 @@ export class MemoryView {
     const out = h('div.stack');
     const run = debounce(async () => {
       const q = input.value.trim();
-      if (!q) { out.replaceChildren(); return; }
+      if (!q) { mount(out); return; }
       try {
         const r = await api.memories.search(q, { k: 8 });
-        out.replaceChildren(h('div.faint.small', `${r.retrieval === 'hybrid' ? 'Semantic + keyword' : 'Keyword'} search${r.embeddingModel ? ` (${r.embeddingModel})` : ''}`),
+        mount(out, h('div.faint.small', `${r.retrieval === 'hybrid' ? 'Semantic + keyword' : 'Keyword'} search${r.embeddingModel ? ` (${r.embeddingModel})` : ''}`),
           ...(r.results.length ? r.results.map((x) => h('div.row.mem-test-row', h('span.badge.num', x.score.toFixed(2)), h('span.grow', truncate(x.memory.content, 160)))) : [h('div.muted.small', 'Nothing would be recalled.')]));
-      } catch (e) { out.replaceChildren(h('div.field-error', e.message)); }
+      } catch (e) { mount(out, h('div.field-error', e.message)); }
     }, 300);
     input.addEventListener('input', run);
     return h('section.panel-section', h('h2.h2', 'What would be recalled?'), input, out,

@@ -1,6 +1,6 @@
 // Sidebar: new chat, search (instant title filter + full-text message search), navigation, the chat list
 // grouped by recency (pinned first), per-chat actions, archive, and a live "machine" status block.
-import { h, debounce, delegate } from '../lib/dom.js';
+import { h, debounce, delegate, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { recencyGroup, modelLabel, fmtBytes, fmtWhen, fmtTokens } from '../lib/format.js';
 import { store, loadArchived, ollamaStatus } from '../state.js';
@@ -78,7 +78,7 @@ export class Sidebar {
     const item = (view, ic, label, path, count) => h('a.side-nav-item', { href: `#${path}`, attrs: { 'aria-current': r.view === view ? 'page' : null } }, icon(ic), h('span', label), count != null ? h('span.count', count) : null);
     const jobs = Object.values(store.get('imageJobs') || {}).filter((j) => !['done', 'error', 'aborted'].includes(j.status));
     const pulls = Object.values(store.get('pulls') || {}).filter((p) => !p.done);
-    this.navEl.replaceChildren(
+    mount(this.navEl, 
       item('images', 'image', 'Image studio', '/images', jobs.length ? `${jobs.length} running` : null),
       item('models', 'cube', 'Models', '/models', pulls.length ? `${Math.round(pulls[0].percent || 0)}%` : null),
       item('memory', 'memory', 'Memory', '/memory', store.get('memoryCount') ?? null),
@@ -104,7 +104,7 @@ export class Sidebar {
       lines.push(h('span.m-line', h(`span.dot${img ? '.ok' : ''}`), h('span.m-label', img ? h('span', h('b', img.name.replace(/\s*\(.*\)$/, '')), ' ready') : 'No image backend')));
       if (ram) lines.push(h('span.m-line', icon('chip', { size: 12 }), h('span.m-label.faint', `${Math.round(ram / 1024 ** 3)} GB RAM${sys.machine.appleSilicon ? ` · ${sys.machine.chip}` : ''}`)));
     }
-    this.footEl.replaceChildren(
+    mount(this.footEl, 
       h('button.machine', { type: 'button', title: 'Setup & health', attrs: { 'aria-current': r.view === 'setup' ? 'page' : null }, on: { click: () => navigate('/setup') } }, lines),
       h('div.row.side-foot-row',
         h('button.btn.btn-ghost.btn-small', { type: 'button', 'aria-pressed': String(this.showArchived), on: { click: () => this.toggleArchived() } }, icon('archive', { size: 14 }), this.showArchived ? 'Hide archived' : 'Archived'),
@@ -148,7 +148,7 @@ export class Sidebar {
     } else if (q && !filtered.length) {
       frag.push(h('div.side-empty.faint', 'No chat titles match.'));
     }
-    this.listEl.replaceChildren(...frag);
+    mount(this.listEl, ...frag);
     if (this.renaming) this.mountRename();
   }
 
@@ -234,7 +234,7 @@ export class Sidebar {
       out.push(snippet.slice(at));
       return out;
     };
-    this.resultsEl.replaceChildren(
+    mount(this.resultsEl, 
       h('div.chat-group-title', res.length ? `Messages · ${res.length}` : 'Messages'),
       ...(res.length ? res.map((x) => h('a.search-hit', {
         href: `#/chat/${x.chatId}?m=${x.messageId}`,

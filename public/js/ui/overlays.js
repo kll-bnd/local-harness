@@ -1,7 +1,7 @@
 // Overlay primitives: toasts, modal dialogs (native <dialog>), menus and popovers.
 // All are keyboard-accessible: dialogs trap focus natively and restore it, menus support arrow keys,
 // Home/End, type-ahead and Escape, popovers close on Escape / outside click and restore focus.
-import { h, focusables, nextId } from '../lib/dom.js';
+import { h, focusables, nextId, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 
 // ------------------------------------------------------------------------------------------------ toasts
@@ -11,7 +11,7 @@ const toastsById = new Map();
 function host() {
   if (!toastHost) {
     toastHost = h('div.toasts', { role: 'region', 'aria-label': 'Notifications' });
-    document.body.append(toastHost);
+    add(document.body, toastHost);
   }
   return toastHost;
 }
@@ -43,7 +43,7 @@ export function toast(opts) {
   el.addEventListener('mouseenter', () => clearTimeout(timer));
   el.addEventListener('mouseleave', arm);
   el.addEventListener('focusin', () => clearTimeout(timer));
-  host().append(el);
+  add(host(), el);
   arm();
   const handle = { dismiss, el };
   if (id) toastsById.set(id, handle);
@@ -72,7 +72,7 @@ export function openDialog({ title, description = null, body = null, actions = [
     type: 'button', disabled: !!a.disabled, dataset: { autofocus: a.autofocus ? '1' : null },
     on: { click: async (e) => { const r = await a.run?.(close, e); if (r !== false) close(a.result ?? a.label); } },
   }, a.label))) : null;
-  dlg.append(
+  add(dlg, 
     h('header.dialog-head',
       h('h2.dialog-title', { id: titleId }, title),
       dismissible ? h('button.icon-btn.dialog-x', { type: 'button', 'aria-label': 'Close', on: { click: () => close(null) } }, icon('x')) : null),
@@ -82,7 +82,7 @@ export function openDialog({ title, description = null, body = null, actions = [
   );
   dlg.addEventListener('cancel', (e) => { e.preventDefault(); if (dismissible) close(null); });
   dlg.addEventListener('mousedown', (e) => { if (e.target === dlg && dismissible) close(null); });
-  document.body.append(dlg);
+  add(document.body, dlg);
   dlg.showModal();
   const auto = dlg.querySelector('[data-autofocus="1"]') || dlg.querySelector('[autofocus]') || focusables(dlg.querySelector('.dialog-body') || dlg)[0];
   auto?.focus();
@@ -187,7 +187,7 @@ function trackOutside(el, anchor, close) {
  */
 export function openPopover(anchor, content, { placement = 'bottom-start', className = '', onClose = null, label = null, focus = true } = {}) {
   const el = h('div.popover', { class: className, role: 'dialog', attrs: { 'aria-label': label } }, content);
-  document.body.append(el);
+  add(document.body, el);
   place(el, anchor, { placement });
   openStack.push(el);
   if (anchor instanceof Element) anchor.setAttribute('aria-expanded', 'true');
@@ -217,8 +217,8 @@ export function openMenu(anchor, items, { placement = 'bottom-start', label = 'M
   let pop = null;
   for (const it of items) {
     if (!it) continue;
-    if (it.separator) { list.append(h('div.menu-sep', { role: 'separator' })); continue; }
-    if (it.heading) { list.append(h('div.menu-heading', { role: 'presentation' }, it.heading)); continue; }
+    if (it.separator) { add(list, h('div.menu-sep', { role: 'separator' })); continue; }
+    if (it.heading) { add(list, h('div.menu-heading', { role: 'presentation' }, it.heading)); continue; }
     const role = it.checked === undefined ? 'menuitem' : 'menuitemcheckbox';
     const btn = h(`button.menu-item${it.danger ? '.danger' : ''}`, {
       type: 'button', role, tabIndex: -1, disabled: !!it.disabled,
@@ -231,7 +231,7 @@ export function openMenu(anchor, items, { placement = 'bottom-start', label = 'M
     h('span.menu-label', it.label, it.hint ? h('span.menu-hint', it.hint) : null),
     it.shortcut ? h('kbd.menu-kbd', it.shortcut) : null);
     entries.push(btn);
-    list.append(btn);
+    add(list, btn);
   }
   let typed = '';
   let typedTimer = null;

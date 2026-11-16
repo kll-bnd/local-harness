@@ -6,6 +6,8 @@ import { validateChatSettings } from '../store/settings.mjs';
 import { activePath, pathTo, deepestLeaf, setActiveLeaf, deleteSubtree, turnUserMessage } from '../chat/tree.mjs';
 import { activeSummary } from '../context/compaction.mjs';
 import { exportMarkdown, exportJson, importPayload } from '../chat/export.mjs';
+import { buildBackup, restoreBackup } from '../chat/backup.mjs';
+import { regenerateImage } from './images.mjs';
 import { generateTitle } from '../chat/titles.mjs';
 import { newId } from '../lib/ids.mjs';
 import { nowIso, deepMerge, isPlainObject } from '../lib/util.mjs';
@@ -49,20 +51,83 @@ function attachmentRefs(app, ids, chatId) {
   });
 }
 
-/** Stream a generation over SSE. `prepare()` runs before headers so setup errors become JSON errors. */
+/**
+ * Stream a generation over SSE. The chat is reserved synchronously first (no await between the busy check and
+ * the reservation), then setup runs (`target`, `prepare`) — setup errors are JSON responses (no SSE bytes yet)
+ * and release the reservation.
+ */
 async function streamTurn(ctx, chat, { prepare, modelRef }) {
   const { app, req, res } = ctx;
-  if (app.engine.busy(chat.id)) throw new HttpError(409, 'chat_busy', 'A generation is already running for this chat');
-  const prepared = await app.engine.target(chat, modelRef);
-  const { anchorId, userMessage } = prepare();
-  const sse = openSse(req, res);
+  const reservation = app.engine.reserve(chat.id);
+  let sse = null;
   try {
-    await app.engine.run({ chat, anchorId, userMessage, emit: (t, d) => sse.send(t, d), signal: sse.signal, modelRef, prepared });
+    const prepared = await app.engine.target(chat, modelRef);
+    if (app.chats.chats.get(chat.id) !== chat) throw notFound('Chat');
+    const { anchorId, userMessage } = prepare();
+    sse = openSse(req, res);
+    await app.engine.run({ chat, anchorId, userMessage, emit: (t, d) => sse.send(t, d), signal: sse.signal, modelRef, prepared, reservation });
   } catch (e) {
+    app.engine.release(chat.id, reservation);
+    if (!sse) throw e;
     sse.send('error', { code: e.code || 'internal_error', message: e.message });
   } finally {
-    sse.end();
+    app.engine.release(chat.id, reservation);
+    sse?.end();
   }
+}
+
+/**
+ * Delete a chat's files unless another chat still references them (forks share attachments and images).
+ * Returns { attachments, images, memories } counts removed.
+ */
+export async function deleteChatAssets(app, chat, { deleteMemories = false } = {}) {
+  const usedAtt = new Set();
+  const usedImg = new Set();
+  for (const c of app.chats.all()) {
+    if (c.id === chat.id) continue;
+    for (const m of Object.values(c.messages)) {
+      for (const a of m.attachments || []) usedAtt.add(a.id);
+      for (const i of m.images || []) usedImg.add(i.id);
+    }
+  }
+  const mine = new Set();
+  const mineImg = new Set();
+  for (const m of Object.values(chat.messages)) {
+    for (const a of m.attachments || []) mine.add(a.id);
+    for (const i of m.images || []) mineImg.add(i.id);
+  }
+  for (const a of app.attachments.items.values()) if (a.chatId === chat.id) mine.add(a.id);
+  for (const r of app.gallery.items.values()) if (r.chatId === chat.id) mineImg.add(r.id);
+  const out = { attachments: 0, images: 0, memories: 0 };
+  for (const id of mine) {
+    const a = app.attachments.tryGet(id);
+    if (!a) continue;
+    if (usedAtt.has(id)) {
+      // still used by another chat (e.g. a fork): keep it and move ownership
+      const owner = app.chats.all().find((c) => c.id !== chat.id && Object.values(c.messages).some((m) => (m.attachments || []).some((x) => x.id === id)));
+      if (owner && a.chatId === chat.id) await app.attachments.assignChat(id, owner.id);
+      continue;
+    }
+    await app.attachments.delete(id).catch(() => {});
+    out.attachments++;
+  }
+  for (const id of mineImg) {
+    const r = app.gallery.tryGet(id);
+    if (!r) continue;
+    if (usedImg.has(id)) {
+      const owner = app.chats.all().find((c) => c.id !== chat.id && Object.values(c.messages).some((m) => (m.images || []).some((x) => x.id === id)));
+      if (owner && r.chatId === chat.id) await app.gallery.update(id, { chatId: owner.id });
+      continue;
+    }
+    await app.gallery.delete(id).catch(() => {});
+    out.images++;
+  }
+  if (deleteMemories) {
+    for (const m of [...app.memories.items.values()]) {
+      if (m.source?.chatId === chat.id) { await app.memories.delete(m.id).catch(() => {}); out.memories++; }
+    }
+  }
+  return out;
 }
 
 function searchChats(app, q, { limit = 50 } = {}) {
@@ -71,10 +136,10 @@ function searchChats(app, q, { limit = 50 } = {}) {
   const results = [];
   for (const chat of app.chats.all()) {
     const onPath = new Set(activePath(chat).map((m) => m.id));
-    const titleHit = terms.every((t) => (chat.title || '').toLowerCase().includes(t));
+    const titleHit = terms.every((t) => String(chat.title || '').toLowerCase().includes(t));
     let any = false;
     for (const m of Object.values(chat.messages)) {
-      if ((m.role !== 'user' && m.role !== 'assistant') || !m.content) continue;
+      if ((m.role !== 'user' && m.role !== 'assistant') || typeof m.content !== 'string' || !m.content) continue;
       const low = m.content.toLowerCase();
       if (!terms.every((t) => low.includes(t))) continue;
       any = true;
@@ -108,10 +173,27 @@ export function registerChatRoutes(r, app) {
   });
 
   r.post('/api/chats/import', async ({ req }) => {
-    const body = await readJson(req, { limit: 100 * 1024 * 1024 });
-    const chats = importPayload(body, { exists: (id) => app.chats.has(id) });
+    const body = await readJson(req, { limit: 512 * 1024 * 1024 });
+    if (body?.format === 'harness.backup') {
+      // A full backup imported here restores its chats with their files; memories/presets/settings are left out
+      // (use POST /api/restore for those) and listed in `ignored` so nothing is skipped silently.
+      const rep = await restoreBackup(app, body, { memories: false, presets: false, settings: 'skip' });
+      if (!rep.chats.length) throw badRequest('No valid chats in this backup');
+      const ignored = ['memories', 'presets', 'settings'].filter((k) => (k === 'settings' ? !!body.settings : Array.isArray(body[k]) && body[k].length));
+      return created({ chats: rep.chats.map((id) => chatSummary(app.chats.get(id))), ignored, restored: rep.restored, skipped: rep.skipped });
+    }
+    const { chats, skipped } = importPayload(body, { exists: (id) => app.chats.has(id) });
     for (const c of chats) await app.chats.insert(c);
-    return created({ chats: chats.map((c) => chatSummary(c)) });
+    return created({ chats: chats.map((c) => chatSummary(c)), ...(skipped ? { skipped: { chats: skipped } } : {}) });
+  });
+
+  r.post('/api/restore', async ({ req, query }) => {
+    const body = await readJson(req, { limit: 512 * 1024 * 1024 });
+    const settingsMode = query.get('settings') || 'skip';
+    if (!['skip', 'safe', 'full'].includes(settingsMode)) throw badRequest("settings must be 'skip', 'safe' or 'full'");
+    const flag = (k) => qBool(query.get(k), true);
+    const report = await restoreBackup(app, body, { chats: flag('chats'), attachments: flag('attachments'), images: flag('images'), memories: flag('memories'), presets: flag('presets'), settings: settingsMode });
+    return created(report);
   });
 
   r.get('/api/chats/:id', ({ params }) => chatDetail(app, app.chats.get(params.id)));
@@ -146,15 +228,16 @@ export function registerChatRoutes(r, app) {
     return chatDetail(app, chat);
   });
 
-  r.delete('/api/chats/:id', async ({ params }) => {
+  r.delete('/api/chats/:id', async ({ params, query }) => {
     const chat = app.chats.get(params.id);
     app.engine.stop(chat.id);
-    await app.chats.delete(chat.id);
-    app.recall.removeChat(chat.id);
     app.background.cancel(`memory:${chat.id}`);
     app.background.cancel(`title:${chat.id}`);
-    await app.attachments.deleteForChat(chat.id);
-    return { ok: true };
+    app.background.cancel(`recall:${chat.id}`);
+    await app.chats.delete(chat.id);
+    app.recall.removeChat(chat.id);
+    const removed = await deleteChatAssets(app, chat, { deleteMemories: qBool(query.get('deleteMemories')) });
+    return { ok: true, removed };
   });
 
   // ---- generation -------------------------------------------------------------------------
@@ -184,6 +267,11 @@ export function registerChatRoutes(r, app) {
     const body = await readJson(ctx.req, { optional: true });
     const anchor = m.role === 'user' ? m : turnUserMessage(chat, m.id);
     if (!anchor) throw badRequest('No user message to regenerate from');
+    if (anchor.kind === 'image_request') {
+      // Regenerating an image turn makes a new image (new seed unless one was fixed), not a text reply.
+      await regenerateImage(ctx, chat, anchor);
+      return;
+    }
     await streamTurn(ctx, chat, { modelRef: modelRefFrom(body.model), prepare: () => ({ anchorId: anchor.id, userMessage: null }) });
   });
 
@@ -347,9 +435,7 @@ export function registerChatRoutes(r, app) {
   });
 
   r.get('/api/export', async ({ res }) => {
-    const chats = [];
-    for (const c of app.chats.all()) chats.push((await exportJson(c)).chat);
-    const body = { format: 'harness.backup', version: 1, exportedAt: nowIso(), settings: app.settings.get(), presets: app.presets.user, memories: app.memories.list({ limit: 1e6 }).items, chats };
+    const body = await buildBackup(app);
     sendJson(res, 200, body, { 'content-disposition': `attachment; filename="harness-backup-${nowIso().slice(0, 10)}.json"` });
   });
 

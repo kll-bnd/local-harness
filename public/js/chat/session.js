@@ -107,7 +107,9 @@ export class ChatModel extends Emitter {
   }
 
   setChatMeta(chat) {
-    this.chat = { ...(this.chat || {}), ...chat };
+    // List summaries carry `generating` as a boolean snapshot; the detail's object form is authoritative.
+    const { generating, ...rest } = chat;
+    this.chat = { ...(this.chat || {}), ...rest, ...(typeof generating === 'object' ? { generating } : {}) };
     this.emit('meta');
   }
 }
@@ -215,14 +217,16 @@ function handleEvent(model, ev) {
       break;
     }
     case 'notice': {
-      // Non-fatal info. Show each kind once per chat per session — no nagging on every turn.
-      if (model.noticed.has(ev.code)) break;
-      model.noticed.add(ev.code);
-      const quiet = ['thinking_unsupported'];
-      if (quiet.includes(ev.code)) break;
-      const kind = ['model_exceeds_budget', 'exceeds_budget', 'context_truncated'].includes(ev.code) ? 'warn' : 'info';
-      const action = ['model_exceeds_budget', 'exceeds_budget'].includes(ev.code) ? { label: 'Context details', run: () => runAction('show-context') } : null;
-      toast({ kind, message: noticeTitle(ev), detail: ev.message, action, id: `notice-${ev.code}`, timeout: 8000 });
+      // Non-fatal info. Memory-budget warnings are shown once per model per app session (the status
+      // pill and context meter keep showing the state quietly); everything else once per chat.
+      const budget = BUDGET_CODES.includes(ev.code);
+      const key = budget ? `budget:${model.live?.modelInfo?.model || ''}` : `${model.id}:${ev.code}`;
+      if (noticedOnce.has(key) || ev.code === 'thinking_unsupported') break;
+      noticedOnce.add(key);
+      model.notices = [...(model.notices || []), ev];
+      const kind = budget || ev.code === 'context_truncated' ? 'warn' : 'info';
+      const action = budget ? { label: 'Details', run: () => runAction('show-context') } : null;
+      toast({ kind, message: noticeTitle(ev), detail: ev.message, action, id: budget ? 'notice-budget' : `notice-${ev.code}`, timeout: 9000 });
       break;
     }
     case 'context': {
@@ -334,9 +338,14 @@ function handleEvent(model, ev) {
   }
 }
 
+const BUDGET_CODES = ['model_exceeds_budget', 'exceeds_budget', 'measured_exceeds_budget', 'cpu_offload'];
+const noticedOnce = new Set();
+
 function noticeTitle(ev) {
   switch (ev.code) {
     case 'model_exceeds_budget': return 'This model is too large for this Mac';
+    case 'measured_exceeds_budget': return 'This model uses more memory than is safe';
+    case 'cpu_offload': return 'Part of the model runs on the CPU (slower)';
     case 'exceeds_budget': return 'Context window is larger than memory allows';
     case 'context_truncated': return 'Older messages were left out to fit the context';
     case 'tools_unsupported': return "This model can't use tools";
@@ -373,7 +382,14 @@ async function run(model, kind, starter) {
   bus.emit('activity');
   let result = null;
   try {
-    result = await starter((ev) => handleEvent(model, ev), controller.signal);
+    try {
+      result = await starter((ev) => handleEvent(model, ev), controller.signal);
+    } catch (e) {
+      // Our previous turn may still be finalizing on the server for a few ms: retry once.
+      if (e.code !== 'chat_busy' || !model.lastFinishedAt || Date.now() - model.lastFinishedAt > 3000) throw e;
+      await new Promise((r) => setTimeout(r, 400));
+      result = await starter((ev) => handleEvent(model, ev), controller.signal);
+    }
   } catch (e) {
     model.live = null;
     model.emit('live');
@@ -383,11 +399,18 @@ async function run(model, kind, starter) {
     await model.load({ force: true }).catch(() => {});
     return false;
   }
+  const ownGeneration = model.live?.generationId;
   model.live = null;
+  model.lastFinishedAt = Date.now();
   for (const [, v] of model.tool) if (v.status === 'running') v.status = result?.aborted ? 'aborted' : 'done';
   model.emit('live');
   bus.emit('activity', { finished: model.id });
   await model.load({ force: true }).catch(() => {});
+  // The refetch can race the server's bookkeeping; our own generation is over either way.
+  if (model.chat?.generating && (!model.chat.generating.generationId || model.chat.generating.generationId === ownGeneration)) {
+    model.chat = { ...model.chat, generating: null };
+    model.emit('live');
+  }
   model.refreshContext().catch(() => {});
   if (model.lastError && model.lastError.code !== 'aborted') {
     const x = explainError(model.lastError);

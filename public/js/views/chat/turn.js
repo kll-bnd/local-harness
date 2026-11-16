@@ -1,9 +1,9 @@
 // One conversational turn: the user message and the assistant/tool chain that answers it, rendered as a
 // single block. TurnView reconciles keyed sub-views (one StepView per assistant step, one ToolCard per tool
 // call) so streaming only touches what changed, and finished markdown is rendered once (and cached).
-import { h, copyText } from '../../lib/dom.js';
+import { h, copyText, mount, add } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
-import { StreamingMarkdown, renderMarkdown } from '../../lib/markdown.js';
+import { StreamingMarkdown, renderMarkdown, renderUserMarkdown } from '../../lib/markdown.js';
 import { fmtTime, fmtFull, fmtInt, fmt1, fmtMs, fmtBytes, modelLabel, plural, truncate } from '../../lib/format.js';
 import { openMenu, toast } from '../../ui/overlays.js';
 import { openLightbox } from '../../ui/lightbox.js';
@@ -110,7 +110,7 @@ class ToolCard {
     const grid = name === 'generate_image' ? imageGrid(images, live, status === 'running') : null;
     this.el.className = `tool-card tool-${status}${name === 'generate_image' ? ' tool-image' : ''}`;
     this.el.dataset.toolCallId = call.id;
-    this.el.replaceChildren(head, detail, job, grid);
+    mount(this.el, head, detail, job, grid);
   }
 }
 
@@ -163,7 +163,7 @@ class StepView {
     this.toolsEl = h('div.tool-cards');
     this.proseEl = h('div.prose');
     this.extraEl = h('div.step-extra');
-    this.el.append(this.reasoningEl, this.proseEl, this.toolsEl, this.extraEl);
+    add(this.el, this.reasoningEl, this.proseEl, this.toolsEl, this.extraEl);
     this.md = new StreamingMarkdown(this.proseEl, { cacheKey: `m:${msg.id}` });
     this.reasonMd = null;
     this.cards = new Map();
@@ -188,7 +188,7 @@ class StepView {
       this.contentSig = cs;
       if (streaming) this.md.update(c);
       else if (c) this.md.finish(c);
-      else this.proseEl.replaceChildren();
+      else mount(this.proseEl);
       this.proseEl.hidden = !c;
     }
     // tool calls (in call order)
@@ -199,7 +199,7 @@ class StepView {
       let card = this.cards.get(call.id);
       if (!card) { card = new ToolCard(this.ctx, call); this.cards.set(call.id, card); }
       card.update(call, toolMsgs.get(call.id));
-      if (card.el.parentNode !== this.toolsEl) this.toolsEl.append(card.el);
+      if (card.el.parentNode !== this.toolsEl) add(this.toolsEl, card.el);
     }
     for (const [id, card] of this.cards) if (!seen.has(id)) { card.el.remove(); this.cards.delete(id); }
     this.toolsEl.hidden = !calls.length;
@@ -215,13 +215,13 @@ class StepView {
         const grid = imageGrid(imgs, live, streaming);
         if (grid) parts.push(grid);
       }
-      this.extraEl.replaceChildren(...parts);
+      mount(this.extraEl, ...parts);
     }
   }
 
   renderReasoning(msg, streaming) {
     const r = msg.reasoning || '';
-    if (!r) { this.reasoningEl.replaceChildren(); this.reasoningEl.hidden = true; return; }
+    if (!r) { mount(this.reasoningEl); this.reasoningEl.hidden = true; return; }
     this.reasoningEl.hidden = false;
     const thinking = streaming && !msg.content;
     const open = this.ctx.view.expanded.has(`r:${msg.id}`);
@@ -232,11 +232,11 @@ class StepView {
       this._rHead = h('button.disclosure.reasoning-toggle', { type: 'button', on: { click: () => { const o = !this.ctx.view.expanded.has(`r:${msg.id}`); this.ctx.view.toggleExpanded(`r:${msg.id}`, o); this.reasonSig = null; this.update(this.ctx.model.msg(msg.id) || msg, new Map()); } } });
       this._rBody = h('div.reasoning-body');
       this._rPeek = h('div.reasoning-peek');
-      this.reasoningEl.append(this._rHead, this._rPeek, this._rBody);
+      add(this.reasoningEl, this._rHead, this._rPeek, this._rBody);
       this.reasonMd = new StreamingMarkdown(this._rBody);
     }
     this._rHead.setAttribute('aria-expanded', String(open));
-    this._rHead.replaceChildren(icon('chevronRight', { size: 12 }), thinking ? h('span.spinner.small') : null, h('span', label), r && !thinking ? h('span.faint', ` · ${fmtInt(r.split(/\s+/).length)} words`) : null);
+    mount(this._rHead, icon('chevronRight', { size: 12 }), thinking ? h('span.spinner.small') : null, h('span', label), r && !thinking ? h('span.faint', ` · ${fmtInt(r.split(/\s+/).length)} words`) : null);
     this._rBody.hidden = !open;
     this._rPeek.hidden = open || !thinking;
     if (!open && thinking) this._rPeek.textContent = r.slice(-220).replace(/\s+/g, ' ');
@@ -275,8 +275,8 @@ export class TurnView {
     this.noteEl = h('div.turn-note');
     this.footEl = h('div.msg-foot');
     this.headEl = h('div.msg-head');
-    this.asstEl.append(this.headEl, this.stepsEl, this.statusEl, this.noteEl, this.footEl);
-    this.el.append(this.userEl, this.asstEl);
+    add(this.asstEl, this.headEl, this.stepsEl, this.statusEl, this.noteEl, this.footEl);
+    add(this.el, this.userEl, this.asstEl);
     this.sigs = '';
     this.update(this.turn, true);
   }
@@ -301,14 +301,14 @@ export class TurnView {
     this.userEl.dataset.messageId = u.id;
     if (editing) {
       if (this.userEl.querySelector('.msg-editor')) return;
-      this.userEl.replaceChildren(editor(u.content, { label: 'Edit message', submitLabel: 'Save & send', hint: 'Creates a new branch; the original stays available.', onCancel: () => this.ctx.view.setEditing(null), onSubmit: (text) => this.ctx.view.submitEdit(u, text) }));
+      mount(this.userEl, editor(u.content, { label: 'Edit message', submitLabel: 'Save & send', hint: 'Creates a new branch; the original stays available.', onCancel: () => this.ctx.view.setEditing(null), onSubmit: (text) => this.ctx.view.submitEdit(u, text) }));
       return;
     }
     const isImage = u.kind === 'image_request';
     const body = isImage
       ? h('div.user-text.image-request', h('span.badge.accent', icon('image', { size: 12 }), 'Image'), ' ', u.content, u.imageRequest ? h('span.faint.small', ` · ${[u.imageRequest.aspect, u.imageRequest.size, u.imageRequest.seed != null && u.imageRequest.seed >= 0 ? `seed ${u.imageRequest.seed}` : null].filter(Boolean).join(' · ')}`) : null)
-      : h('div.user-text', u.content);
-    this.userEl.replaceChildren(
+      : h('div.user-text.user-md', renderUserMarkdown(u.content, { cacheKey: `u:${u.id}` }));
+    mount(this.userEl, 
       body,
       attachmentChips(u.attachments),
       h('div.msg-tools.user-tools',
@@ -332,7 +332,7 @@ export class TurnView {
 
     // head: model · time
     const editingA = last && this.ctx.view.editing === last.id;
-    this.headEl.replaceChildren(
+    mount(this.headEl, 
       h('span.who', modelName(first?.model || model.live?.modelInfo)),
       first ? h('span.msg-time.faint', { title: fmtFull(first.createdAt) }, fmtTime(first.createdAt)) : null,
       last?.edited ? h('span.badge.outline', 'edited') : null,
@@ -360,13 +360,13 @@ export class TurnView {
     for (const [id, sv] of this.steps) if (!seen.has(id)) { sv.el.remove(); this.steps.delete(id); }
     const oldEditor = this.stepsEl.querySelector(':scope > .msg-editor');
     if (editingA) {
-      if (!oldEditor) this.stepsEl.append(editor(last.content, { label: 'Edit answer', submitLabel: 'Save', hint: 'Saved as an edited copy; the original stays available as a version.', onCancel: () => this.ctx.view.setEditing(null), onSubmit: (text) => this.ctx.view.submitAssistantEdit(last, text) }));
+      if (!oldEditor) add(this.stepsEl, editor(last.content, { label: 'Edit answer', submitLabel: 'Save', hint: 'Saved as an edited copy; the original stays available as a version.', onCancel: () => this.ctx.view.setEditing(null), onSubmit: (text) => this.ctx.view.submitAssistantEdit(last, text) }));
     } else oldEditor?.remove();
 
     // live status line
     const d = isLast ? describeLive(model) : null;
     const comp = isLast ? model.live?.compaction : null;
-    this.statusEl.replaceChildren(
+    mount(this.statusEl, 
       comp?.status === 'done' ? h('span.status-line.done', icon('summary', { size: 13 }), `Summarized ${plural(comp.messages || 0, 'earlier message')} to make room`) : null,
       d ? h(`span.status-line.phase-${d.phase}`, h('span.spinner.small'), d.label) : null,
     );
@@ -384,12 +384,12 @@ export class TurnView {
     }
     if (last?.finishReason === 'length') notes.push(h('div.note-line', icon('info', { size: 13 }), 'Cut off at the reply length limit.'));
     if (last?.finishReason === 'tool_limit') notes.push(h('div.note-line', icon('info', { size: 13 }), 'Stopped after reaching the tool-call limit for one turn.'));
-    this.noteEl.replaceChildren(...notes);
+    mount(this.noteEl, ...notes);
     this.noteEl.hidden = !notes.length;
 
     // footer: stats + retrieval + actions + versions
     const generating = isLast && !!model.live;
-    if (!last || generating || editingA) { this.footEl.replaceChildren(); this.footEl.hidden = true; return; }
+    if (!last || generating || editingA) { mount(this.footEl); this.footEl.hidden = true; return; }
     this.footEl.hidden = false;
     const stats = last.stats || model.stats.get(`turn:${last.id}`) || null;
     const live = model.stats.get(last.id);
@@ -414,7 +414,7 @@ export class TurnView {
     const nRec = ret?.recallChunkIds?.length || 0;
     const retBits = [nMem ? plural(nMem, 'memory', 'memories') : null, nDoc ? plural(nDoc, 'excerpt') : null, nRec ? plural(nRec, 'past chat', 'past chats') : null].filter(Boolean);
     const isImage = last.kind === 'image_result';
-    this.footEl.replaceChildren(
+    mount(this.footEl, 
       statBits.length ? h('span.msg-stats.num', { title: tip }, statBits.join(' · ')) : null,
       retBits.length ? h('button.chip.used-chip', { type: 'button', title: 'Show what was added to the prompt', dataset: { action: 'show-retrieval', id: first.id } }, icon('memory', { size: 12 }), `Used ${retBits.join(' · ')}`) : null,
       h('span.spacer'),

@@ -58,9 +58,10 @@ export async function extractMemories(app, chat, { signal } = {}) {
     if (content.length < 8 || content.length > 500) { res.skipped.push(content || '(empty)'); continue; }
     if (looksLikeSecret(content)) { res.skipped.push('(secret)'); continue; }
     const category = MEMORY_CATEGORIES.includes(op.category) ? op.category : 'other';
-    if (op.action === 'update' && op.id && app.memories.items.has(op.id)) {
-      const m = await app.memories.update(op.id, { content, category }, { source: { chatId: chat.id, messageId: lastId } });
-      res.updated.push(m);
+    const target = op.action === 'update' && op.id ? app.memories.items.get(op.id) : null;
+    if (target && !target.pinned && target.origin !== 'manual') {
+      const m = await app.memories.update(op.id, { content, category }, { source: { chatId: chat.id, messageId: lastId }, origin: 'auto' }).catch(() => null);
+      if (m) res.updated.push(m); else res.skipped.push(content);
     } else {
       const r = await app.memories.add({ content, category, origin: 'auto', source: { chatId: chat.id, messageId: lastId } });
       if (r.action === 'added') res.added.push(r.memory);

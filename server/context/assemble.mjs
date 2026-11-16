@@ -6,7 +6,10 @@
 //   [history] messages after the summary boundary, verbatim (reasoning stripped)
 //   [last user message] ← ephemeral <context> block (retrieved memories, document excerpts, past-chat snippets)
 import { PROMPT_OVERHEAD } from './tokens.mjs';
-import { summaryBlock, memoryBlock, turnContextBlock } from '../chat/prompts.mjs';
+import { summaryBlock, memoryBlock, turnContextBlock, escapeUntrusted, untrustedBlock, UNTRUSTED_NOTE } from '../chat/prompts.mjs';
+
+/** Tool results that carry text from outside (web pages, past chats) — rendered as untrusted data. */
+export const UNTRUSTED_TOOLS = new Set(['fetch_url', 'recall']);
 import { stripThinking } from '../chat/reasoning.mjs';
 import { truncateMiddle } from '../lib/util.mjs';
 
@@ -37,6 +40,7 @@ export function safeSplitPoints(msgs) {
  */
 export function makeRenderer({ attachments, counter, inlineMaxTokens, vision, imageIndexAllowed, feedbackImages = false, gallery = null, providerKind = 'ollama' }) {
   const docs = new Set();
+  const untrusted = { flag: false };
   const render = async (m, index) => {
     if (m.role === 'system') return null;
     if (m.role === 'user') {
@@ -50,14 +54,16 @@ export function makeRenderer({ attachments, counter, inlineMaxTokens, vision, im
         const a = attachments.tryGet(ref.id);
         if (!a) { notes.push(`[Attachment "${ref.name || ref.id}" was removed]`); continue; }
         if (a.kind === 'image') {
-          if (vision && imageIndexAllowed(index)) images.push({ mime: a.mime, base64: (await attachments.readOriginal(a.id)).toString('base64'), name: a.name });
+          if (vision && imageIndexAllowed(index)) { images.push({ mime: a.mime, base64: (await attachments.readOriginal(a.id)).toString('base64'), name: a.name }); untrusted.flag = true; }
           else notes.push(`[Image attached: ${a.name}${vision ? '' : ' (this model cannot see images)'}]`);
         } else if (a.kind === 'text') {
           if ((a.tokens || 0) <= inlineMaxTokens) {
             const text = await attachments.readText(a.id);
-            files.push(`<file name="${a.name}">\n${text ?? ''}\n</file>`);
+            files.push(`<file name="${escapeUntrusted(a.name).replace(/"/g, "'")}">\n${escapeUntrusted(text ?? '')}\n</file>`);
+            untrusted.flag = true;
           } else {
             docs.add(a.id);
+            untrusted.flag = true;
             notes.push(`[Document attached: ${a.name} (~${a.tokens} tokens, ${a.chunks} parts). Relevant excerpts are provided in <context> when they match the question.]`);
           }
         } else {
@@ -78,7 +84,9 @@ export function makeRenderer({ attachments, counter, inlineMaxTokens, vision, im
       return { role: 'assistant', content, ...(toolCalls ? { toolCalls } : {}), _id: m.id };
     }
     if (m.role === 'tool') {
-      const out = { role: 'tool', content: m.content || '', toolCallId: m.toolCallId, toolName: m.toolName, _id: m.id };
+      const isUntrusted = UNTRUSTED_TOOLS.has(m.toolName);
+      if (isUntrusted) untrusted.flag = true;
+      const out = { role: 'tool', content: isUntrusted ? untrustedBlock(m.toolName, m.content || '') : m.content || '', toolCallId: m.toolCallId, toolName: m.toolName, _id: m.id };
       if (feedbackImages && vision && m.images?.length && gallery) {
         out.images = [];
         for (const ref of m.images) {
@@ -91,7 +99,7 @@ export function makeRenderer({ attachments, counter, inlineMaxTokens, vision, im
     }
     return null;
   };
-  return { render, docs, providerKind, tokens: (nm) => (nm ? counter.message(nm) : 0) };
+  return { render, docs, providerKind, untrusted, tokens: (nm) => (nm ? counter.message(nm) : 0) };
 }
 
 /** Attachment ids on `path` that are too large to inline and therefore use document retrieval. */
@@ -182,7 +190,7 @@ export async function assemble({
 
   const memSystem = placement === 'system' ? [...pinnedMemories, ...(retrieval.memories || [])] : pinnedMemories;
   const memTurn = placement === 'system' ? [] : retrieval.memories || [];
-  const sysBase = [baseSystem.trim(), dateLine].filter(Boolean).join('\n\n');
+  const sysBase = [baseSystem.trim(), dateLine, UNTRUSTED_NOTE].filter(Boolean).join('\n\n');
   const sysMem = memSystem.length ? memoryBlock(memSystem) : '';
   const sysSummary = summary?.content ? summaryBlock(summary.content) : '';
   const systemText = [sysBase, sysMem, sysSummary].filter(Boolean).join('\n\n');
@@ -280,5 +288,7 @@ export async function assemble({
     rawEstimate,
     hasImages: messages.some((m) => m.images?.length),
     docIds: [...renderer.docs],
+    // Text we did not write (files, documents, web pages, past-chat snippets, attached images) is in this request.
+    untrusted: !!(renderer.untrusted?.flag || (retrieval.documents || []).length || (retrieval.recall || []).length),
   };
 }

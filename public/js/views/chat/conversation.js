@@ -1,6 +1,6 @@
 // The transcript: keyed turn reconciliation, lazy rendering of old turns, auto-scroll that respects the
 // user scrolling up, the compaction divider with an inline summary editor, and delegated message actions.
-import { h, copyText, delegate } from '../../lib/dom.js';
+import { h, copyText, delegate, mount, add } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
 import { renderMarkdown } from '../../lib/markdown.js';
 import { fmtInt, plural, fmtRelative, modelLabel } from '../../lib/format.js';
@@ -19,6 +19,7 @@ const EAGER_TURNS = 24;
 export class ConversationView {
   constructor(model, { onEmpty } = {}) {
     this.model = model;
+    this.ctx = { model, view: this };
     this.onEmpty = onEmpty;
     this.turns = new Map(); // key → TurnView
     this.order = [];
@@ -98,7 +99,7 @@ export class ConversationView {
       let tv = this.turns.get(t.key);
       if (!tv) {
         const eager = !initial || i >= turns.length - EAGER_TURNS;
-        tv = new TurnView(this, t, { materialize: eager });
+        tv = new TurnView(this.ctx, t, { materialize: eager });
         this.turns.set(t.key, tv);
         if (!tv.materialized) this.io.observe(tv.el);
       } else tv.update(t);
@@ -189,7 +190,7 @@ export class ConversationView {
             } } }, 'Remove')));
       }
     }
-    this.divider.replaceChildren(head, body);
+    mount(this.divider, head, body);
   }
 
   // ------------------------------------------------------------------------------------------ scrolling

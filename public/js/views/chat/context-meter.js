@@ -1,7 +1,7 @@
 // Context meter: how full the context window is, what fills it, and why the window is this size.
 // The bar spans the whole window (numCtx): coloured segments for each prompt component, empty prompt
 // budget, a hatched reply reserve at the end, and a tick where auto-summarization kicks in.
-import { h } from '../../lib/dom.js';
+import { h, add } from '../../lib/dom.js';
 import { fmtInt, fmtTokens, fmtBytes, fmtPercent } from '../../lib/format.js';
 
 export const SEGMENTS = [
@@ -24,13 +24,13 @@ function bar(ctx, { large = false } = {}) {
     const v = ctx.breakdown?.[s.key] || 0;
     if (!v) continue;
     usedSum += v;
-    el.append(h(`span.seg.seg-${s.key}`, { style: { width: pct(v) } }));
+    add(el, h(`span.seg.seg-${s.key}`, { style: { width: pct(v) } }));
   }
-  if (!ctx.breakdown && ctx.used) el.append(h('span.seg.seg-history', { style: { width: pct(ctx.used) } }));
+  if (!ctx.breakdown && ctx.used) add(el, h('span.seg.seg-history', { style: { width: pct(ctx.used) } }));
   const free = Math.max(0, (ctx.budget || num) - Math.max(usedSum, ctx.used || 0));
-  el.append(h('span.seg.seg-free', { style: { width: pct(free) } }));
-  if (ctx.replyReserve) el.append(h('span.seg.seg-reserve', { style: { width: pct(ctx.replyReserve) } }));
-  if (ctx.compactAt) el.append(h('span.ctx-tick', { style: { left: pct(ctx.compactAt) } }));
+  add(el, h('span.seg.seg-free', { style: { width: pct(free) } }));
+  if (ctx.replyReserve) add(el, h('span.seg.seg-reserve', { style: { width: pct(ctx.replyReserve) } }));
+  if (ctx.compactAt) add(el, h('span.ctx-tick', { style: { left: pct(ctx.compactAt) } }));
   return el;
 }
 

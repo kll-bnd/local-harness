@@ -16,8 +16,9 @@ export function h(tag, props, ...children) {
     if (props != null) children.unshift(props);
     props = {};
   }
-  const [base, ...rest] = tag.split('.');
-  const [name, id] = base.split('#');
+  let id = null;
+  const t = tag.replace(/#([\w-]+)/, (m, x) => { id = x; return ''; });
+  const [name, ...rest] = t.split('.');
   const el = document.createElement(name || 'div');
   if (id) el.id = id;
   if (rest.length) el.classList.add(...rest);
@@ -71,7 +72,13 @@ export function append(el, children) {
   return el;
 }
 
-/** Replace all children of `el`. */
+/** Append children (null / false / undefined are skipped — unlike Element.append, which would print "null"). */
+export function add(el, ...children) {
+  append(el, children);
+  return el;
+}
+
+/** Replace all children of `el` (null-safe, see add). */
 export function mount(el, ...children) {
   el.replaceChildren();
   append(el, children);

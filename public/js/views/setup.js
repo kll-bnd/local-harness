@@ -1,7 +1,7 @@
 // Setup & health: is a chat backend running (start Ollama, or how to install it), is there a model (with
 // a recommendation that fits this machine and live download progress), the machine and its memory
 // budget, the image backend (pointer to Draw Things' API server) and embeddings.
-import { h } from '../lib/dom.js';
+import { h, mount } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtTokens, modelLabel } from '../lib/format.js';
 import { store, loadRecommended, chatModels, ollamaStatus, loadSystem, loadModels, patchSettings } from '../state.js';
@@ -28,7 +28,7 @@ export class SetupView {
     loadRecommended().catch(() => {});
   }
 
-  toolbar() { return { title: h('div.tb-title', h('span.title-text', 'Setup & health')), actions: [h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Check again')] }; }
+  toolbar() { return { title: h('div.tb-title.page-title', h('span.title-text', 'Setup & health')), actions: [h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Check again')] }; }
 
   render() {
     const sys = store.get('system');
@@ -95,7 +95,7 @@ export class SetupView {
       emb.lowRamNote ? h('p.muted', emb.lowRamNote) : null,
       emb.suggestion && m?.ramTier !== 'low' ? h('div.row', h('button.btn.btn-small', { type: 'button', on: { click: () => pullModel({ model: emb.suggestion }) } }, `Download ${emb.suggestion}`)) : null) : null;
 
-    this.page.replaceChildren(
+    mount(this.page, 
       h('div.page-head', h('h1.h1', hasModel && anyBackend ? 'Ready' : 'Welcome to Harness'), hasModel && anyBackend ? h('button.btn.btn-primary', { type: 'button', on: { click: () => runAction('new-chat') } }, icon('compose', { size: 14 }), 'Start chatting') : null),
       h('p.lede', 'Everything runs on this computer. Here is what Harness found, and what still needs doing.'),
       machine,

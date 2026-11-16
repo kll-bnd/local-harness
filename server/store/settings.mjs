@@ -3,7 +3,8 @@ import path from 'node:path';
 import { readJson, writeJsonAtomic } from '../lib/fsx.mjs';
 import { deepMerge, clone } from '../lib/util.mjs';
 import { badRequest } from '../lib/errors.mjs';
-import { obj, num, bool, str, oneOf, any, arrayOf, modelRef, custom, validatePatch } from './schema.mjs';
+import { obj, num, bool, str, oneOf, any, arrayOf, modelRef, custom, validatePatch, sanitizeValue } from './schema.mjs';
+import { log } from '../lib/log.mjs';
 
 export function defaultOllamaUrl() {
   const h = process.env.OLLAMA_HOST;
@@ -61,6 +62,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     },
     custom: [],
   },
+  security: { allowedOrigins: [] },
   ui: { theme: 'system' },
 });
 
@@ -72,7 +74,7 @@ const url = () => custom((v, p) => {
 // Number of seconds (negative = forever), a numeric string (sent to Ollama as a number), or a Go duration ("30m", "1h30m").
 const keepAlive = custom((v, p) => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && (/^\s*-?\d+(\.\d+)?\s*$/.test(v) || /^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(v))) ? null : `${p} must be a duration like "30m", "-1" or a number of seconds`, { nullable: true });
 const thinkV = oneOf(['auto', 'on', 'off', 'low', 'medium', 'high']);
-const params = obj({
+export const PARAMS_SCHEMA = obj({
   temperature: num(0, 5), top_p: num(0, 1), top_k: num(0, 1000, { int: true }), min_p: num(0, 1), repeat_penalty: num(0, 5),
   seed: num(-1, 2 ** 53, { int: true }), num_predict: num(-2, 1e6, { int: true }), stop: arrayOf(str({ nullable: false, max: 100 }), { nullable: true, max: 16 }),
   presence_penalty: num(-2, 2), frequency_penalty: num(-2, 2),
@@ -88,7 +90,7 @@ export const SETTINGS_SCHEMA = obj({
   defaultModel: modelOrNull,
   defaultPresetId: str({ max: 64 }),
   systemPrompt: str({ max: 50000 }),
-  params,
+  params: PARAMS_SCHEMA,
   keepAlive,
   context: obj({
     mode: custom((v, p) => (v === 'auto' || v === 'max' || (Number.isInteger(v) && v >= 512 && v <= 2 ** 21) ? null : `${p} must be 'auto', 'max' or an integer token count >= 512`)),
@@ -139,6 +141,13 @@ export const SETTINGS_SCHEMA = obj({
     builtin: obj({ a1111: obj({ enabled: bool(), baseUrl: url() }), comfyui: obj({ enabled: bool(), baseUrl: url() }) }),
     custom: arrayOf(imageProviderEntry, { max: 50 }),
   }),
+  security: obj({
+    // Extra browser origins allowed to call the API (e.g. a UI dev server); the app's own origin is always allowed.
+    allowedOrigins: arrayOf(custom((v, p) => {
+      if (typeof v !== 'string') return `${p} must be an origin string`;
+      try { const u = new URL(v); return (u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'app:') && u.origin === v.replace(/\/+$/, '') ? null : `${p} must be an origin like http://localhost:5173`; } catch { return `${p} must be an origin like http://localhost:5173`; }
+    }, { nullable: false }), { max: 20 }),
+  }),
   ui: custom((v, p) => (v && typeof v === 'object' && !Array.isArray(v) && JSON.stringify(v).length < 65536 ? null : `${p} must be an object (< 64KB)`)),
 });
 
@@ -147,7 +156,7 @@ export const CHAT_SETTINGS_SCHEMA = obj({
   model: modelOrNull,
   presetId: str({ max: 64 }),
   systemPrompt: str({ max: 50000 }),
-  params,
+  params: PARAMS_SCHEMA,
   keepAlive,
   context: obj({ mode: SETTINGS_SCHEMA.shape.context.shape.mode }),
   reasoning: obj({ think: thinkV }),
@@ -166,7 +175,13 @@ export class SettingsStore {
 
   async load() {
     const stored = await readJson(this.file, null);
-    this.value = deepMerge(clone(DEFAULT_SETTINGS), stored || {});
+    // Never trust the file blindly (older versions, hand edits, tampering): keep only valid branches.
+    const { value, dropped } = sanitizeValue(SETTINGS_SCHEMA, stored ?? {});
+    this.value = deepMerge(clone(DEFAULT_SETTINGS), value || {});
+    if (stored && dropped.length) {
+      log.warn(`settings.json: ignored invalid entries ${dropped.slice(0, 10).join(', ')}${dropped.length > 10 ? ' …' : ''}`);
+      await writeJsonAtomic(this.file, this.value).catch(() => {});
+    }
     return this;
   }
 

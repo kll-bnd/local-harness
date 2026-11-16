@@ -1,5 +1,5 @@
 // Full-window image viewer with keyboard navigation and metadata. Images are always same-origin URLs.
-import { h } from '../lib/dom.js';
+import { h, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes } from '../lib/format.js';
 
@@ -25,13 +25,13 @@ export function openLightbox(images, index = 0, { actions = null } = {}) {
     const img = images[i];
     imgEl.src = img.url;
     imgEl.alt = img.prompt || 'Image';
-    meta.replaceChildren(
+    mount(meta, 
       img.prompt ? h('div.lb-prompt', img.prompt) : null,
       h('div.lb-sub.num', [img.width && img.height ? `${img.width}×${img.height}` : null, img.seed != null ? `seed ${img.seed}` : null, img.model || null, img.bytes ? fmtBytes(img.bytes) : null].filter(Boolean).join(' · ')),
     );
     counter.textContent = images.length > 1 ? `${i + 1} / ${images.length}` : '';
     prev.hidden = next.hidden = images.length < 2;
-    bar.replaceChildren(
+    mount(bar, 
       h('a.icon-btn', { href: `${img.url}${img.url.includes('?') ? '&' : '?'}download=1`, title: 'Download', 'aria-label': 'Download', attrs: { download: '' } }, icon('download')),
       ...(actions ? actions(img, close) : []).map((a) => h('button.btn.btn-small', { type: 'button', on: { click: () => a.run(img, close) } }, a.icon ? icon(a.icon, { size: 14 }) : null, a.label)),
     );
@@ -43,7 +43,7 @@ export function openLightbox(images, index = 0, { actions = null } = {}) {
     if (e.key === 'ArrowRight') { e.preventDefault(); go(1); }
   });
   dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });
-  document.body.append(dlg);
+  add(document.body, dlg);
   render();
   dlg.showModal();
   dlg.querySelector('.lb-foot .icon-btn:last-child')?.focus();

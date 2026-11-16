@@ -33,31 +33,44 @@ export async function readJson(file, fallback = null) {
   }
 }
 
-async function doWrite(file, data) {
+async function doWrite(file, data, abortIf) {
+  if (abortIf?.()) return false;
   await fs.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const fh = await fs.open(tmp, 'w');
   try {
-    await fh.writeFile(data);
+    await fh.writeFile(typeof data === 'function' ? data() : data);
     await fh.sync();
   } finally {
     await fh.close();
   }
+  // Checked again right before the rename: a delete that happened meanwhile must not be undone.
+  if (abortIf?.()) { await fs.rm(tmp, { force: true }); return false; }
   await fs.rename(tmp, file);
+  return true;
 }
 
-/** Atomically replace `file` with `data`. Writes to the same path are serialized in call order. */
-export function writeFileAtomic(file, data) {
+/**
+ * Atomically replace `file` with `data` (a string/Buffer, or a function producing it at write time).
+ * Writes to the same path are serialized in call order. `abortIf()` is checked before writing and again
+ * just before the rename (tombstones for deleted records).
+ */
+export function writeFileAtomic(file, data, { abortIf } = {}) {
   const prev = queues.get(file) || Promise.resolve();
-  const next = prev.catch(() => {}).then(() => doWrite(file, data));
+  const next = prev.catch(() => {}).then(() => doWrite(file, data, abortIf));
   queues.set(file, next);
   const cleanup = () => { if (queues.get(file) === next) queues.delete(file); };
   next.then(cleanup, cleanup);
   return next;
 }
 
-export function writeJsonAtomic(file, obj, { pretty = true } = {}) {
-  return writeFileAtomic(file, JSON.stringify(obj, null, pretty ? 2 : 0) + '\n');
+export function writeJsonAtomic(file, obj, { pretty = true, abortIf } = {}) {
+  return writeFileAtomic(file, JSON.stringify(obj, null, pretty ? 2 : 0) + '\n', { abortIf });
+}
+
+/** Resolve once every write queued so far for `file` has settled. */
+export async function waitForWrites(file) {
+  while (queues.has(file)) await queues.get(file).catch(() => {});
 }
 
 /** Wait for all queued writes to settle. */
