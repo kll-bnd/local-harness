@@ -254,7 +254,7 @@
   background: var(--bg-elev); border-radius: 12px; box-shadow: 0 0 0 0.5px var(--border-strong), 0 1px 3px rgba(0, 0, 0, 0.05), 0 6px 20px rgba(0, 0, 0, 0.04);
   transition: box-shadow var(--dur) var(--ease);
 }
-.composer.focused { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, var(--border-strong)), 0 1px 3px rgba(0, 0, 0, 0.05), 0 6px 20px rgba(0, 0, 0, 0.05); }
+.composer.focused { box-shadow: 0 0 0 1px var(--accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, var(--border-strong)), 0 1px 3px rgba(0, 0, 0, 0.05), 0 6px 20px rgba(0, 0, 0, 0.05); }
 .composer.incognito { background: color-mix(in srgb, var(--bg-elev) 92%, var(--fg) 8%); }
 .composer-input {
   display: block; width: 100%; min-height: 46px; max-height: 42vh; padding: 13px 15px 6px; border: 0; background: transparent; resize: none;

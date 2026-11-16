@@ -38,7 +38,9 @@ const elapsed = () => secs(Date.now() - T0);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class Skip extends Error {}
+class Check extends Error {} // an expected check failure (no stack trace in the output)
 const skip = (why) => { throw new Skip(why); };
+const fail = (why) => { throw new Check(why); };
 const results = [];
 
 async function step(n, name, fn, { optional = false, minLeftMs = 0 } = {}) {
@@ -53,7 +55,7 @@ async function step(n, name, fn, { optional = false, minLeftMs = 0 } = {}) {
     key = r.key || '';
   } catch (e) {
     status = e instanceof Skip ? 'SKIP' : 'FAIL';
-    key = e instanceof Skip ? e.message : `${e.message}${e.stack ? ` @ ${String(e.stack).split('\n')[1]?.trim()}` : ''}`;
+    key = e instanceof Skip || e instanceof Check ? e.message : `${e.message} @ ${String(e.stack || '').split('\n')[1]?.trim()}`;
   }
   console.log(clip(`=> ${status} (${secs(Date.now() - t)}) ${key}`, 400));
   results.push({ n, name, status, key, ms: Date.now() - t });
@@ -240,7 +242,7 @@ async function main() {
   // 1 ------------------------------------------------------------------------------------------
   await run(1, 'System info', async () => {
     const r = await api('GET', '/api/system?refresh=1');
-    if (r.status !== 200) throw new Error(`GET /api/system → ${r.status}`);
+    if (r.status !== 200) fail(`GET /api/system → ${r.status}`);
     const m = r.json.machine;
     say('machine', `${m.platform}/${m.arch}, ${m.chip}, ${m.cpus} cpus, ${gb(m.totalMemBytes)} RAM, tier ${m.ramTier}, safe budget ${gb(m.memoryBudget?.budgetBytes)} (${m.memoryBudget?.source})`);
     const o = r.json.providers.find((p) => p.id === 'ollama');
@@ -249,7 +251,7 @@ async function main() {
     say('protections', `inEffect ${pr?.inEffect}, external ${pr?.external ?? false}: ${pr?.message}`);
     say('kv/env Harness would set', j(pr?.wanted, 280));
     S.tier = m.ramTier;
-    if (o?.status !== 'running') throw new Error('Ollama is not reachable');
+    if (o?.status !== 'running') fail('Ollama is not reachable');
     const external = pr?.inEffect === false && pr?.external === true;
     return { key: `${m.platform}/${m.arch} ${gb(m.totalMemBytes)} tier ${m.ramTier} budget ${gb(m.memoryBudget?.budgetBytes)}; Ollama ${o.version}; protections ${external ? 'not in effect (external Ollama, as expected)' : `inEffect=${pr?.inEffect}`}`, status: external ? 'PASS' : 'WARN' };
   });
@@ -257,7 +259,7 @@ async function main() {
   // 2 ------------------------------------------------------------------------------------------
   await run(2, 'Recommended models for this machine', async () => {
     const r = await api('GET', '/api/models/recommended');
-    if (r.status !== 200) throw new Error(`→ ${r.status}`);
+    if (r.status !== 200) fail(`→ ${r.status}`);
     say('machine', j(r.json.machine));
     for (const m of r.json.models) {
       say(`model ${m.id}`, `suggested ${m.suggestedVariant}${m.largestRealisticVariant ? `, largestRealistic ${m.largestRealisticVariant}` : ''}${m.suggestTextOnly ? ', suggestTextOnly' : ''}, fitsThisMachine ${m.fitsThisMachine}, installed ${m.installed}`);
@@ -271,17 +273,17 @@ async function main() {
       if (m.avoid?.length) say('avoid', m.avoid.map((a) => a.model.split(':').pop()).join(', '));
       S.nemo = m;
     }
-    if (!S.nemo) throw new Error('no Nemotron entry');
+    if (!S.nemo) fail('no Nemotron entry');
     return { key: `suggested ${S.nemo.suggestedVariant}${S.nemo.largestRealisticVariant ? ` / largest realistic ${S.nemo.largestRealisticVariant}` : ''}, text-only ${!!S.nemo.suggestTextOnly}, fits ${S.nemo.fitsThisMachine}` };
   });
 
   // 3 ------------------------------------------------------------------------------------------
   await run(3, 'Pull the recommended Nemotron file through Harness', async () => {
     let why;
-    if (TAG_ENV) { S.tag = TAG_ENV; why = 'TAG from the environment'; } else if (S.nemo?.largestRealisticVariant) { S.tag = S.nemo.largestRealisticVariant; why = `the backend's "largest realistic" choice for this ${S.tier}-RAM machine (its comfortable suggestion would be ${S.nemo.suggestedVariant})`; } else if (S.nemo?.suggestedVariant) { S.tag = S.nemo.suggestedVariant; why = "the backend's suggestedVariant (largest that fits with a useful window)"; } else throw new Error('no tag to pull');
+    if (TAG_ENV) { S.tag = TAG_ENV; why = 'TAG from the environment'; } else if (S.nemo?.largestRealisticVariant) { S.tag = S.nemo.largestRealisticVariant; why = `the backend's "largest realistic" choice for this ${S.tier}-RAM machine (its comfortable suggestion would be ${S.nemo.suggestedVariant})`; } else if (S.nemo?.suggestedVariant) { S.tag = S.nemo.suggestedVariant; why = "the backend's suggestedVariant (largest that fits with a useful window)"; } else fail('no tag to pull');
     say('tag', `${S.tag} — ${why}`);
     const list = await api('GET', '/api/models?refresh=1');
-    if (list.json?.models?.some((m) => m.model === S.tag)) { say('already installed', 'skipping the download'); return { key: `${S.tag} already installed`, status: 'PASS' }; }
+    if (list.json?.models?.some((m) => m.model === S.tag)) { S.installed = true; say('already installed', 'skipping the download'); return { key: `${S.tag} already installed`, status: 'PASS' }; }
     let lastPrint = 0;
     let printed = 0;
     const r = await sse('POST', '/api/models/pull', { model: S.tag }, {
@@ -292,7 +294,8 @@ async function main() {
       },
     });
     const done = byType(r.events, 'done')[0];
-    if (!done) throw new Error(`pull did not finish: ${j(r.error || byType(r.events, 'error')[0])}`);
+    if (!done) fail(`pull did not finish: ${j(r.error || byType(r.events, 'error')[0])}`);
+    S.installed = true;
     const steps = byType(r.events, 'progress');
     const bytes = Math.max(0, ...steps.map((p) => p.total || 0));
     return { key: `${S.tag} pulled in ${secs(r.ms)} (${steps.length} progress events, largest layer ${mb(bytes)})` };
@@ -300,10 +303,10 @@ async function main() {
 
   // 4 ------------------------------------------------------------------------------------------
   await run(4, 'Create the text-only copy', async () => {
-    if (!S.tag) skip('nothing pulled');
+    needModel();
     const r = await api('POST', '/api/models/text-only', { model: S.tag }, { timeoutMs: 5 * MIN });
     say(`POST /api/models/text-only → ${r.status}`, j(r.json, 300));
-    if (r.status !== 201 && r.status !== 200) throw new Error(`${r.json?.error?.code}: ${r.json?.error?.message}`);
+    if (r.status !== 201 && r.status !== 200) fail(`${r.json?.error?.code}: ${r.json?.error?.message}`);
     S.copy = r.json.model;
     const info = await api('GET', `/api/models/info?model=${encodeURIComponent(S.copy)}`);
     say('copy info', `capabilities ${j(info.json?.info?.capabilities)}, size ${gb(info.json?.info?.sizeBytes)}, blobs ${info.json?.info?.blobs?.length}, hasProjector ${info.json?.info?.hasProjector}, ctx ${info.json?.info?.contextLength} (${info.json?.info?.contextLengthSource})`);
@@ -320,19 +323,21 @@ async function main() {
   });
 
   const model = () => ({ providerId: 'ollama', model: S.copy || S.tag });
+  const needModel = () => { if (!S.installed) skip('no installed Nemotron model (step 3/4 failed)'); };
+  const needChat = () => { needModel(); if (!S.chatOk) skip('the plain chat turn (step 6) did not work'); };
 
   // 5 ------------------------------------------------------------------------------------------
   const showPlan = async (label) => {
     const r = await api('GET', `/api/models/context?model=${encodeURIComponent(model().model)}`, undefined, { timeoutMs: 2 * MIN });
     const p = r.json?.contextPlan;
-    if (!p) throw new Error(`no plan: ${j(r.json)}`);
+    if (!p) fail(`no plan: ${j(r.json)}`);
     say(`${label}`, `numCtx ${p.numCtx}, limitedBy ${p.limitedBy}, basis ${p.memory?.basis}, kv ${p.memory?.kvCacheType}/${p.memory?.kvCacheTypeSource}, est. ${gb(p.memory?.estimatedTotalBytes)} of budget ${gb(p.memory?.budgetBytes)}, contextCheap ${p.memory?.contextCheap}${p.memory?.pressure ? `, pressure ${j(p.memory.pressure, 160)}` : ''}`);
     say('explanation', p.explanation);
     for (const w of p.warnings || []) say(`warning ${w.code}`, w.message);
     return p;
   };
   await run(5, 'Context plan for the copy on this machine', async () => {
-    if (!S.copy && !S.tag) skip('no model');
+    needModel();
     S.plan0 = await showPlan('plan');
     return { key: `numCtx ${S.plan0.numCtx}, ${S.plan0.limitedBy}, basis ${S.plan0.memory?.basis}, warnings ${(S.plan0.warnings || []).map((w) => w.code).join(',') || 'none'}` };
   });
@@ -340,7 +345,7 @@ async function main() {
   // A chat with tiny prompts and replies (the virtual GPU is slow): short system prompt, tools off, small num_predict.
   const newChat = async (settings, title) => {
     const r = await api('POST', '/api/chats', { ...(title ? { title } : {}), settings: { model: model(), systemPrompt: 'You are a concise assistant. Answer briefly.', tools: { enabled: false }, params: { num_predict: 48, temperature: 0.7 }, ...settings } });
-    if (r.status !== 201) throw new Error(`create chat → ${r.status} ${j(r.json)}`);
+    if (r.status !== 201) fail(`create chat → ${r.status} ${j(r.json)}`);
     return r.json.chat.id;
   };
   const send = async (chatId, content, label, timeoutMs = 10 * MIN) => {
@@ -350,12 +355,13 @@ async function main() {
 
   // 6 ------------------------------------------------------------------------------------------
   await run(6, 'Plain chat turn (SSE) + resulting measurement', async () => {
-    if (!S.copy && !S.tag) skip('no model');
+    needModel();
     S.chat1 = await newChat({});
     const r = await send(S.chat1, 'Hi! My name is Ada and I live in Lisbon. Reply with one short sentence.', 'turn 1');
     const done = printTurn(r, 'turn 1');
     S.turn1 = r;
-    if (!done) throw new Error(`no done: ${j(r.error || byType(r.events, 'error')[0])}`);
+    if (!done) fail(`no done: ${j(r.error || byType(r.events, 'error')[0])}`);
+    S.chatOk = true;
     const meas = await api('GET', `/api/models/measurements?model=${encodeURIComponent(model().model)}`);
     const samples = meas.json?.samples || [];
     say('measurements', `${samples.length} sample(s), basis ${meas.json?.basis}, loadedNumCtx ${meas.json?.loadedNumCtx}`);
@@ -369,10 +375,10 @@ async function main() {
 
   // 7 ------------------------------------------------------------------------------------------
   await run(7, 'Second turn in the same chat (prompt cache, calibration)', async () => {
-    if (!S.chat1) skip('no chat from step 6');
+    needChat();
     const r = await send(S.chat1, 'Now one short sentence about snow.', 'turn 2');
     const done = printTurn(r, 'turn 2');
-    if (!done) throw new Error(`no done: ${j(r.error || byType(r.events, 'error')[0])}`);
+    if (!done) fail(`no done: ${j(r.error || byType(r.events, 'error')[0])}`);
     const c1 = byType(S.turn1.events, 'context')[0]?.calibration;
     const c2 = byType(r.events, 'context')[0]?.calibration;
     const ctx = await api('GET', `/api/chats/${S.chat1}/context`);
@@ -385,7 +391,7 @@ async function main() {
 
   // 8 ------------------------------------------------------------------------------------------
   await run(8, '"Draw me a red fox in the snow." — the model calls generate_image', async () => {
-    if (!S.copy && !S.tag) skip('no model');
+    needModel();
     const reg = await api('POST', '/api/images/providers', { name: 'Draw Things (stand-in)', kind: 'a1111', baseUrl: a1111.url });
     say('image provider', `${reg.status} ${reg.json?.provider?.id} ${reg.json?.provider?.status}`);
     const chat = await newChat({ tools: { enabled: true, builtin: { generate_image: true, remember: false, recall: false, get_current_time: false, calculate: false, fetch_url: false } }, params: { num_predict: 96, temperature: 0.7 } });
@@ -402,9 +408,9 @@ async function main() {
     if (idone) say('image_done', `chatModelUnloaded ${idone.chatModelUnloaded}, reload ${idone.reload}, memory ${j(idone.job?.memory, 220)}`);
     const tr = byType(r.events, 'tool_result')[0];
     if (tr) say('tool_result', clip(tr.content, 200));
-    if (!call) throw new Error(`the model did not call a tool (${byType(r.events, 'done')[0] ? 'answered in text' : j(r.error || byType(r.events, 'error')[0])})`);
-    if (call.toolCall.name !== 'generate_image') throw new Error(`called ${call.toolCall.name}`);
-    if (!img) throw new Error('no image event');
+    if (!call) fail(`the model did not call a tool (${byType(r.events, 'done')[0] ? 'answered in text' : j(r.error || byType(r.events, 'error')[0])})`);
+    if (call.toolCall.name !== 'generate_image') fail(`called ${call.toolCall.name}`);
+    if (!img) fail('no image event');
     const file = await api('GET', img.url, undefined, { raw: true });
     const b = file.buf || Buffer.alloc(0);
     const png = b.length > 24 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) && b.subarray(12, 16).toString('latin1') === 'IHDR';
@@ -412,14 +418,14 @@ async function main() {
     const h = png ? b.readUInt32BE(20) : null;
     say('image bytes', `GET ${img.url} → ${file.status}, ${b.length} B, ${file.headers?.['content-type']}, PNG ${png}${png ? ` ${w}×${h}` : ''}`);
     const done = byType(r.events, 'done')[0];
-    if (!png) throw new Error('image bytes are not a valid PNG');
-    if (!done) throw new Error(`image generated but the turn did not finish: ${j(r.error || byType(r.events, 'error')[0])}`);
+    if (!png) fail('image bytes are not a valid PNG');
+    if (!done) fail(`image generated but the turn did not finish: ${j(r.error || byType(r.events, 'error')[0])}`);
     return { key: `${secs(r.ms)}; args ${j(call.toolCall.arguments, 80)}; phases ${byType(r.events, 'image_status').map((e) => e.phase).join('>')}; PNG ${w}×${h}; final ${done.message?.fallback ? `fallback ${done.message.fallback}` : 'text'}: "${clip(done.message?.content, 60)}"` };
   });
 
   // 9 ------------------------------------------------------------------------------------------
   await step(9, 'Thinking on, then off', async () => {
-    if (!S.copy && !S.tag) skip('no model');
+    needChat();
     const chat = await newChat({ reasoning: { think: 'on' }, params: { num_predict: 160, temperature: 0.6 } });
     const on = await send(chat, 'What is 17+25? Answer with only the number.', 'think on', 8 * MIN);
     printTurn(on, 'think on');
@@ -436,15 +442,18 @@ async function main() {
 
   // 10 -----------------------------------------------------------------------------------------
   await step(10, 'Auto-title and memory extraction (background)', async () => {
-    if (!S.chat1) skip('no chat from step 6');
+    needChat();
     const deadline = Math.min(Date.now() + 7 * MIN, T0 + BUDGET_MS - 2 * MIN);
     let bg = null;
     let chat = null;
+    let idlePolls = 0;
     for (;;) {
       bg = (await api('GET', '/api/system', undefined, { timeoutMs: 30000 })).json?.background;
       chat = (await api('GET', `/api/chats/${S.chat1}`)).json?.chat;
       const idle = !bg?.running && !(bg?.pending || []).length;
-      if ((idle && chat?.titleSource === 'auto') || Date.now() > deadline) break;
+      idlePolls = idle ? idlePolls + 1 : 0;
+      // done when the queue is idle and the title arrived — or idle for 30 s (nothing more is coming)
+      if ((idle && chat?.titleSource === 'auto') || idlePolls >= 6 || Date.now() > deadline) break;
       await sleep(5000);
     }
     const titleEv = bus.find((e) => e.type === 'chat.updated' && e.chat?.id === S.chat1 && e.chat?.titleSource === 'auto');
@@ -463,7 +472,7 @@ async function main() {
 
   // 11 -----------------------------------------------------------------------------------------
   await step(11, 'Forced compaction on a tiny window', async () => {
-    if (!S.copy && !S.tag) skip('no model');
+    needChat();
     // 512 is the API minimum, but its 128-token prompt budget leaves the summarizer no room; 1024 keeps it fast.
     const chat = await newChat({ context: { mode: 1024 }, params: { num_predict: 8, temperature: 0.5 }, memory: { enabled: false }, recall: { enabled: false } });
     const filler = (i) => `Note ${i}: the lighthouse keeper logs wind, rain, ships and gulls every hour; today the wind was strong from the north-west, two fishing boats came back early, and the lamp was cleaned twice. Reply with just OK.`;
@@ -480,7 +489,7 @@ async function main() {
         if (c.status === 'failed') say('compaction failed', `${c.error} (fallback ${c.fallback})`);
       }
     }
-    if (!compacted) throw new Error('compaction did not complete within the bound');
+    if (!compacted) fail('compaction did not complete within the bound');
     return { key: `${compacted.messages} messages → summary of ${compacted.summary?.tokens} tok in ${compacted.calls} call(s); used ${compacted.usedBefore} → ${compacted.usedAfter}` };
   }, { optional: true, minLeftMs: 4 * MIN });
 

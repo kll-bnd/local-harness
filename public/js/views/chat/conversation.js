@@ -38,11 +38,19 @@ export class ConversationView {
     this.el = h('div.conversation', this.scroller, this.jump);
     this.divider = null;
 
+    // Safari/WebKit has no CSS scroll anchoring: when a placeholder above the viewport turns into a real
+    // turn of a different height, keep what the reader is looking at in place by hand.
+    const anchoring = typeof CSS !== 'undefined' && CSS.supports?.('overflow-anchor', 'auto');
     this.io = new IntersectionObserver((entries) => {
       for (const e of entries) {
         if (!e.isIntersecting) continue;
         const tv = this.turns.get(e.target.dataset.turn);
-        if (tv && !tv.materialized) { tv.materialize(); this.io.unobserve(e.target); }
+        if (!tv || tv.materialized) continue;
+        const above = !anchoring && e.boundingClientRect.bottom <= (e.rootBounds?.top ?? 0);
+        const before = above ? tv.el.offsetHeight : 0;
+        tv.materialize();
+        this.io.unobserve(e.target);
+        if (above) this.scroller.scrollTop += tv.el.offsetHeight - before;
       }
     }, { root: this.scroller, rootMargin: '1600px 0px' });
 

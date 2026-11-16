@@ -73,7 +73,13 @@ export const FAKE_OLLAMA_MODELS = {
   },
 };
 
-const PULLABLE = { 'llama3.2:3b': { family: 'llama', params: '3.2B', quant: 'Q4_K_M', size: 2.0e9, caps: ['completion', 'tools'], info: { 'general.architecture': 'llama', 'llama.context_length': 131072, 'llama.block_count': 28, 'llama.embedding_length': 3072, 'llama.attention.head_count': 24, 'llama.attention.head_count_kv': 8 } }, 'nomic-embed-text:latest': { family: 'nomic-bert', params: '137M', quant: 'F16', size: 0.27e9, caps: ['embedding'], info: { 'general.architecture': 'nomic-bert', 'nomic-bert.context_length': 2048, 'nomic-bert.pooling_type': 1 } } };
+// Every real UD-* Nemotron quant (model layer sizes from the registry; each also pulls a 946 MiB projector).
+const NEMO_UD = Object.fromEntries([['UD-Q4_K_XL', 4826, 'Q4_K_M'], ['UD-Q2_K_XL', 3569, 'Q2_K'], ['UD-IQ3_XXS', 3532, 'IQ3_XXS'], ['UD-IQ2_M', 3368, 'IQ2_M']].map(([tag, layerMiB, quant]) => [
+  `hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:${tag}`,
+  { ...FAKE_OLLAMA_MODELS['hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL'], quant, blobs: [{ kind: 'model', size: layerMiB * MiB }, { kind: 'projector', size: 946 * MiB }] },
+]));
+
+const PULLABLE = { ...NEMO_UD,  'llama3.2:3b': { family: 'llama', params: '3.2B', quant: 'Q4_K_M', size: 2.0e9, caps: ['completion', 'tools'], info: { 'general.architecture': 'llama', 'llama.context_length': 131072, 'llama.block_count': 28, 'llama.embedding_length': 3072, 'llama.attention.head_count': 24, 'llama.attention.head_count_kv': 8 } }, 'nomic-embed-text:latest': { family: 'nomic-bert', params: '137M', quant: 'F16', size: 0.27e9, caps: ['embedding'], info: { 'general.architecture': 'nomic-bert', 'nomic-bert.context_length': 2048, 'nomic-bert.pooling_type': 1 } } };
 
 const norm = (name) => (name && !name.includes(':') ? `${name}:latest` : name);
 

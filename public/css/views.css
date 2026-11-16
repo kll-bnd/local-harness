@@ -174,7 +174,7 @@ html.ready .boot-splash { display: none; }
 
 /* ---- palette */
 .palette { border: 0; padding: 0; width: min(620px, calc(100vw - 32px)); margin: 12vh auto auto; border-radius: var(--r-lg); background: var(--bg-elev); color: var(--fg); box-shadow: var(--shadow-panel); overflow: hidden; }
-.palette::backdrop { background: var(--bg-backdrop); }
+.palette::backdrop { background: var(--bg-backdrop, rgba(20, 20, 22, 0.3)); }
 .palette[open] { animation: dialog-in 140ms var(--ease); }
 .palette-head { display: flex; align-items: center; gap: 10px; padding: 0 16px; border-bottom: 0.5px solid var(--rule); color: var(--fg-3); }
 .palette-input { flex: 1; height: 50px; border: 0; background: transparent; font-size: 15px; outline: none; color: var(--fg); }

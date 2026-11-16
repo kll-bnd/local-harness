@@ -29,7 +29,7 @@ test('first run without models: setup recommends a model for 8 GB and downloads 
     await page.waitForFunction(() => /1 chat model installed/.test(document.querySelector('.setup-page')?.textContent || ''), null, { timeout: 20000 });
     await page.locator('.page-head button', { hasText: 'Start chatting' }).click();
     await page.waitForFunction(() => location.hash === '#/chat');
-    await page.waitForFunction(() => /llama3\.2/i.test(document.querySelector('.intro-model')?.textContent || ''));
+    await page.waitForFunction(() => /llama ?3\.2/i.test(document.querySelector('.intro-model')?.textContent || ''));
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });

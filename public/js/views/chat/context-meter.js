@@ -90,6 +90,7 @@ export function contextPanel(ctx, plan, opts = {}) {
       h('h3.section-title', 'Why this size'),
       h(`div.callout${warn ? '.warn' : ''}.ctx-explain`, h('span', plan.explanation)),
       plan.contextNote ? h('p.faint.small', plan.contextNote) : null,
+      plan.memory?.contextCheap && !/cheap|file size|model file/i.test(plan.explanation || '') ? h('p.small.ctx-cheap', `With this model the window itself is cheap (${fmtTokens(plan.numCtx)} ≈ ${fmtBytes(plan.memory.kvBytes)}); the model file (${fmtBytes(plan.memory.modelBytes)}) is what limits this machine.`) : null,
       warningList(plan, opts),
       opts.onMode ? modeControl(plan, opts) : null,
       opts.maxPlan ? maxCost(plan, opts.maxPlan) : null,
