@@ -236,6 +236,9 @@ async function main() {
   const pre = await api('PATCH', '/api/settings', { providers: { autodetect: false }, memory: { extractDelayMs: 1000 }, compaction: { maxSummaryTokens: 64 } });
   if (pre.status !== 200) say('settings patch failed', j(pre.json));
 
+  const model = () => ({ providerId: 'ollama', model: S.copy || S.tag });
+  const needModel = () => { if (!S.installed) skip('no installed Nemotron model (step 3 failed)'); };
+  const needChat = () => { needModel(); if (!S.chatOk) skip('the plain chat turn (step 6) did not work'); };
   const critical = [];
   const run = async (n, name, fn, opts) => { const st = await step(n, name, fn, opts); if (n <= 8) critical.push(st); return st; };
 
@@ -322,9 +325,6 @@ async function main() {
     return { key: `${S.copy} (${r.json.created ? 'created' : 'existed'}, template ${r.json.template}, caps ${(r.json.capabilities || []).join('/')}); ${note}`, status };
   });
 
-  const model = () => ({ providerId: 'ollama', model: S.copy || S.tag });
-  const needModel = () => { if (!S.installed) skip('no installed Nemotron model (step 3/4 failed)'); };
-  const needChat = () => { needModel(); if (!S.chatOk) skip('the plain chat turn (step 6) did not work'); };
 
   // 5 ------------------------------------------------------------------------------------------
   const showPlan = async (label) => {
@@ -426,6 +426,8 @@ async function main() {
   // 9 ------------------------------------------------------------------------------------------
   await step(9, 'Thinking on, then off', async () => {
     needChat();
+    const caps = (await api('GET', `/api/models/info?model=${encodeURIComponent(model().model)}`)).json?.info?.capabilities || [];
+    if (!caps.includes('thinking')) skip(`${model().model} lists no "thinking" capability (${caps.join('/')}) — Harness never sends think:true to it`);
     const chat = await newChat({ reasoning: { think: 'on' }, params: { num_predict: 160, temperature: 0.6 } });
     const on = await send(chat, 'What is 17+25? Answer with only the number.', 'think on', 8 * MIN);
     printTurn(on, 'think on');
