@@ -30,7 +30,7 @@ about 4.5 GB).
 1. **Get Harness.** In Terminal:
 
    ```bash
-   git clone <repository-url> harness
+   git clone https://github.com/kll-bnd/local-harness.git harness
    cd harness
    ```
 
