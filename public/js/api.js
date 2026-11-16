@@ -72,6 +72,9 @@ export function transport(req) {
 /** Observers of every response (security gate: 401 auth_required / 423 locked → lock screen). */
 const responseHooks = new Set();
 export function onApiError(fn) { responseHooks.add(fn); return () => responseHooks.delete(fn); }
+/** Observers of every request sent (method, path) — e.g. to know when Harness last saw the user act. */
+const requestHooks = new Set();
+export function onApiRequest(fn) { requestHooks.add(fn); return () => requestHooks.delete(fn); }
 
 const textEncoder = new TextEncoder();
 
@@ -107,6 +110,7 @@ async function send(method, path, { body, signal, headers = {}, keepalive = fals
     else if (body instanceof Blob) payload = new Uint8Array(await body.arrayBuffer());
     else { payload = textEncoder.encode(JSON.stringify(body)); h['content-type'] = 'application/json'; }
   }
+  for (const fn of requestHooks) { try { fn(method, path); } catch { /* observer failed */ } }
   try {
     return await transport({ method, path, headers: h, body: payload, signal: signal || new AbortController().signal, keepalive });
   } catch (e) {
@@ -243,6 +247,8 @@ export const security = {
   setMode: ({ password, mode }) => post('/api/security/mode', { password, mode }),
   /** → { confirmation, expiresAt }: a single-use X-Harness-Confirm value (2 minutes). */
   confirm: (password) => post('/api/security/confirm', { password }),
+  /** The user is here (pointer, keys…): keeps Harness from auto-locking. → { ok, idleLockAt } */
+  activity: () => post('/api/security/activity', {}),
 };
 
 export const auth = {
@@ -267,7 +273,8 @@ export const backup = {
 
 // ------------------------------------------------------------------------------------------------ 10.6
 export const network = {
-  get: () => get('/api/network'),
+  /** → the offlineLock status (the backend answers { offlineLock: {…} }). */
+  get: () => get('/api/network').then((r) => r?.offlineLock || r),
   /** minutes 1–120; needs the password. → { offlineLock, restartRequired } */
   allow: ({ minutes = 15, password }) => post('/api/network/allow', { minutes, password }),
   block: () => post('/api/network/block', {}),

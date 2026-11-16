@@ -88,6 +88,9 @@ export function registerSecurityRoutes(r, core) {
     return core.rekey({ password: body.password, header: confirmHeader(req), sessionHash: auth.sessionHash });
   });
 
+  // The explicit "the user is here" signal (at most once a minute while the user interacts; data-free).
+  r.post('/api/security/activity', () => core.touch());
+
   r.post('/api/security/confirm', async ({ req, auth }) => {
     const body = await readJson(req);
     if (!core.vault.hasPassword) throw new HttpError(409, 'no_password', 'Harness has no password; nothing needs confirming.');

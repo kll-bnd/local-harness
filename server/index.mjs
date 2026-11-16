@@ -46,8 +46,9 @@ function buildCoreRouter(core) {
   return r;
 }
 
-// Requests that do not keep Harness awake (status polling, the event stream).
-const PASSIVE = /^(GET \/api\/(health|security|auth\/status|events|network))$/;
+// Passive, long-lived or automatic requests: never activity for the idle lock and never holding it open
+// (docs/API.md §10.3). Everything else the UI sends counts as the user being there.
+const PASSIVE = /^(GET \/api\/(health|security|auth\/status|events|network)|POST \/api\/network\/test)$/;
 
 /**
  * The request handler shared by the HTTP listener and the bridge (`bridge: true` skips the Host/Origin checks and
@@ -78,9 +79,11 @@ export function makeHandler(core, { bridge = false } = {}) {
       }
     }
     if (url.pathname.startsWith('/api/')) {
-      const done = core.requestStarted(!PASSIVE.test(`${req.method} ${url.pathname}`));
-      res.once('close', done);
-      res.once('finish', done);
+      if (!PASSIVE.test(`${req.method} ${url.pathname}`)) {
+        const done = core.requestStarted();
+        res.once('close', done);
+        res.once('finish', done);
+      }
       try {
         let m = coreRouter.match(req.method, url.pathname);
         let app = null;

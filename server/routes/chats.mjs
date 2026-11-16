@@ -71,7 +71,7 @@ async function streamTurn(ctx, chat, { prepare, modelRef }) {
   } catch (e) {
     app.engine.release(chat.id, reservation);
     if (!sse) throw e;
-    sse.send('error', { code: e.code || 'internal_error', message: e.message });
+    sse.send('error', { code: e.code || 'internal_error', message: e.message, ...(e.code === 'offline_lock' && e.details ? { details: e.details } : {}) });
   } finally {
     app.engine.release(chat.id, reservation);
     sse?.end();

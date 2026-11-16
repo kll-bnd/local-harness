@@ -10,6 +10,7 @@
 //          caller abort         → the signal's reason (DOMException name 'AbortError')
 import http from 'node:http';
 import https from 'node:https';
+import { assertEgress } from '../security/egress.mjs';
 
 const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 10000, maxSockets: 32 });
 const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 10000, maxSockets: 32 });
@@ -70,10 +71,14 @@ function connectError(err, url) {
  * @param {AbortSignal} [o.signal]   the only timeout mechanism (abort/timeout at any stage, incl. while streaming)
  * @param {Function} [o.lookup]      custom DNS lookup (fetch_url pins the vetted address)
  * @param {object} [o.agent]         override agent (false = no keep-alive)
+ * @param {string} [o.egress]        what this request is for, in an offline_lock refusal (docs/API.md §10.6)
  * @returns {Promise<HttpResponse>}
  */
-export function httpRequest(input, { method = 'GET', headers = {}, body, signal, lookup, agent } = {}) {
+export function httpRequest(input, { method = 'GET', headers = {}, body, signal, lookup, agent, egress = 'other' } = {}) {
   const url = input instanceof URL ? input : new URL(input);
+  // The single outbound choke point: a non-local destination is refused while internet access is blocked,
+  // before any name resolution.
+  try { assertEgress(url, egress); } catch (e) { return Promise.reject(e); }
   const isHttps = url.protocol === 'https:';
   if (!isHttps && url.protocol !== 'http:') return Promise.reject(new Error(`Unsupported protocol ${url.protocol}`));
   const mod = isHttps ? https : http;

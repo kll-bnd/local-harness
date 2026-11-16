@@ -11,6 +11,7 @@ import { withTimeout } from './util.mjs';
  */
 export function mapBackendError(e, target, path, { userSignal, signal, timeoutMs } = {}) {
   if (e instanceof ProviderError) return e;
+  if (e?.code === 'offline_lock') return e; // internet access blocked: the 403 with the "allow" hint goes through
   const timedOut = isTimeoutError(e) || signal?.reason?.name === 'TimeoutError' || userSignal?.reason?.name === 'TimeoutError';
   if (timedOut) {
     const secs = timeoutMs ? ` after ${Math.round(timeoutMs / 1000)} s` : '';
@@ -25,13 +26,13 @@ export function mapBackendError(e, target, path, { userSignal, signal, timeoutMs
  * @param {{baseUrl, name, id, apiKey?}} target
  * @returns {Promise<import('./http-client.mjs').HttpResponse>}
  */
-export async function backendFetch(target, path, { method = 'GET', headers = {}, body, rawBody, signal, timeoutMs } = {}) {
+export async function backendFetch(target, path, { method = 'GET', headers = {}, body, rawBody, signal, timeoutMs, egress } = {}) {
   const sig = withTimeout(signal, timeoutMs);
   const h = { ...headers };
   if (body !== undefined && !h['content-type']) h['content-type'] = 'application/json';
   if (target.apiKey) h.authorization = `Bearer ${target.apiKey}`;
   try {
-    return await httpRequest(target.baseUrl + path, { method, headers: h, body: rawBody ?? (body !== undefined ? JSON.stringify(body) : undefined), signal: sig });
+    return await httpRequest(target.baseUrl + path, { method, headers: h, body: rawBody ?? (body !== undefined ? JSON.stringify(body) : undefined), signal: sig, egress: egress || 'remote_provider' });
   } catch (e) {
     throw mapBackendError(e, target, path, { userSignal: signal, signal: sig, timeoutMs });
   }

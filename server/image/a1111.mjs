@@ -26,7 +26,7 @@ export class A1111Provider {
   async status() {
     const probe = async (path) => {
       try {
-        const res = await backendFetch(this, path, { timeoutMs: 1500 });
+        const res = await backendFetch(this, path, { timeoutMs: 1500, egress: 'remote_image_provider' });
         const text = (await res.text()).slice(0, 500000);
         let json = null;
         if (/^\s*[{[]/.test(text)) { try { json = JSON.parse(text); } catch { /* not JSON */ } }

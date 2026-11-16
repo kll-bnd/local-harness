@@ -249,7 +249,7 @@ export function formatRecoveryKey(bytes) {
 
 /** Parse a typed recovery key (case, spaces and dashes ignored; I/L → 1, O → 0). null when malformed. */
 export function parseRecoveryKey(text) {
-  let s = String(text || '').toUpperCase().replace(/[\s-]/g, '');
+  let s = String(text || '').toUpperCase().replace(/[\s-]/g, '').replace(/^HRK[IL]/, 'HRK1');
   if (!s.startsWith('HRK1')) return null;
   s = s.slice(4).replace(/[IL]/g, '1').replace(/O/g, '0');
   if (s.length !== 52) return null;

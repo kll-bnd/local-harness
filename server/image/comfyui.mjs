@@ -1,6 +1,7 @@
 // ComfyUI backend: queue an API-format workflow (built-in template or user-supplied with {{placeholders}}),
 // track progress over the /ws WebSocket when available, poll /history, fetch outputs from /view.
 import crypto from 'node:crypto';
+import { egressBlocked } from '../security/egress.mjs';
 import { imageJson, imageRequest, sniffImageMime, formatNodeErrors } from './http.mjs';
 import { ProviderError } from '../lib/errors.mjs';
 import { sleep } from '../lib/util.mjs';
@@ -108,6 +109,7 @@ export class ComfyUIProvider {
     if (typeof WebSocket !== 'function') return null;
     try {
       const wsUrl = this.baseUrl.replace(/^http/, 'ws') + `/ws?clientId=${clientId}`;
+      if (egressBlocked(wsUrl)) return null; // progress only; the job itself is refused with offline_lock
       const ws = new WebSocket(wsUrl);
       ws.onmessage = (ev) => {
         if (typeof ev.data !== 'string') return; // binary preview frames

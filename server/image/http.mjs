@@ -3,7 +3,7 @@ import { ProviderError } from '../lib/errors.mjs';
 import { backendFetch } from '../lib/backend-http.mjs';
 
 export async function imageRequest(provider, path, { method = 'GET', body, rawBody, headers = {}, signal, timeoutMs, accept404 = false } = {}) {
-  const res = await backendFetch(provider, path, { method, body, rawBody, headers, signal, timeoutMs });
+  const res = await backendFetch(provider, path, { method, body, rawBody, headers, signal, timeoutMs, egress: 'remote_image_provider' });
   if (accept404 && res.status === 404) { res.cancel(); return null; }
   if (!res.ok) {
     const text = await res.text().catch(() => '');

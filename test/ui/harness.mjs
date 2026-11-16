@@ -16,6 +16,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { startFakeOllama } from '../fake-ollama.mjs';
 import { startFakeA1111 } from '../fake-a1111.mjs';
+import { startFakeCatalog } from './fake-catalog.mjs';
 import { startServer } from '../../server/index.mjs';
 import { deepMerge } from '../../server/lib/util.mjs';
 
@@ -54,11 +55,19 @@ export function freePort() {
  * @param {boolean} [o.offlineLock]    override the internet blocker (secure stacks default to on)
  * @param {(dir: string) => Promise} [o.prepare]  write files into the data dir before the server starts
  * @param {string} [o.reuseDataDir]    start on an existing data dir (e.g. one an opt-out stack left as 0.1 did)
+ * @param {boolean} [o.catalog=false]  run a fake Hugging Face + ollama.com (the model catalogue's sources)
  */
-export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false, secure = false, offlineLock, prepare, reuseDataDir = null } = {}) {
+export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false, secure = false, offlineLock, prepare, reuseDataDir = null, catalog = false } = {}) {
   const dataDir = reuseDataDir || await fs.mkdtemp(path.join(os.tmpdir(), 'harness-ui-'));
   const fake = ollama ? await startFakeOllama({ port: 0, delayMs, models, pullStepMs }) : null;
   const a1111 = image ? await startFakeA1111({ port: 0, stepMs, drawThings: true }) : null;
+  const catalogFake = catalog ? await startFakeCatalog() : null;
+  if (catalogFake) {
+    // The backend reads these on every catalogue request (tests in one file run one at a time).
+    process.env.HARNESS_CATALOG_HF_BASE = catalogFake.url;
+    process.env.HARNESS_CATALOG_HF_REGISTRY = catalogFake.url;
+    process.env.HARNESS_CATALOG_OLLAMA_BASE = catalogFake.url;
+  }
   let ollamaUrl = fake?.url || `http://127.0.0.1:${await freePort()}`;
   const extra = {};
   let binDir = null;
@@ -93,19 +102,29 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
     return { status: res.status, data: ct.includes('json') ? await res.json() : await res.text() };
   };
   const stack = {
-    url: srv.url, dataDir, fake, a1111, srv, api, secure,
+    url: srv.url, dataDir, fake, a1111, srv, api, secure, catalog: catalogFake,
     /** Secure stacks: choose the password from outside the UI (→ the recovery key); stack.api() then has a session. */
     async setupPassword(password) {
-      const r = await api('POST', '/api/security/setup', { password });
+      const r = await api('POST', '/api/security/setup', { password, session: 'token' });
       if (r.status !== 200) throw new Error(`setup failed: ${r.status} ${JSON.stringify(r.data)}`);
       token = r.data.sessionToken || null;
+      await stack.waitUnlocked();
       return r.data;
+    },
+    /** Wait until a migration (encrypting existing files) is over. */
+    async waitUnlocked(timeout = 20000) {
+      const t0 = Date.now();
+      while ((await api('GET', '/api/security')).data.state === 'migrating') {
+        if (Date.now() - t0 > timeout) throw new Error('still migrating');
+        await sleep(100);
+      }
     },
     /** Secure stacks: give stack.api() a session by unlocking (also unlocks a locked Harness). */
     async unlock(password) {
-      const r = await api('POST', '/api/security/unlock', { password });
+      const r = await api('POST', '/api/security/unlock', { password, session: 'token' });
       if (r.status !== 200) throw new Error(`unlock failed: ${r.status} ${JSON.stringify(r.data)}`);
       token = r.data.sessionToken || token;
+      await stack.waitUnlocked();
       return r.data;
     },
     setToken(t) { token = t; },
@@ -121,6 +140,10 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
       await stack.srv.close().catch(() => {});
       await fake?.close().catch(() => {});
       await a1111?.close().catch(() => {});
+      if (catalogFake) {
+        await catalogFake.close().catch(() => {});
+        for (const k of ['HARNESS_CATALOG_HF_BASE', 'HARNESS_CATALOG_HF_REGISTRY', 'HARNESS_CATALOG_OLLAMA_BASE']) if (process.env[k] === catalogFake.url) delete process.env[k];
+      }
       await fs.rm(dataDir, { recursive: true, force: true }).catch(() => {});
       if (binDir) await fs.rm(binDir, { recursive: true, force: true }).catch(() => {});
     },

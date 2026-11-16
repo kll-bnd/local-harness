@@ -164,6 +164,7 @@ export class Core extends EventEmitter {
       unlock: { failedAttempts: this.vault.meta?.throttle?.failures || 0, retryAfterMs: this.vault.exists ? this.vault.retryAfterMs() : 0, ...(this.keychainError ? { keychainError: this.keychainError } : {}) },
       recoveryKey: rk ? { createdAt: rk.createdAt } : null,
       idleLockMinutes: this.idleLockMinutes(),
+      idleLockAt: this.idleLockAt(),
       session: authInfo ? { authenticated: !!authInfo.authenticated, via: authInfo.via || null } : { authenticated: false, via: null },
       transport: this.transport,
       offlineLock: this.network.status(),
@@ -569,11 +570,23 @@ export class Core extends EventEmitter {
   }
 
   // ------------------------------------------------------------------------------------------ activity / idle
-  requestStarted(isActivity = true) {
+  /** A user-initiated request (passive ones are not counted at all): activity, and open until it ends. */
+  requestStarted() {
     this.inflight++;
-    if (isActivity) this.lastActivity = Date.now();
+    this.lastActivity = Date.now();
     let done = false;
-    return () => { if (!done) { done = true; this.inflight--; if (isActivity) this.lastActivity = Date.now(); } };
+    return () => { if (!done) { done = true; this.inflight--; this.lastActivity = Date.now(); } };
+  }
+
+  /** POST /api/security/activity: "the user is here". */
+  touch() { this.lastActivity = Date.now(); return { ok: true, idleLockAt: this.idleLockAt() }; }
+
+  /** When Harness would lock if nothing else happens (null: idle lock off, not applicable, or work is running). */
+  idleLockAt() {
+    if (this.state !== 'unlocked' || this.mode !== 'password' || !this.vault.encrypted) return null;
+    const min = this.idleLockMinutes();
+    if (!min || this.inflight > 0 || this._busy()) return null;
+    return new Date(this.lastActivity + min * 60000).toISOString();
   }
 
   _startIdleTimer() {

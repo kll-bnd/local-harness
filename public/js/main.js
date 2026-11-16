@@ -21,6 +21,7 @@ import { getUi, setUi, flushUiState, migrateBrowserStorage, clearUiState } from 
 import { lockdown, onLockdown, isLockError, isLockingDown } from './lockdown.js';
 import { setSecurityContext } from './security-ui.js';
 import { applyNetworkStatus, startNetworkClock } from './views/network.js';
+import { startIdleWatch, stopIdleWatch } from './views/idle.js';
 
 const desktop = window.harnessDesktop || null;
 const root = document.getElementById('app');
@@ -382,23 +383,13 @@ const refreshOnReturn = () => {
 document.addEventListener('visibilitychange', refreshOnReturn);
 window.addEventListener('focus', refreshOnReturn);
 
-// The idle lock counts requests. Someone reading or scrolling is not idle, so while they interact a light
-// request is sent at most once a minute (GET /api/ui-state: status routes like /api/auth/status are passive and
-// do not count as activity).
-let lastBeat = Date.now();
-const heartbeat = () => {
-  if (document.hidden || isLockingDown()) return;
-  const now = Date.now();
-  if (now - lastBeat < 60000) return;
-  lastBeat = now;
-  api.uiState.get().catch(() => {});
-};
-for (const t of ['pointerdown', 'keydown', 'wheel', 'touchstart']) window.addEventListener(t, heartbeat, { capture: true, passive: true });
+// Auto-lock: the page tells Harness when the user is actually here (views/idle.js).
 
 // ------------------------------------------------------------------------------------------------ lock
 // Any request answered "locked" / "not signed in" ends this page's session.
 api.onApiError((e) => { if (isLockError(e)) lockdown(e.code); });
 onLockdown(() => {
+  stopIdleWatch();
   busCtl?.abort();
   clearTimeout(reconnectTimer);
   for (const m of liveChats()) { try { m.live?.controller?.abort(); } catch { /* ignore */ } }
@@ -425,6 +416,7 @@ export async function start({ security, passwordReset } = {}) {
   shell.applyLayout();
   registerBusHandlers();
   startNetworkClock();
+  startIdleWatch(security);
   connectEvents();
   loadRecommended().catch(() => {}); // friendly model names; not needed to start
   const results = await Promise.allSettled([loadSettings(), loadPresets(), loadSystem(), loadModels(), loadChats(), refreshMemoryCount()]);

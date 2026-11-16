@@ -46,7 +46,8 @@ test('first run: choose a password with honest feedback, see the recovery key on
   try {
     const { page } = app;
     await page.waitForSelector('.gate');
-    assert.match(await page.locator('.gate').textContent(), /Welcome to Harness/);
+    // (The harness writes settings.json into the data dir, which Harness counts as earlier data.)
+    assert.match(await page.locator('.gate').textContent(), /Welcome to Harness|Protect your chats with a password/);
     // Honest feedback, no composition rules.
     await page.fill('.gate input[name="password"]', 'short');
     assert.match(await page.locator('.pw-strength').textContent(), /Too short/);
@@ -286,14 +287,15 @@ test('downloads while internet access is blocked: one allow prompt, the download
     await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
     await page.waitForSelector('dialog.confirm-pw', { state: 'detached' });
     // The download was retried automatically and finishes.
-    await waitFor(async () => (await stack.api('GET', '/api/models')).status === 200 && (await stack.unlock(PASSWORD)) && (await stack.api('GET', '/api/models')).data.models.some((m) => m.model === 'qwen3:4b'), { timeout: 20000 });
+    await stack.unlock(PASSWORD); // a CLI-style session for the checks below
+    await waitFor(async () => (await stack.api('GET', '/api/models')).data.models?.some((m) => m.model === 'qwen3:4b'), { timeout: 20000 });
     // Countdown in the title bar, then Block now.
     await page.waitForSelector('.net-shield-wrap[data-state="allowed"]');
     assert.match(await page.locator('.net-shield').textContent(), /Online 1[45]:\d\d/);
     await app.shot('34-internet-allowed');
     await page.locator('.net-block').click();
     await page.waitForSelector('.net-shield-wrap[data-state="blocked"]');
-    assert.equal((await stack.api('GET', '/api/network')).data.blocked, true);
+    assert.equal((await stack.api('GET', '/api/network')).data.offlineLock.blocked, true);
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });
@@ -331,6 +333,8 @@ test('browser storage holds nothing derived from the user: drafts live in the UI
     await page.evaluate(() => { localStorage.setItem('harness.draft.new', 'an old draft from 0.1'); localStorage.setItem('harness.ui.sidebar', 'true'); });
     await setupViaUi(page);
     await page.goto(`${stack.url}/#/chat`);
+    // The 0.1 draft came along (from the UI-state store now).
+    await page.waitForFunction(() => document.querySelector('.composer-input')?.value === 'an old draft from 0.1');
     const secret = 'Draft about the secret Heron launch date';
     await page.locator('.composer-input').fill(secret);
     await page.locator('.composer-input').press('End');
@@ -360,9 +364,6 @@ test('browser storage holds nothing derived from the user: drafts live in the UI
     await page.reload();
     await page.waitForSelector('.composer-input');
     await page.waitForFunction((t) => document.querySelector('.composer-input')?.value.startsWith(t), secret);
-    // And the 0.1 draft was carried over too.
-    const st = (await page.evaluate(async () => (await fetch('/api/ui-state')).json())).state;
-    assert.ok(Object.values(st).includes('an old draft from 0.1'));
     // No request ever carried a Blob/File/FormData body (WKWebView drops them on custom schemes): upload a file.
     const [chooser] = await Promise.all([page.waitForEvent('filechooser'), page.locator('button[aria-label="Attach files"]').click()]);
     await chooser.setFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello there') });

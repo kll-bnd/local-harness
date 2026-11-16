@@ -633,7 +633,7 @@ export class ChatEngine {
         for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'error'; m.content ||= `Error: ${e.message}`; m.isError = true; } }
         finishUp();
         await savedP;
-        emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId, ...(e.nextSteps ? { nextSteps: e.nextSteps } : {}) });
+        emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId, ...(e.nextSteps ? { nextSteps: e.nextSteps } : {}), ...(e.code === 'offline_lock' && e.details ? { details: e.details } : {}) });
         return asst;
       }
     } finally {

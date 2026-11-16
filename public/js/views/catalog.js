@@ -2,7 +2,7 @@
 // without typing — sorted lists with filters (kind, fits this Mac, size, publisher; search is one more filter)
 // and endless scrolling — and a page per model with its card, numbers and every file with its fit here.
 // "Will this run on my Mac?" is answered on every row; what does not fit is dimmed, never hidden.
-import { h, mount, add, debounce } from '../lib/dom.js';
+import { h, mount, add, debounce, copyText } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtTokens, fmtRelative, fmtFull, modelShort } from '../lib/format.js';
 import { renderMarkdown } from '../lib/markdown.js';
@@ -33,13 +33,18 @@ export const fmtParams = (n) => {
 };
 const fmtCount = (n) => (n == null ? null : n >= 1e6 ? `${(n / 1e6).toFixed(1).replace(/\.0$/, '')}M` : n >= 1e3 ? `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1).replace(/\.0$/, '')}K` : String(n));
 
-/** The at-a-glance fit chip for a list row. */
+/**
+ * The at-a-glance fit chip for a list row. An estimate from the parameter count alone is worded as such
+ * ("Probably …"); the model page sizes every file and gives the firm answer.
+ */
 function fitChip(fit) {
   if (!fit) return h('span.fit-chip.unknown', { title: 'Size not known yet — open it to see every file' }, 'Size unknown');
   const size = fit.sizeBytes ? `≈ ${fmtBytes(fit.sizeBytes)}` : '';
+  const guess = fit.basis === 'parameters';
+  const note = `${fit.note || ''}${guess ? `${fit.note ? ' — ' : ''}estimated from the parameter count; open it for every file` : ''}`;
   return fit.fits
-    ? h('span.fit-chip.ok', { title: fit.note || 'Estimated to fit this Mac' }, icon('check', { size: 12 }), h('span', 'Fits this Mac'), size ? h('span.faint', ` · ${size}`) : null)
-    : h('span.fit-chip.no', { title: fit.note || 'Estimated not to fit this Mac' }, h('span', 'Too big for this Mac'), size ? h('span.faint', ` · ${size}`) : null);
+    ? h('span.fit-chip.ok', { title: note || 'Estimated to fit this Mac' }, icon('check', { size: 12 }), h('span', guess ? 'Probably fits' : 'Fits this Mac'), size ? h('span.faint', ` · ${size}`) : null)
+    : h('span.fit-chip.no', { title: note || 'Estimated not to fit this Mac' }, h('span', guess ? 'Probably too big' : 'Too big for this Mac'), size ? h('span.faint', ` · ${size}`) : null);
 }
 
 // ------------------------------------------------------------------------------------------------ list
@@ -214,6 +219,13 @@ export class CatalogBrowser {
 export class ModelPage {
   constructor() {
     this.el = h('div.model-page');
+    // Copy buttons of code blocks in the model card.
+    this.el.addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-action="copy-code"]');
+      if (!b) return;
+      const code = b.closest('.code-block')?.querySelector('code')?.textContent || '';
+      if (await copyText(code)) { b.querySelector('span').textContent = 'Copied'; setTimeout(() => { b.querySelector('span').textContent = 'Copy'; }, 1400); }
+    });
     this.detail = null;
     this.key = null;
     this.blocked = null;
@@ -280,6 +292,10 @@ export class ModelPage {
     if (!d.downloadable) return null;
     if (f.pullable === false) return h('span.faint.small.nowrap', { title: 'Ollama’s registry does not offer this exact file' }, 'Not downloadable');
     const copy = !!f.textOnly?.recommended;
+    // What does not fit stays available, quietly.
+    if (f.fit && !f.fit.fits) {
+      return h('button.btn.btn-small.btn-ghost.dl-anyway', { type: 'button', dataset: { model: f.model }, title: 'Too big for this Mac: it would be slow or fail to load', on: { click: () => downloadFromCatalog(f) } }, 'Download anyway');
+    }
     return h(`button.btn.btn-small${primary ? '.btn-primary' : ''}`, { type: 'button', dataset: { model: f.model }, on: { click: () => downloadFromCatalog(f) } },
       icon('download', { size: 13 }), copy ? 'Download and set up' : 'Download');
   }

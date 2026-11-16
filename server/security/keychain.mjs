@@ -52,20 +52,20 @@ const NOT_FOUND = /could not be found|-25300/i;
 const DENIED = /user canceled|cancelled|-128\b|-25293|-25308|interaction is not allowed|not permitted|authorization/i;
 
 function classify(r, action) {
-  if (r.timedOut) return new KeychainError('timeout', `The Keychain did not answer within ${Math.round(KEYCHAIN_TIMEOUT_MS / 1000)} s while ${action} (a macOS prompt may be waiting for an answer). Harness stays locked; the password still opens it.`);
+  if (r.timedOut) return new KeychainError('timeout', `The Keychain did not answer in time while ${action} (a macOS prompt may be waiting for an answer). Harness stays locked; the password still opens it.`);
   if (r.failed) return new KeychainError('failed', `Could not run the Keychain tool while ${action}.`);
   if (DENIED.test(r.err)) return new KeychainError('denied', `The Keychain refused access while ${action} (the prompt was denied or cannot be shown). Harness stays locked; the password still opens it.`);
   return null;
 }
 
 /** The macOS login Keychain via /usr/bin/security (the binary is injectable for tests). */
-export function macKeychain({ securityBin = process.env.HARNESS_SECURITY_BIN || '/usr/bin/security' } = {}) {
+export function macKeychain({ securityBin = process.env.HARNESS_SECURITY_BIN || '/usr/bin/security', timeoutMs = KEYCHAIN_TIMEOUT_MS } = {}) {
   const q = (s) => `"${String(s).replace(/["\\]/g, '\\$&')}"`;
   return {
     kind: 'keychain',
     /** The stored key, or null when there is no item. Throws KeychainError when access is denied or times out. */
     async get() {
-      const r = await runSecurity(securityBin, [`find-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)} -w`]);
+      const r = await runSecurity(securityBin, [`find-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)} -w`], { timeoutMs });
       const line = r.out.split(/\r?\n/).map((l) => l.trim().replace(/^security>\s*/, '')).find((l) => B64_32.test(l));
       if (line) return Buffer.from(line, 'base64');
       const e = classify(r, 'reading the Harness key');
@@ -74,14 +74,14 @@ export function macKeychain({ securityBin = process.env.HARNESS_SECURITY_BIN || 
     },
     async set(key) {
       const v = Buffer.from(key).toString('base64');
-      const r = await runSecurity(securityBin, [`add-generic-password -U -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)} -l ${q(KEYCHAIN_LABEL)} -w ${v}`]);
+      const r = await runSecurity(securityBin, [`add-generic-password -U -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)} -l ${q(KEYCHAIN_LABEL)} -w ${v}`], { timeoutMs });
       const e = classify(r, 'storing the Harness key');
       if (e) throw e;
       const back = await this.get();
       if (!back || !back.equals(Buffer.from(key))) throw new KeychainError('failed', 'The Keychain did not give back the stored key.');
     },
     async delete() {
-      const r = await runSecurity(securityBin, [`delete-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)}`]);
+      const r = await runSecurity(securityBin, [`delete-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)}`], { timeoutMs });
       if (NOT_FOUND.test(r.err)) return;
       const e = classify(r, 'removing the Harness key');
       if (e) throw e;

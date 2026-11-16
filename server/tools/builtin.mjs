@@ -1,6 +1,7 @@
 // Built-in tools for the agent loop. Each tool: { name, description, parameters, available(ctx), run(args, ctx) }.
 // run() returns { content: string (what the model sees), isError?, data? (for the UI), images? }.
 import { evaluate, formatNumber } from './calculate.mjs';
+import { anyBlocking } from '../security/egress.mjs';
 import { fetchUrl } from './fetch-url.mjs';
 import { ASPECTS } from '../image/defaults.mjs';
 import { imageRef } from '../image/gallery.mjs';
@@ -104,7 +105,8 @@ export const BUILTIN_TOOLS = [
     shortDescription: 'Download a web page as text (only for URLs the user gives or asks about).',
     description: 'Download a web page and return its readable text. Only use when the user provides a URL or explicitly asks you to look something up online.',
     parameters: { type: 'object', properties: { url: { type: 'string', description: 'Full http(s) URL.' } }, required: ['url'] },
-    available: () => true,
+    // Not offered to the model while internet access is blocked (docs/API.md §10.6).
+    available: () => !anyBlocking(),
     async run(args, ctx) {
       const cfg = ctx.settings.tools?.fetchUrl || {};
       const raw = String(args.url || '');
@@ -120,6 +122,7 @@ export const BUILTIN_TOOLS = [
         return { content: `${r.title ? `# ${r.title}\n` : ''}URL: ${r.url} (HTTP ${r.status})\n\n${r.text}`, data: { url: r.url, status: r.status, title: r.title, truncated: r.truncated } };
       } catch (e) {
         if (isAbortError(e) && ctx.signal?.aborted) throw e;
+        if (e?.code === 'offline_lock') return { content: 'Error: internet access is blocked in Harness, so web pages cannot be opened. The user can allow it for a few minutes in Harness.', isError: true, data: { blocked: 'offline_lock', error: { code: 'offline_lock', details: e.details } } };
         return { content: `Error fetching ${args.url}: ${e.message}`, isError: true };
       }
     },

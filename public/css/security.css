@@ -211,3 +211,11 @@
   .cat-item { flex-direction: column; gap: 6px; }
   .cat-search { width: 100%; }
 }
+
+/* ---------------------------------------------------------------- auto-lock hint */
+.idle-hint {
+  position: fixed; z-index: 70; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px;
+  padding: 8px 8px 8px 12px; border-radius: var(--r-lg); background: var(--bg-elev); box-shadow: var(--shadow-pop); color: var(--fg-2); font-size: 12.5px;
+  max-width: calc(100vw - 32px); font-variant-numeric: tabular-nums; animation: gate-in 200ms var(--ease);
+}
+.idle-hint .icon { color: var(--fg-3); flex: none; }

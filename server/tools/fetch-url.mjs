@@ -84,10 +84,12 @@ export async function fetchUrl(rawUrl, { allowPrivateNetwork = false, maxChars =
     try {
       res = await httpRequest(url, {
         signal: sig,
+        egress: 'fetch_url',
         lookup: vettedLookup(allowPrivateNetwork),
-        headers: { 'user-agent': 'Harness/0.1 (local assistant; fetch_url tool)', accept: 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5', 'accept-encoding': 'identity' },
+        headers: { 'user-agent': 'Harness/0.2 (local assistant; fetch_url tool)', accept: 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5', 'accept-encoding': 'identity' },
       });
     } catch (e) {
+      if (e?.code === 'offline_lock') throw e;
       if (e?.cause instanceof BlockedError) throw new Error(e.cause.message);
       if (e instanceof BlockedError) throw e;
       if (e?.name === 'TimeoutError') throw new Error(`Timed out after ${Math.round(timeoutMs / 1000)} s fetching ${url.host}`);
