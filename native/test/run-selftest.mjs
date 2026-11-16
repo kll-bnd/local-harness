@@ -74,10 +74,15 @@ for (let n = 1; n <= launches; n++) {
   if (st?.pageLoads >= 1) {
     say(`launch${n}.firstPage`, `${Date.now() - t0} ms after start`);
     const pids = [child.pid, ...descendants(child.pid)];
-    const kids = pids.slice(1).map((p) => `${p}:${sh('ps', ['-o', 'comm=', '-p', String(p)]).trim().split('/').pop()}`);
+    const name = (p) => sh('ps', ['-o', 'comm=', '-p', String(p)]).trim().split('/').pop();
+    const kids = pids.slice(1).map((p) => `${p}:${name(p)}`);
     say(`launch${n}.processes`, kids);
-    const sk = sockets(pids);
-    say(`launch${n}.sockets`, { ok: sk.listening.length === 0, ...sk });
+    // The app and the backend must hold no socket at all; an Ollama the backend started is the model server and
+    // listens on 127.0.0.1 by design (reported separately).
+    const ours = pids.filter((p) => !/^ollama/.test(name(p)));
+    const theirs = pids.filter((p) => /^ollama/.test(name(p)));
+    const sk = sockets(ours);
+    say(`launch${n}.sockets`, { ok: sk.listening.length === 0 && sk.inet === 0, appAndBackend: sk, ollama: theirs.length ? sockets(theirs).listening : 'not started' });
     if (n === 1) { await sleep(Number(opt('settle', '8')) * 1000); say(`launch${n}.memoryIdle`, memory(child.pid, st.backendPid)); }
   } else {
     say(`launch${n}.firstPage`, `none (state ${JSON.stringify(st)})`);

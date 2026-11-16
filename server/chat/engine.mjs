@@ -1,6 +1,7 @@
 // The chat turn runner: settings resolution → retrieval → assembly (+ auto-compaction) → streaming
 // agent loop with tools → persistence → background follow-ups (title, memory extraction, recall index).
 import { newId } from '../lib/ids.mjs';
+import { egressBlocked, OfflineLockError } from '../security/egress.mjs';
 import { nowIso, deepMerge, clone, formatBytes, formatTokensK } from '../lib/util.mjs';
 import { HttpError, isAbortError, ProviderError } from '../lib/errors.mjs';
 import { log } from '../lib/log.mjs';
@@ -179,6 +180,7 @@ export class ChatEngine {
     const s = this.effectiveSettings(chat);
     const { provider, model } = await this.app.registry.resolve(modelRef || s.model);
     const st = await this.app.registry.status(provider);
+    if (!st.ok && egressBlocked(provider.baseUrl)) throw new OfflineLockError('remote_provider', new URL(provider.baseUrl).hostname);
     if (!st.ok) throw new ProviderError(`${provider.name} is not running at ${provider.baseUrl}${provider.id === 'ollama' ? ' — start Ollama (POST /api/providers/ollama/start)' : ''}`, { status: 503, code: 'connection_failed', providerId: provider.id });
     const info = await this.app.registry.modelInfo(provider, model);
     if (info.capabilities.includes('embedding') && !info.capabilities.includes('completion')) throw new HttpError(400, 'not_chat_model', `${model} is an embedding model and cannot chat`);

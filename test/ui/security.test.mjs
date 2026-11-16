@@ -274,9 +274,14 @@ test('0.1 data is encrypted when the password is chosen, with progress', async (
     await page.fill('.gate input[name="password2"]', PASSWORD);
     await page.click('.gate-form button[type="submit"]');
     await page.waitForSelector('.rk-key');
+    // While the key is on screen the existing files are being encrypted, with progress.
+    await page.waitForSelector('.mig:not([hidden])');
+    assert.match(await page.locator('.mig').textContent(), /Encrypting your data/);
+    await page.waitForFunction(() => document.querySelector('.mig')?.hidden || /of \d+ files/.test(document.querySelector('.mig')?.textContent || ''), null, { timeout: 15000 });
+    await app.shot('36-migration');
     await page.check('.rk-confirm input');
     await page.click('.gate-actions .btn-primary');
-    // Progress (or done already) and then the app with the old chats.
+    // Then the app with the old chats.
     await page.waitForSelector('.app .sidebar', { timeout: 30000 });
     await page.waitForFunction(() => /Old chat 39/.test(document.querySelector('.sidebar')?.textContent || ''));
     // On disk nothing is readable any more.

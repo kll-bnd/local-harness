@@ -29,6 +29,10 @@
       const k = await native('keychain');
       return { ok: h.keySent && h.keyMatches && k.exists && k.fingerprint === st.keyFingerprint, keySent: h.keySent, keyMatches: h.keyMatches, sameFingerprint: k.fingerprint === st.keyFingerprint };
     });
+    await check('windowFrameRestored', async () => {
+      const s = await native('state');
+      return { ok: JSON.stringify(s.windowFrame) === JSON.stringify(st.frame), saved: st.frame, now: s.windowFrame };
+    });
     await check('keychainDeletedWhenModeOff', async () => {
       await emit({ type: 'keychain-key' });
       await sleep(500);
@@ -313,6 +317,12 @@
     await sleep(200);
     const s2 = await native('state');
     return { ok: c >= 3 && s1.locked && !s1.lockMenuEnabled && s1.badge === '' && locked.status === 423 && !s2.locked && s2.lockMenuEnabled, lockControls: c, lockedAfterSleep: s1.locked, menuDisabledWhileLocked: !s1.lockMenuEnabled, status423: locked.status === 423 };
+  });
+
+  await check('windowFrameSaved', async () => {
+    const r = await native('setFrame', { x: 140, y: 120, width: 1010, height: 710 });
+    await native('stash', { key: 'frame', value: r.frame });
+    return { ok: r.ok && r.frame[2] === 1010 && r.frame[3] === 710, frame: r.frame };
   });
 
   await check('keychainItemCreated', async () => {

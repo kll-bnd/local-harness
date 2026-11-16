@@ -156,7 +156,23 @@ locks the data, so the user has to type the password again right after typing it
 backend reports what is enforced in `GET /api/security` → `offlineLock.osScope` (`"backend"`, `"ollama"`
 or `"none"`).
 
-To be confirmed on a real Mac by the native-app work (and recorded here once known): that
-`sandbox-exec` and this profile syntax work on current macOS; that a real Ollama under the sandbox still
-loads a model on the GPU and answers on loopback; that a model download and any request to a public host
-fail; and that name lookups are blocked rather than forwarded by the system resolver.
+Confirmed on a real Mac (GitHub's Apple Silicon runner: macOS 26.7.2, "Apple M1 (Virtual)", Ollama 0.40.13;
+the `native` job of `.github/workflows/macos.yml`, `native/ci/sandbox-ollama.mjs` and `native/ci/sb-variants.mjs`):
+
+* `/usr/bin/sandbox-exec` exists on macOS 26 and accepts the profile.
+* The first draft of the profile did **not** confine anything but DNS: `(allow network* (local ip "localhost:*"))`
+  matches the machine's own addresses, so TCP and UDP to the internet went through. The shipped profile allows
+  outbound traffic only to a loopback peer (`remote ip "localhost:*"`), listening via `network-inbound (local ip
+  "localhost:*")`, Unix-domain sockets, and closes mDNSResponder's socket.
+* With it, a real `ollama serve` started the way the backend starts it (`sandbox-exec -f offline-lock.sb ollama serve`,
+  `OLLAMA_HOST=127.0.0.1:11434`) loads `qwen3:0.6b` **on the GPU** (Metal "Apple Paravirtual device", 100 % of the
+  model in VRAM — the same as without the sandbox) and answers chats on 127.0.0.1. A model pull fails (`lookup
+  registry.ollama.ai: no such host`); from a process under the same profile a TCP connection to 1.1.1.1:443 and to a
+  public IPv6 address fails with `EPERM`, `getaddrinfo` of a public name fails (`ENOTFOUND`), a direct UDP DNS query to
+  the configured name server is refused, and an HTTPS fetch fails — while 127.0.0.1, ::1, local listening sockets and
+  Unix sockets keep working. Without the sandbox the same pull, connection, lookups and fetch all succeed.
+* Name lookups are **blocked, not forwarded** by the system resolver: `getaddrinfo` reaches mDNSResponder over
+  `/private/var/run/mDNSResponder`, which the profile closes (the `mach-lookup` denies alone did not stop it).
+* Limit: the sandbox checks when a socket binds or listens, not each accepted connection, so a confined program that
+  listens on all interfaces can be reached from the local network (measured). Harness's Ollama listens on 127.0.0.1
+  only, where the kernel refuses other peers.

@@ -95,6 +95,8 @@ export class Core extends EventEmitter {
     await ensureDir(this.dataDir);
     await fixPermissions(this.dataDir).catch(() => {});
     this.launch.load();
+    // launchers read launch.json before starting the backend: make the defaults visible on a fresh install
+    if (!(await import('node:fs')).existsSync(this.launch.file)) { try { this.launch.set({}); } catch { /* read-only: defaults */ } }
     let vaultError = null;
     try { this.vault.load(); } catch (e) { vaultError = e; }
     if (this.vault.restoredFromBackup) log.warn('vault.json was damaged; restored it from its verified copy vault.json.bak.');
@@ -579,13 +581,13 @@ export class Core extends EventEmitter {
   }
 
   /** POST /api/security/activity: "the user is here". */
-  touch() { this.lastActivity = Date.now(); return { ok: true, idleLockAt: this.idleLockAt() }; }
+  touch() { this.lastActivity = Date.now(); return { ok: true, idleLockAt: this.idleLockAt({ ownRequests: 1 }) }; }
 
   /** When Harness would lock if nothing else happens (null: idle lock off, not applicable, or work is running). */
-  idleLockAt() {
+  idleLockAt({ ownRequests = 0 } = {}) {
     if (this.state !== 'unlocked' || this.mode !== 'password' || !this.vault.encrypted) return null;
     const min = this.idleLockMinutes();
-    if (!min || this.inflight > 0 || this._busy()) return null;
+    if (!min || this.inflight > ownRequests || this._busy()) return null;
     return new Date(this.lastActivity + min * 60000).toISOString();
   }
 

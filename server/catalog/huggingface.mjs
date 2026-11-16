@@ -96,53 +96,81 @@ export function mapListItem(m, { fits, installedNames, curated }) {
     downloads: num(m?.downloads), likes: num(m?.likes), trendingScore: num(m?.trendingScore),
     updatedAt: str(m?.lastModified, 40), gated: !!m?.gated && m.gated !== 'false', license: licenseOf(m),
     tags: (Array.isArray(m?.tags) ? m.tags : []).filter((t) => typeof t === 'string' && !NOISE_TAGS.test(t) && !/^[a-z]{2}$/.test(t)).slice(0, 12).map((t) => t.slice(0, 60)),
-    fit: fits.listFit({ parameters, contextLength, name: id }),
+    fit: fits.listFit({ parameters, contextLength, name: id, vision: kind === 'vision' }),
     installed, recommended, url: `https://huggingface.co/${id}`,
   };
 }
 
+const UPSTREAM_PAGE = 50;
+
+/**
+ * One page of the list. Our cursor = { upstream cursor of the page being read, offset of the next unread row in
+ * it }, so rows dropped by filtering or by `limit` are never skipped; up to 3 upstream pages are read to fill
+ * `limit` (shorter pages are fine; `nextCursor: null` only at the real end).
+ */
 export async function hfList(q, { fits, installedNames, curated, cache }) {
   const B = bases();
   const sortKey = HF_SORTS[q.sort || 'trending'];
   if (!sortKey) throw new HttpError(400, 'unsupported_sort', `sort must be one of ${Object.keys(HF_SORTS).join(', ')}`);
   const minP = paramsArg(q.minParams);
   const maxP = paramsArg(q.maxParams);
-  const filterKey = JSON.stringify([q.sort, q.kind, q.q, q.publisher, minP, maxP]);
-  let hfCursor = null;
+  const filterKey = JSON.stringify([q.sort, q.kind, q.q, q.publisher, minP, maxP, q.fits]);
+  let upCursor = null;
+  let offset = 0;
   if (q.cursor) {
     const c = decodeCursor(q.cursor);
-    if (!c || c.s !== 'hf' || c.f !== filterKey || typeof c.c !== 'string') throw new HttpError(400, 'bad_cursor', 'This cursor belongs to another listing; start again without it.');
-    hfCursor = c.c;
+    if (!c || c.s !== 'hf' || c.f !== filterKey || (c.c !== null && typeof c.c !== 'string') || !Number.isInteger(c.o) || c.o < 0 || c.o > UPSTREAM_PAGE) throw new HttpError(400, 'bad_cursor', 'This cursor belongs to another listing; start again without it.');
+    upCursor = c.c;
+    offset = c.o;
   }
-  const u = new URL(`${B.hf}/api/models`);
-  u.searchParams.set('filter', 'gguf');
-  u.searchParams.set('sort', sortKey);
-  u.searchParams.set('direction', '-1');
-  u.searchParams.set('limit', String(Math.min(100, Math.max(q.limit * 2, 20))));
-  for (const e of EXPAND) u.searchParams.append('expand[]', e);
-  if (q.q) u.searchParams.set('search', q.q.slice(0, 100));
-  if (q.publisher) u.searchParams.set('author', q.publisher.slice(0, 100));
-  if (q.kind && KIND_PIPELINE[q.kind]) u.searchParams.set('pipeline_tag', KIND_PIPELINE[q.kind]);
-  if (minP || maxP) u.searchParams.set('num_parameters', [minP ? `min:${asB(minP)}` : null, maxP ? `max:${asB(maxP)}` : null].filter(Boolean).join(','));
-  if (hfCursor) u.searchParams.set('cursor', hfCursor);
-  const key = `hf:list:${u.href}`;
-  let page = cache.get(key);
-  let cached = !!page;
-  if (!page) {
+  const fetchPage = async (cursor) => {
+    const u = new URL(`${B.hf}/api/models`);
+    u.searchParams.set('filter', 'gguf');
+    u.searchParams.set('sort', sortKey);
+    u.searchParams.set('direction', '-1');
+    u.searchParams.set('limit', String(UPSTREAM_PAGE));
+    for (const e of EXPAND) u.searchParams.append('expand[]', e);
+    if (q.q) u.searchParams.set('search', q.q.slice(0, 100));
+    if (q.publisher) u.searchParams.set('author', q.publisher.slice(0, 100));
+    if (q.kind && KIND_PIPELINE[q.kind]) u.searchParams.set('pipeline_tag', KIND_PIPELINE[q.kind]);
+    if (minP || maxP) u.searchParams.set('num_parameters', [minP ? `min:${asB(minP)}` : null, maxP ? `max:${asB(maxP)}` : null].filter(Boolean).join(','));
+    if (cursor) u.searchParams.set('cursor', cursor);
+    const key = `hf:list:${u.href}`;
+    const hit = cache.get(key);
+    if (hit) return { ...hit, cached: true };
     const r = await catalogGet(u.href, { source: 'huggingface' });
     if (r.status !== 200) throw new CatalogUnavailable('huggingface', `Hugging Face answered ${r.status}.`);
     let rows;
     try { rows = JSON.parse(r.text); } catch { throw new CatalogUnavailable('huggingface', 'Hugging Face sent something that is not a model list.'); }
     if (!Array.isArray(rows)) throw new CatalogUnavailable('huggingface', 'Hugging Face sent something that is not a model list.');
-    page = { rows, next: nextCursorFromLink(r.headers.get('link'), B.hf), fetchedAt: new Date().toISOString() };
+    const page = { rows, next: nextCursorFromLink(r.headers.get('link'), B.hf), fetchedAt: new Date().toISOString() };
     cache.set(key, page, r.text.length);
-    cached = false;
+    return { ...page, cached: false };
+  };
+  const items = [];
+  let cached = true;
+  let fetchedAt = null;
+  let next = null;
+  for (let pages = 0; pages < 3; pages++) {
+    const page = await fetchPage(upCursor);
+    cached &&= page.cached;
+    fetchedAt ||= page.fetchedAt;
+    let i = offset;
+    for (; i < page.rows.length && items.length < q.limit; i++) {
+      const m = page.rows[i];
+      if (!isChatRepo(m)) continue;
+      const it = mapListItem(m, { fits, installedNames, curated });
+      if (!it || (q.kind && it.kind !== q.kind) || (q.fits && !it.fit?.fits)) continue;
+      items.push(it);
+    }
+    if (i < page.rows.length) { next = { c: upCursor, o: i }; break; } // the page has unread rows: continue here
+    if (!page.next) { next = null; break; } // the real end
+    upCursor = page.next;
+    offset = 0;
+    next = { c: upCursor, o: 0 };
+    if (items.length >= q.limit) break;
   }
-  let items = page.rows.filter(isChatRepo).map((m) => mapListItem(m, { fits, installedNames, curated })).filter(Boolean);
-  if (q.kind) items = items.filter((i) => i.kind === q.kind);
-  if (q.fits) items = items.filter((i) => i.fit?.fits);
-  items = items.slice(0, q.limit);
-  return { items, nextCursor: page.next ? encodeCursor({ s: 'hf', f: filterKey, c: page.next }) : null, sourceNote: null, fetchedAt: page.fetchedAt, cached };
+  return { items, nextCursor: next ? encodeCursor({ s: 'hf', f: filterKey, ...next }) : null, sourceNote: null, fetchedAt, cached };
 }
 
 // ---------------------------------------------------------------------------------------------- detail

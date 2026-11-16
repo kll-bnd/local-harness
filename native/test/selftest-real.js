@@ -37,11 +37,13 @@
     const types = {};
     let text = '';
     let buf = '';
+    let napHeldDuring = null;
     const t0 = performance.now();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       times.push(Math.round(performance.now() - t0));
+      if (times.length === 3) napHeldDuring = (await native('state')).activityHeld;
       buf += dec.decode(value, { stream: true });
       let i;
       while ((i = buf.indexOf('\n\n')) >= 0) {
@@ -52,7 +54,9 @@
         try { const ev = JSON.parse(data); types[ev.type] = (types[ev.type] || 0) + 1; if (ev.type === 'token' && ev.delta) text += ev.delta; } catch { /* ignore */ }
       }
     }
-    return { status: res.status, pieces: times.length, firstMs: times[0], lastMs: times[times.length - 1], types, chars: text.length };
+    await sleep(500);
+    const napHeldAfter = (await native('state')).activityHeld;
+    return { status: res.status, pieces: times.length, firstMs: times[0], lastMs: times[times.length - 1], types, chars: text.length, napHeldDuring, napHeldAfter };
   }
 
   // ------------------------------------------------------------------------------------------- launch 2
@@ -110,9 +114,10 @@
   await native('result', { key: 'marker', value: { ok: true, marker } });
 
   await check('appNapHeldOnlyWhileGenerating', async () => {
+    const r = await chat(chatId, `Count from one to twenty in words. ${marker}`);
     const s = await native('state');
-    return { ok: s.activityHeld === false && s.busyCount === 0, activityHeld: s.activityHeld, busy: s.busyCount };
-  });
+    return { ok: r.napHeldDuring === true && r.napHeldAfter === false && s.busyCount === 0, heldWhileStreaming: r.napHeldDuring, heldAfter: r.napHeldAfter, pieces: r.pieces };
+  }, 300000);
 
   await check('offlineLockAroundOllama', async () => {
     const net = await req('GET', '/api/network');

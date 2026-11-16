@@ -219,6 +219,12 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
             NSApp.unhide(nil)
             w?.show()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { r(["visible": w?.isVisible ?? false]) }
+        case "setFrame":
+            guard let win = w?.window else { r(["ok": false]); return }
+            let f = NSRect(x: (b["x"] as? Double) ?? 100, y: (b["y"] as? Double) ?? 100, width: (b["width"] as? Double) ?? 1000, height: (b["height"] as? Double) ?? 700)
+            win.setFrame(f, display: true)
+            w?.saveStateNow()
+            r(["ok": true, "frame": [Int(win.frame.minX), Int(win.frame.minY), Int(win.frame.width), Int(win.frame.height)]])
         case "restartBackend":
             app.restartBackend()
             r(["ok": true])
@@ -297,6 +303,8 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
             s["fullscreen"] = w.window.styleMask.contains(.fullScreen)
             s["url"] = w.webView?.url?.absoluteString ?? NSNull()
             s["titlebarHeight"] = Double(w.window.frame.height - w.window.contentLayoutRect.height)
+            let f = w.window.frame
+            s["windowFrame"] = [Int(f.minX), Int(f.minY), Int(f.width), Int(f.height)]
             s["pageZoom"] = Double(w.webView?.pageZoom ?? 0)
         }
         s["hotKey"] = app.hotKeyStatus

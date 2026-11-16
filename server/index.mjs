@@ -98,9 +98,10 @@ export function makeHandler(core, { bridge = false } = {}) {
         if (!m) return sendJson(res, 404, { error: { code: 'not_found', message: `No route for ${req.method} ${url.pathname}` } });
         if (m.allowed) return sendJson(res, 405, { error: { code: 'method_not_allowed', message: `Use ${m.allowed.join(', ')}` } }, { allow: m.allowed.join(', ') });
         const opts = m.route.opts || {};
+        // the lock first (423 says the same as GET /api/security), then the session (401)
+        if (!opts.open && !opts.whileLocked && !app) app = core.requireApp();
         const auth = bridge ? { ok: true, via: 'bridge', sessionHash: 'bridge' } : core.auth.check(req);
         if (!opts.open && !auth.ok) throw new HttpError(401, 'auth_required', core.mode === 'password' ? 'Enter your Harness password to continue.' : 'Open Harness from its launcher to continue.', { reason: auth.reason || 'missing', unlock: core.mode === 'password' });
-        if (!opts.open && !opts.whileLocked && !app) { app = core.requireApp(); }
         const out = await m.route.handler({ req, res, params: m.params, query: url.searchParams, url, app: app || core.app, core, auth, bridge });
         if (res.headersSent || res.writableEnded) return;
         if (out instanceof Reply) return sendJson(res, out.status, out.body, out.headers);

@@ -117,8 +117,9 @@ export function parseTagsPage(html, name) {
 export function parseModelPage(html) {
   const s = String(html || '');
   const meta = /<meta\s+name="description"\s+content="([^"]*)"/i.exec(s) || /<meta\s+content="([^"]*)"\s+name="description"/i.exec(s);
-  const head = s.slice(0, Math.max(0, s.search(/id="readme"/i)) || s.length);
-  const capabilities = [...new Set([...head.matchAll(/<span\b[^>]*>([^<]{1,20})<\/span>/gi)].map((m) => decodeEntities(m[1]).trim().toLowerCase()).filter((t) => CAPS.has(t)))];
+  const cut = s.search(/id="readme"/i);
+  const head = cut > 0 ? s.slice(0, cut) : s;
+  const capabilities = [...new Set([...head.matchAll(CAP_RE())].map((m) => decodeEntities(m[1]).trim().toLowerCase()).filter((t) => /^[a-z][a-z-]{1,20}$/.test(t)))];
   const display = elementAfter(s, /<div\b[^>]*id="display"[^>]*>/i);
   const readme = display ? htmlToText(display) : null;
   return { description: meta ? decodeEntities(meta[1]).slice(0, 1000) : null, capabilities, readme: readme && readme.text ? readme : null };
@@ -149,6 +150,25 @@ function itemFor(m, { fits, installedNames, curated }) {
 const encodeCursor = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
 const decodeCursor = (c) => { try { return JSON.parse(Buffer.from(String(c), 'base64url').toString('utf8')); } catch { return null; } };
 
+/** Result items on a search page that are NOT official library models (community uploads: href="/<user>/<model>"). */
+export function countCommunityItems(html) {
+  let n = 0;
+  for (const chunk of String(html || '').split(/<li\b/i).slice(1)) {
+    if (/hx-get=/i.test(chunk.slice(0, 300))) continue; // the "load more" element
+    if (/href="\/library\//i.test(chunk)) continue;
+    if (/href="\/[\w.-]+\/[\w.-]+"/i.test(chunk)) n++;
+  }
+  return n;
+}
+
+/**
+ * Lists come from the site's search (ollama.com/search — verified Nov 2026): 20 per page; `c=local` always (never
+ * cloud-only models), `c=vision|embedding` for kind, `o=newest` for "updated" (popular is the default and must be
+ * omitted), `s=8|16|32|64` ("up to N GB", the bucket at or above this Mac's budget) for fits=true; page N > 1 is
+ * the htmx fragment that only answers with `HX-Request: true`. Only official library models (/library/…) are
+ * offered; paging stops at the first page with none (community uploads follow the official ones). The one-page
+ * /library?sort=… listing is the fallback when the search page cannot be read.
+ */
 export async function ollamaList(q, { fits, installedNames, curated, cache }) {
   const B = bases();
   const siteSort = OLLAMA_SORTS[q.sort || 'trending'];
@@ -156,11 +176,11 @@ export async function ollamaList(q, { fits, installedNames, curated, cache }) {
   const notes = [];
   if (q.publisher || q.minParams || q.maxParams) notes.push('publisher and parameter filters apply to Hugging Face only');
   const filterKey = JSON.stringify([q.sort, q.kind, q.q, q.fits]);
-  let offset = 0;
+  let page = 1;
   if (q.cursor) {
     const c = decodeCursor(q.cursor);
-    if (!c || c.s !== 'ol' || c.f !== filterKey || !Number.isInteger(c.o) || c.o < 0 || c.o > 100000) throw new HttpError(400, 'bad_cursor', 'This cursor belongs to another listing; start again without it.');
-    offset = c.o;
+    if (!c || c.s !== 'ol' || c.f !== filterKey || !Number.isInteger(c.p) || c.p < 2 || c.p > 99) throw new HttpError(400, 'bad_cursor', 'This cursor belongs to another listing; start again without it.');
+    page = c.p;
   }
   const keep = (list) => {
     // Cloud-only entries (no local size) cannot be downloaded.
@@ -169,30 +189,44 @@ export async function ollamaList(q, { fits, installedNames, curated, cache }) {
     if (q.fits) items = items.filter((i) => i.fit?.fits);
     return items;
   };
-  if (q.q) {
-    // The site's search: 20 per page, `c=local` (never cloud-only models), `o` = its sort, `s` = its size filter
-    // ("up to N GB": the bucket at or above this Mac's memory budget when fits=true); later pages are the
-    // htmx "load more" requests (HX-Request: true). Our cursor is the next page number.
-    const page = q.cursor ? offset : 1;
-    const u = new URL(`${B.ollama}/search`);
-    u.searchParams.set('q', q.q.slice(0, 100));
-    u.searchParams.set('c', 'local');
-    u.searchParams.set('o', siteSort);
-    if (q.fits) u.searchParams.set('s', sizeBucket(fits.budgetBytes));
-    if (page > 1) u.searchParams.set('page', String(page));
-    const key = `ol:search:${u.href}`;
-    let res = cache.get(key);
-    const cached = !!res;
-    if (!res) {
-      const r = await catalogGet(u.href, { source: 'ollama', accept: 'text/html', maxBytes: 4 * 1024 * 1024, headers: page > 1 ? { 'hx-request': 'true' } : {} });
-      if (r.status !== 200) throw new CatalogUnavailable('ollama', `ollama.com answered ${r.status}.`);
-      res = { models: parseListPage(r.text), next: nextSearchPage(r.text), fetchedAt: new Date().toISOString() };
-      cache.set(key, res, r.text.length / 4);
+  const u = new URL(`${B.ollama}/search`);
+  if (q.q) u.searchParams.set('q', q.q.slice(0, 100));
+  u.searchParams.append('c', 'local');
+  if (q.kind === 'vision' || q.kind === 'embedding') u.searchParams.append('c', q.kind);
+  if (siteSort === 'newest') u.searchParams.set('o', 'newest');
+  if (q.fits) u.searchParams.set('s', sizeBucket(fits.budgetBytes));
+  if (page > 1) u.searchParams.set('page', String(page));
+  const key = `ol:search:${u.href}`;
+  let res = cache.get(key);
+  const cached = !!res;
+  if (!res) {
+    let r;
+    try {
+      r = await catalogGet(u.href, { source: 'ollama', accept: 'text/html', maxBytes: 4 * 1024 * 1024, headers: page > 1 ? { 'hx-request': 'true' } : {} });
+    } catch (e) {
+      if (e?.code === 'offline_lock' || q.q || page > 1) throw e;
+      return libraryFallback(q, { keep, cache, notes, B });
     }
-    const next = res.next && res.next > page && res.models.length ? encodeCursor({ s: 'ol', f: filterKey, o: res.next }) : null;
-    return { items: keep(res.models), nextCursor: next, sourceNote: ['read from the ollama.com website (its search)', ...notes].join('; '), fetchedAt: res.fetchedAt, cached };
+    if (r.status !== 200) {
+      if (!q.q && page === 1) return libraryFallback(q, { keep, cache, notes, B });
+      throw new CatalogUnavailable('ollama', `ollama.com answered ${r.status}.`);
+    }
+    const models = parseListPage(r.text);
+    const community = countCommunityItems(r.text);
+    if (!models.length && !community && page === 1 && !q.q && !(q.kind || q.fits)) {
+      // a 200 page with content but nothing we can read: the layout changed
+      if (r.text.length > 2000) return libraryFallback(q, { keep, cache, notes, B, why: 'search' });
+    }
+    res = { models, community, next: models.length && !community && nextSearchPage(r.text) ? page + 1 : null, fetchedAt: new Date().toISOString() };
+    cache.set(key, res, r.text.length / 4);
   }
-  const url = `${B.ollama}/library?sort=${siteSort}`;
+  const next = res.next && res.next <= 99 ? encodeCursor({ s: 'ol', f: filterKey, p: res.next }) : null;
+  return { items: keep(res.models), nextCursor: next, sourceNote: ['read from the ollama.com website', ...notes].join('; '), fetchedAt: res.fetchedAt, cached };
+}
+
+/** The one-page library listing (fallback for browsing). Zero items from it → 502 "the page has changed". */
+async function libraryFallback(q, { keep, cache, notes, B }) {
+  const url = `${B.ollama}/library?sort=${OLLAMA_SORTS[q.sort || 'trending']}`;
   const key = `ol:list:${url}`;
   let page = cache.get(key);
   const cached = !!page;
@@ -200,14 +234,12 @@ export async function ollamaList(q, { fits, installedNames, curated, cache }) {
     const r = await catalogGet(url, { source: 'ollama', accept: 'text/html', maxBytes: 6 * 1024 * 1024 });
     if (r.status !== 200) throw new CatalogUnavailable('ollama', `ollama.com answered ${r.status}.`);
     const models = parseListPage(r.text);
-    if (!models.length) throw new CatalogUnavailable('ollama', 'Could not read the model list on ollama.com (the page layout may have changed).');
+    if (!models.length) throw new CatalogUnavailable('ollama', 'The Ollama library page has changed: Harness could not read its model list.');
     page = { models, fetchedAt: new Date().toISOString() };
     cache.set(key, page, r.text.length / 4);
   }
-  const items = keep(page.models);
-  const slice = items.slice(offset, offset + q.limit);
-  const next = offset + q.limit < items.length ? encodeCursor({ s: 'ol', f: filterKey, o: offset + q.limit }) : null;
-  return { items: slice, nextCursor: next, sourceNote: ['read from the ollama.com website', ...notes].join('; '), fetchedAt: page.fetchedAt, cached };
+  // the fallback lists everything on one page: hand out the first `limit` (no cursor: the search is the pager)
+  return { items: keep(page.models).slice(0, q.limit), nextCursor: null, sourceNote: ['read from the ollama.com library page', ...notes].join('; '), fetchedAt: page.fetchedAt, cached };
 }
 
 /** The site's size filter value ("up to N GB") for a memory budget. */

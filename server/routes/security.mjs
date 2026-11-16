@@ -5,7 +5,7 @@ import { Reply } from './common.mjs';
 import { runEgressSelfTest } from '../security/selftest.mjs';
 import { MAX_ALLOW_MINUTES } from '../security/network.mjs';
 
-const SELFTEST_INTERVAL_MS = Number(process.env.HARNESS_SELFTEST_INTERVAL_MS ?? 10000);
+const selftestIntervalMs = () => Number(process.env.HARNESS_SELFTEST_INTERVAL_MS ?? 10000);
 const confirmHeader = (req) => (typeof req.headers['x-harness-confirm'] === 'string' ? req.headers['x-harness-confirm'] : null);
 
 /**
@@ -166,7 +166,7 @@ export function registerSecurityRoutes(r, core) {
   let lastTest = 0;
   let running = null;
   r.post('/api/network/test', async () => {
-    const wait = lastTest + SELFTEST_INTERVAL_MS - Date.now();
+    const wait = lastTest + selftestIntervalMs() - Date.now();
     if (running || wait > 0) throw new HttpError(429, 'rate_limited', 'The self-test ran a moment ago; try again shortly.', { retryAfterMs: Math.max(wait, 1000) });
     lastTest = Date.now();
     running = runEgressSelfTest({ network: core.network, ollama: { sandboxExec: core.ollamaProcess.sandboxExec, profile: core.ollamaProcess.profile } });

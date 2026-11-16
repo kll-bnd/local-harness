@@ -196,7 +196,7 @@ describe('encryption at rest and locking', () => {
     await s.setup();
     try {
       s.fake.setDelay(15);
-      s.fake.chatScript = () => ({ content: 'word '.repeat(400), toolCalls: [] });
+      s.fake.chatScript = () => ({ thinking: '', content: 'word '.repeat(400), toolCalls: [] });
       const c = await s.call('POST', '/api/chats', {});
       const chatId = c.data.chat.id;
       const up = await s.call('POST', '/api/attachments?name=a.txt', Buffer.from('hello'), { headers: { 'content-type': 'text/plain' } });
@@ -226,7 +226,7 @@ describe('encryption at rest and locking', () => {
       assert.throws(() => s.srv.auth.createSession(), (e) => e.status === 423);
       assert.equal((await s.unlock()).status, 200);
       const back = await s.call('GET', `/api/chats/${chatId}`);
-      const msgs = Object.values(back.data.chat.messages).filter((m) => m.role === 'assistant');
+      const msgs = (Array.isArray(back.data.messages) ? back.data.messages : Object.values(back.data.messages)).filter((m) => m.role === 'assistant');
       assert.ok(msgs.length === 1 && msgs[0].content.length > 0 && msgs[0].content.length < 'word '.repeat(400).length, 'the partial reply was kept');
       assert.equal((await s.call('GET', '/api/chats', undefined, { token })).status, 401, 'sessions from before the lock are gone');
       const session = s.srv.auth.createSession();
@@ -249,7 +249,7 @@ describe('encryption at rest and locking', () => {
       assert.equal((await s.call('GET', '/api/security')).data.idleLockAt !== null, true);
       // a running generation defers the lock
       s.fake.setDelay(20);
-      s.fake.chatScript = () => ({ content: 'word '.repeat(200), toolCalls: [] });
+      s.fake.chatScript = () => ({ thinking: '', content: 'word '.repeat(200), toolCalls: [] });
       const c = await s.call('POST', '/api/chats', {});
       const gen = fetch(`${s.url}/api/chats/${c.data.chat.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${s.token}` }, body: JSON.stringify({ content: 'go' }) }).then((r) => r.text());
       await waitFor(() => core.app?.engine.active.size > 0);

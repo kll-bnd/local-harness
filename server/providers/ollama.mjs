@@ -105,6 +105,8 @@ export class OllamaProvider {
   }
 
   async request(path, { method = 'GET', body, signal, timeoutMs } = {}) {
+    // Models Harness itself used (loaded) in this Ollama: what locking unloads (docs/API.md §10.3).
+    if (body?.model && /^\/api\/(chat|generate|embed|embeddings)$/.test(path) && body.keep_alive !== 0) (this.usedModels ||= new Set()).add(body.model);
     const res = await backendFetch(this, path, { method, body, signal, timeoutMs });
     if (!res.ok) {
       const text = await res.text().catch(() => '');

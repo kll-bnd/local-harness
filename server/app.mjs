@@ -119,9 +119,15 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
     const t0 = Date.now();
     while ((app.engine.active.size || app.images.active) && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 25));
     if (lock) {
+      // Unload what Harness loaded: everything in an Ollama Harness started; in another Ollama, the models Harness used.
       const ollama = app.registry.ollama();
-      const loaded = [...app.engine.loadedCtx.keys()].filter((k) => k.startsWith(`${ollama?.id}/`)).map((k) => k.slice(ollama.id.length + 1));
-      await Promise.allSettled(loaded.map((m) => Promise.race([ollama.unload(m), new Promise((r) => setTimeout(r, 5000))])));
+      if (ollama) {
+        const used = new Set([...(ollama.usedModels || []), ...[...app.engine.loadedCtx.keys()].filter((k) => k.startsWith(`${ollama.id}/`)).map((k) => k.slice(ollama.id.length + 1))]);
+        const ps = await Promise.race([ollama.ps().catch(() => []), new Promise((r) => setTimeout(() => r([]), 3000))]);
+        const loaded = ps.map((m) => m.model || m.name).filter((m) => app.ollamaProcess.managed || used.has(m));
+        await Promise.allSettled(loaded.map((m) => Promise.race([ollama.unload(m), new Promise((r) => setTimeout(r, 5000))])));
+        ollama.usedModels?.clear();
+      }
     }
     app.bus.publish('server.closing', { reason: lock ? 'locked' : 'shutdown' });
     await app.chats.flush();
