@@ -5,6 +5,9 @@ import { runGate } from './gate.js';
 import * as api from './api.js';
 import { initUiState } from './ui-state.js';
 import { isLockError } from './lockdown.js';
+import { initMenuBridge } from './menu-bridge.js';
+
+initMenuBridge();
 
 async function open() {
   const { security, passwordReset } = await runGate();

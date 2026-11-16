@@ -83,7 +83,8 @@ test('browsing while internet access is blocked: allow in place, then both sourc
     await settled(page);
     await page.selectOption('.cat-size', '0-3');
     await settled(page);
-    assert.ok((await listState(page)).every((r) => /[0-3](\.\d)?B parameters/.test(r.text)));
+    // Up to 3B: millions of parameters or at most 3B.
+    assert.ok((await listState(page)).every((r) => /(\d+M|[0-2](\.\d+)?B|3B) parameters/.test(r.text)), JSON.stringify((await listState(page)).map((r) => r.text)));
     await page.selectOption('.cat-size', '');
     await page.fill('.cat-pub', 'bartowski');
     await page.waitForFunction(() => [...document.querySelectorAll('.cat-browser .cat-item')].every((e) => e.querySelector('.cat-pub-name')?.textContent === 'bartowski') && document.querySelectorAll('.cat-browser .cat-item').length > 0);

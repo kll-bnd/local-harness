@@ -62,11 +62,16 @@ async function streamTurn(ctx, chat, { prepare, modelRef }) {
   const reservation = app.engine.reserve(chat.id);
   let sse = null;
   try {
+    // Right after unlocking, the Ollama Harness manages may still be starting: wait for it, visibly.
+    await app.engine.ensureOllamaUp(chat, modelRef, () => {
+      sse ||= openSse(req, res);
+      sse.send('model_status', { phase: 'loading', reason: 'starting_ollama', message: 'Starting Ollama…' });
+    });
     const prepared = await app.engine.target(chat, modelRef);
     if (app.chats.chats.get(chat.id) !== chat) throw notFound('Chat');
     const { anchorId, userMessage } = prepare();
     if (!chat.messages[anchorId]) throw new HttpError(409, 'message_deleted', 'The message to answer no longer exists');
-    sse = openSse(req, res);
+    sse ||= openSse(req, res);
     await app.engine.run({ chat, anchorId, userMessage, emit: (t, d) => sse.send(t, d), signal: sse.signal, modelRef, prepared, reservation });
   } catch (e) {
     app.engine.release(chat.id, reservation);

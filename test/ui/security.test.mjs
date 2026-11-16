@@ -247,8 +247,13 @@ test('desktop menu: the `lock` action locks Harness', async () => {
     await page.evaluate(() => window.__menu('lock'));
     await page.waitForSelector('.gate input[name="password"]');
     assert.equal((await stack.api('GET', '/api/security')).data.state, 'locked');
+    // Pressing Lock again on the lock screen is not replayed after unlocking.
+    await page.waitForFunction(() => typeof window.__menu === 'function');
+    await page.evaluate(() => window.__menu('lock'));
     // The drag region is marked for WebKit too; controls inside stay clickable.
     await unlockViaUi(page);
+    await page.waitForTimeout(400);
+    assert.equal(await page.locator('.gate').count(), 0, 'still unlocked');
     assert.equal(await page.locator('.main-titlebar').getAttribute('data-app-region'), 'drag');
     assert.equal(await page.locator('.main-titlebar button[aria-label="Toggle inspector"]').getAttribute('data-app-region'), 'no-drag');
     await app.assertClean(assert);
@@ -351,9 +356,78 @@ test('sensitive actions ask for the password: an encrypted backup download', asy
     await page.waitForFunction(() => /not your Harness password/.test(document.querySelector('dialog.confirm-pw')?.textContent || ''));
     await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
     const [dl] = await Promise.all([page.waitForEvent('download'), page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click()]);
-    const env = JSON.parse(await fs.readFile(await dl.path(), 'utf8'));
+    const file = await dl.path();
+    const env = JSON.parse(await fs.readFile(file, 'utf8'));
     assert.equal(env.format, 'harness.backup.encrypted');
     assert.equal(env.cipher, 'aes-256-gcm');
+    // Restoring it needs the backup's passphrase and the Harness password (X-Harness-Confirm).
+    const [chooser] = await Promise.all([page.waitForEvent('filechooser'), page.locator('.privacy button', { hasText: 'Restore from backup' }).click()]);
+    await chooser.setFiles(file);
+    await page.fill('dialog input[name="passphrase"]', 'wrong words');
+    await page.locator('dialog .dialog-actions .btn-primary', { hasText: 'Restore' }).click();
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
+    await page.waitForFunction(() => /passphrase/i.test(document.querySelector('dialog.confirm-pw .field-error')?.textContent || ''));
+    await page.locator('dialog.confirm-pw .dialog-actions .btn', { hasText: 'Cancel' }).click();
+    const [chooser2] = await Promise.all([page.waitForEvent('filechooser'), page.locator('.privacy button', { hasText: 'Restore from backup' }).click()]);
+    await chooser2.setFiles(file);
+    await page.fill('dialog input[name="passphrase"]', 'tide pool backup words');
+    await page.locator('dialog .dialog-actions .btn-primary', { hasText: 'Restore' }).click();
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
+    await page.waitForFunction(() => /Backup restored/.test(document.querySelector('.toasts')?.textContent || ''));
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
+test('protection mode: "Don\'t ask on this Mac" needs the password; the lock screen then opens with one click', async () => {
+  const stack = await startStack({ secure: true });
+  const app = await openApp(stack, { hash: '#/settings/privacy' });
+  try {
+    const { page } = app;
+    await setupViaUi(page);
+    await page.waitForSelector('.privacy');
+    await app.shot('37-privacy');
+    // The self-test, in plain words per layer.
+    await page.locator('.privacy button', { hasText: 'Check that nothing can get out' }).click();
+    await page.waitForSelector('.selftest-head', { timeout: 15000 });
+    assert.match(await page.locator('.selftest-head').textContent(), /Nothing got out/);
+    assert.match(await page.locator('.selftest-list').textContent(), /Harness itself: refused to connect to huggingface\.co:443/);
+    await page.locator('.mode-card[data-mode="keychain"]').click();
+    await page.waitForSelector('dialog.confirm-pw');
+    await page.locator('dialog.confirm-pw .dialog-actions .btn', { hasText: 'Cancel' }).click();
+    assert.equal(await page.locator('.mode-card[aria-checked="true"]').getAttribute('data-mode'), 'password', 'nothing changes without the password');
+    await page.locator('.mode-card[data-mode="keychain"]').click();
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
+    await page.waitForSelector('.mode-card[data-mode="keychain"][aria-checked="true"]');
+    await lockViaKeys(page);
+    await page.locator('.gate button', { hasText: 'Open Harness' }).click();
+    await page.waitForSelector('.privacy');
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
+test('keychain mode: a launcher\'s #launch=<code> signs the window in and leaves no trace in the address', async () => {
+  const stack = await startStack({ secure: true });
+  await stack.setupPassword(PASSWORD);
+  const m = await stack.api('POST', '/api/security/mode', { password: PASSWORD, mode: 'keychain' });
+  assert.equal(m.status, 200);
+  await stack.waitUnlocked();
+  const lc = await stack.api('POST', '/api/auth/launch-code', {});
+  assert.equal(lc.status, 200, JSON.stringify(lc.data));
+  const app = await openApp(stack, { hash: `#launch=${lc.data.code}` });
+  try {
+    const { page } = app;
+    await page.waitForSelector('.app .sidebar');
+    assert.equal(await page.evaluate(() => location.hash), '');
+    assert.ok(!(await page.evaluate(() => history.length > 0 && location.href)).includes('launch='));
+    // Without a code a new window is told to use the launcher (or the password).
+    const other = await openApp(stack);
+    try {
+      await other.page.waitForSelector('.gate');
+      assert.match(await other.page.locator('.gate').textContent(), /Open Harness from its launcher/);
+    } finally { await other.close(); }
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });

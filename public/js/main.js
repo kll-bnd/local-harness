@@ -22,6 +22,7 @@ import { lockdown, onLockdown, isLockError, isLockingDown } from './lockdown.js'
 import { setSecurityContext } from './security-ui.js';
 import { applyNetworkStatus, startNetworkClock } from './views/network.js';
 import { startIdleWatch, stopIdleWatch } from './views/idle.js';
+import { setMenuHandler } from './menu-bridge.js';
 
 const desktop = window.harnessDesktop || null;
 const root = document.getElementById('app');
@@ -180,7 +181,7 @@ document.addEventListener('keydown', (e) => {
 // ------------------------------------------------------------------------------------------------ desktop bridge
 if (desktop) {
   try {
-    desktop.onMenuAction?.((name, ...args) => runActionFrom('menu', name, ...args));
+    setMenuHandler((name, ...args) => runActionFrom('menu', name, ...args));
   } catch (e) { console.warn('desktop bridge', e); }
 }
 // External http(s) links (model cards, the catalogue, setup help) open in the default browser through the

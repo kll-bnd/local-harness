@@ -222,6 +222,7 @@ describe('encryption at rest and locking', () => {
         assert.equal(r.data.error.code, 'locked', p);
       }
       assert.equal(s.srv.app, null, 'no app (no open stores) while locked');
+      assert.equal((await s.call('GET', '/api/security')).data.offlineLock.externalOllama, true, 'a foreign Ollama is reported while locked too');
       assert.equal(s.srv.security.state, 'locked');
       assert.throws(() => s.srv.auth.createSession(), (e) => e.status === 423);
       assert.equal((await s.unlock()).status, 200);
@@ -417,6 +418,51 @@ describe('upgrades, modes and key-store damage', () => {
       assert.equal(st.data.error.code, 'vault_missing');
       assert.equal((await s.call('POST', '/api/security/setup', { password: PW })).status, 409);
       assert.ok(!fss.existsSync(path.join(dataDir, 'vault.json')), 'nothing was created over the encrypted files');
+    } finally { await s.close(); }
+  });
+});
+
+describe('files the backend does not own', () => {
+  test('launcher files (desktop.json, native/, Electron/) are never encrypted, chmod-ed or counted; an earlier build\'s mistake is repaired', async () => {
+    const fresh = await tmpDir('harness-own-');
+    fss.writeFileSync(path.join(fresh, 'desktop.json'), '{"window":{"w":1200}}');
+    const probe = await stack({ dataDir: fresh });
+    try {
+      const st = (await probe.call('GET', '/api/security')).data;
+      assert.equal(st.state, 'needs_setup');
+      assert.equal(st.plainDataFound, false, 'a launcher\'s desktop.json is not 0.1 data');
+    } finally { await probe.close(); }
+    const launcher = {
+      'desktop.json': '{"window":{"w":1200}}',
+      'native/window-state.json': '{"x":1}',
+      'native/app.lock': '4242',
+      'Electron/Local Storage/leveldb/000003.log': 'chromium bytes',
+      'Electron/window-state.json': '{"y":2}',
+    };
+    const s = await stack({
+      prepare: async (dir) => {
+        for (const [rel, text] of Object.entries(launcher)) { fss.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fss.writeFileSync(path.join(dir, rel), text, { mode: 0o644 }); }
+      },
+    });
+    try {
+      await s.setup();
+      await s.call('POST', '/api/chats', { title: 'owned' });
+      await s.srv.app.chats.flush();
+      for (const [rel, text] of Object.entries(launcher)) {
+        assert.equal(fss.readFileSync(path.join(s.dataDir, rel), 'utf8'), text, `${rel} untouched`);
+        assert.equal(fss.statSync(path.join(s.dataDir, rel)).mode & 0o777, 0o644, `${rel} permissions untouched`);
+      }
+      // what an earlier 0.2 build did: encrypt a launcher file → decrypted back in place at the next unlock
+      fss.writeFileSync(path.join(s.dataDir, 'desktop.json'), encryptHXC(s.srv.core.vault.dek, Buffer.from(launcher['desktop.json'])));
+      fss.writeFileSync(path.join(s.dataDir, 'native/window-state.json'), encryptHXC(s.srv.core.vault.dek, Buffer.from(launcher['native/window-state.json'])));
+      await s.call('POST', '/api/security/lock', {});
+      assert.equal((await s.unlock()).status, 200);
+      assert.equal(fss.readFileSync(path.join(s.dataDir, 'desktop.json'), 'utf8'), launcher['desktop.json']);
+      assert.equal(fss.readFileSync(path.join(s.dataDir, 'native/window-state.json'), 'utf8'), launcher['native/window-state.json']);
+      // switching encryption off leaves them alone too
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'off', password: PW })).status, 200);
+      await waitFor(async () => (await s.call('GET', '/api/security')).data.state === 'unlocked', { timeout: 15000 });
+      for (const [rel, text] of Object.entries(launcher)) assert.equal(fss.readFileSync(path.join(s.dataDir, rel), 'utf8'), text);
     } finally { await s.close(); }
   });
 });

@@ -191,3 +191,21 @@ on close (saves the WebContent process's memory) and recreated on reopen. The gl
 `generation.finished` and image-job events on the app's own `GET /api/events` stream, and released on lock, on a lost
 stream and when the backend stops. If the web content process dies, a dialog offers to reload. A second launch for
 the same data folder brings the first window forward.
+
+## Size and memory (measured on the runner, next to the Electron build)
+
+| | native (`scripts/build-native.sh`) | Electron (`npm run dist:app`) |
+|---|---|---|
+| `Harness.app` on disk | **120 MB** (Node.js 117 MB, app binary 0.7 MB, `server/`+`public/` 2 MB) | 309 MB |
+| download | 39 MB zip | 129 MB dmg |
+| processes at idle | app, `node` backend, WebKit WebContent, WebKit Networking | main (with the backend in it), renderer, GPU and network helpers |
+| resident memory (RSS), idle | **239 MB** (app 89, node 74, WebContent 56, Networking 20) | 418 MB (main 169, helpers 91 + 52, renderer 106) |
+| physical footprint, idle | **93 MB** (app 21, node 31, WebContent 36, Networking 5) | 107 MB (main 50, helpers 20 + 8, renderer 29) |
+
+Both measured 15–20 s after start on a fresh data folder, at the UI's first-run password screen, with
+`ps -o rss` and macOS's `footprint` (`native/test/run-selftest.mjs`, `native/ci/electron-memory.mjs`); Ollama is the
+same in both and not included. RSS counts shared system-framework pages once per process, so the footprint is the
+better measure of what the app costs the Mac: the native app saves about 15 MB of footprint and ~180 MB of RSS at
+idle, ~190 MB of disk, and Chromium entirely. Most of the remaining cost is the backend (the same Node.js process in
+every mode) and the web content; the chat model (~4 GB) dwarfs both. After a few chats the backend grows (165 MB
+footprint was measured mid-test with a model loaded), as it does in every mode.

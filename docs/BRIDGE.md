@@ -72,8 +72,9 @@ reads a length above 1,048,581 treats the stream as corrupt and stops.
 
 ### Events (`EVENT`)
 
-- `{ "type": "ready", "protocol": 1, "version": "0.2.0", "locked": true, "encryption": { "mode": "password" }, "offlineLock": true }`
-  once requests will be answered. Requests sent before `ready` are queued. `locked: true` means the UI can
+- `{ "type": "ready", "protocol": 1, "version": "0.2.0", "locked": true, "state": "needs_setup", "encryption": { "mode": "password" }, "offlineLock": true }`
+  once requests will be answered (`state` is the security state of `GET /api/security`: `needs_setup`, `locked`,
+  `migrating`, `unlocked` or `error`). Requests sent before `ready` are queued. `locked: true` means the UI can
   load and will show its lock screen; everything except the lock routes answers with HTTP status 423
   until the password has been accepted.
 - `{ "type": "locked" }` and `{ "type": "unlocked" }` whenever that state changes, so the app can enable

@@ -175,13 +175,37 @@ export class ChatEngine {
     return true;
   }
 
+  /**
+   * The first message after unlocking must not fail because the Ollama that Harness starts itself is still
+   * coming up: when the chat would use the built-in Ollama, it is not answering, and Harness is starting it (or
+   * may start it), wait for that start (bounded by OllamaProcess.start's own timeout). `onWait()` is called once
+   * before waiting (the route shows model_status loading / starting_ollama). Never throws.
+   */
+  async ensureOllamaUp(chat, modelRef = null, onWait = null) {
+    try {
+      const ref = modelRef || this.effectiveSettings(chat).model;
+      if (ref?.providerId && ref.providerId !== 'ollama') return;
+      const provider = this.app.registry.ollama();
+      if (!provider) return;
+      if ((await this.app.registry.status(provider)).ok) return;
+      const proc = this.app.ollamaProcess;
+      const mayStart = this.app.settings.get().ollama?.autoStart !== false && process.env.HARNESS_NO_OLLAMA_AUTOSTART !== '1' && proc.info().installed;
+      if (!proc.starting && !mayStart) return;
+      onWait?.();
+      await proc.start();
+      this.app.registry.invalidate();
+      await this.app.registry.status(provider, { refresh: true });
+    } catch (e) { log.warn(`Waiting for Ollama: ${e.message}`); }
+  }
+
   /** Resolve model, metadata, context plan and budgets for a chat. */
   async target(chat, modelRef = null) {
     const s = this.effectiveSettings(chat);
     const { provider, model } = await this.app.registry.resolve(modelRef || s.model);
     const st = await this.app.registry.status(provider);
     if (!st.ok && egressBlocked(provider.baseUrl)) throw new OfflineLockError('remote_provider', new URL(provider.baseUrl).hostname);
-    if (!st.ok) throw new ProviderError(`${provider.name} is not running at ${provider.baseUrl}${provider.id === 'ollama' ? ' — start Ollama (POST /api/providers/ollama/start)' : ''}`, { status: 503, code: 'connection_failed', providerId: provider.id });
+    const startError = provider.id === 'ollama' && this.app.ollamaProcess?.lastError ? ` (Harness tried to start it: ${this.app.ollamaProcess.lastError})` : '';
+    if (!st.ok) throw new ProviderError(`${provider.name} is not running at ${provider.baseUrl}${startError}${provider.id === 'ollama' && !startError ? ' — start Ollama (POST /api/providers/ollama/start)' : ''}`, { status: 503, code: 'connection_failed', providerId: provider.id });
     const info = await this.app.registry.modelInfo(provider, model);
     if (info.capabilities.includes('embedding') && !info.capabilities.includes('completion')) throw new HttpError(400, 'not_chat_model', `${model} is an embedding model and cannot chat`);
     let otherModelsBytes = 0;

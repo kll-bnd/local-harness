@@ -5,6 +5,11 @@
 //   npm run dev:fake                      # UI at http://127.0.0.1:4747
 //   npm run dev:fake -- --ram 8           # pretend the machine has 8 GB RAM (low-RAM code paths)
 //   npm run dev:fake -- --delay 40 --step 150 --port 4747 --data .harness-dev --fresh
+//   npm run dev:fake -- --insecure       # no password, no API sessions, internet not blocked (explicit opt-out)
+//
+// By default the stack runs with the shipped 0.2 defaults: the UI asks for a password first (the data dir is
+// encrypted), and internet access is blocked. Once encrypted, settings.json cannot be rewritten from here: the
+// fakes keep their default ports, so the wiring from the first start stays valid (use --fresh to start over).
 //
 // Fakes prefer their real default ports (11434, 7860, 8188, 8080) and fall back to free ports.
 import fs from 'node:fs/promises';
@@ -35,15 +40,22 @@ if (args.fresh === 'true') await fs.rm(dataDir, { recursive: true, force: true }
 await fs.mkdir(dataDir, { recursive: true });
 const settingsFile = path.join(dataDir, 'settings.json');
 let settings = {};
-try { settings = JSON.parse(await fs.readFile(settingsFile, 'utf8')); } catch { /* first run */ }
+let encrypted = false;
+try {
+  const raw = await fs.readFile(settingsFile);
+  encrypted = raw.subarray(0, 4).toString('latin1') === 'HXC1';
+  if (!encrypted) settings = JSON.parse(raw.toString('utf8'));
+} catch { /* first run */ }
 settings.providers = { ...(settings.providers || {}), autodetect: true, builtin: { ...(settings.providers?.builtin || {}), ollama: { enabled: true, baseUrl: ollama.url }, llamacpp: { enabled: true, baseUrl: openai.url }, lmstudio: { enabled: false, baseUrl: 'http://127.0.0.1:1234' } } };
 settings.image = { ...(settings.image || {}), autodetect: true, builtin: { a1111: { enabled: true, baseUrl: a1111.url }, comfyui: { enabled: true, baseUrl: comfy.url } } };
 settings.ollama = { ...(settings.ollama || {}), autoStart: false };
-await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2));
+if (!encrypted) await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2));
 
 if (args.ram) process.env.HARNESS_TOTALMEM_BYTES = String(Number(args.ram) * 1024 ** 3);
 const { startServer } = await import('../server/index.mjs');
-const srv = await startServer({ port: Number(args.port || 4747), dataDir, openBrowser: args.open === 'true' });
+const insecure = args.insecure === 'true';
+const srv = await startServer({ port: Number(args.port || 4747), dataDir, openBrowser: args.open === 'true', ...(insecure ? { security: { mode: 'off', apiAuth: false }, offlineLock: false } : {}) });
+const sec = srv.core.securityStatus();
 
 console.log(`
 Harness dev stack (fake backends)
@@ -53,6 +65,7 @@ Harness dev stack (fake backends)
   fake ComfyUI       ${comfy.url}
   fake llama.cpp     ${openai.url}   (OpenAI-compatible chat + images)
   data dir           ${dataDir}${args.ram ? `\n  simulated RAM      ${args.ram} GB` : ''}
+  security           ${insecure ? 'OFF (--insecure)' : `${sec.mode} mode, ${sec.state}${sec.state === 'needs_setup' ? ' — choose a password in the UI' : ''}`}; internet ${sec.offlineLock.blocked ? 'blocked' : 'allowed'}${encrypted ? '\n  note               settings.json is encrypted: backend wiring kept from the first start' : ''}
 
 Trigger phrases for the fake model: "calculate 2+2", "what time is it", "please remember that ...",
 "draw a red fox", "long answer 200", "my name is Ada". Use qwen3:4b for thinking, deepseek-r1:1.5b for <think> tags.

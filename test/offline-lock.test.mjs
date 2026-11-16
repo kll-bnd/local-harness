@@ -34,7 +34,7 @@ async function blockedStack({ settings = {}, fake } = {}) {
 
 describe('the blocker', () => {
   test('on by default; allow opens a time-boxed window that ends by itself; block ends it at once', async () => {
-    const fake = await startFakeOllama({ port: 0 });
+    const fake = await startFakeOllama({ port: 0, pullStepMs: 40 });
     const s = await blockedStack({ fake });
     try {
       const n = await s.call('GET', '/api/network');
@@ -55,8 +55,7 @@ describe('the blocker', () => {
       await waitFor(() => net.blocked && JSON.parse(fss.readFileSync(path.join(s.dataDir, 'launch.json'), 'utf8')).offlineLockSuspendedUntil === null, { timeout: 3000 });
       // a download started inside the window keeps it open until it ends (waitingFor), then blocking resumes
       await s.call('POST', '/api/network/allow', { minutes: 5 });
-      fake.installed.delete('qwen3:4b');
-      const pullP = fetch(`${s.srv.url}/api/models/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'qwen3:0.6b' }) }).then((r) => r.text());
+      const pullP = fetch(`${s.srv.url}/api/models/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'llama3.2:3b' }) }).then((r) => r.text());
       await waitFor(() => net.downloads.size > 0);
       net.launch.set({ offlineLockSuspendedUntil: new Date(Date.now() + 30).toISOString() });
       net._arm();

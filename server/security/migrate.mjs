@@ -15,31 +15,78 @@ import { log } from '../lib/log.mjs';
 
 const TMP_SUFFIX = '.harness-migrate.tmp';
 
-/** Should this path ever be encrypted? (plain-by-design files, logs, temporaries and quarantined files are not) */
-export function isDataFile(file) {
+/**
+ * What the backend owns in the data directory — an explicit allow-list, so files of the launchers (desktop.json,
+ * native/, Electron/ …) or anything else are never encrypted, decrypted, chmod-ed or counted as user data.
+ */
+export const OWNED_FILES = new Set(['settings.json', 'presets.json', 'calibration.json', 'memories.json', 'model-copies.json', 'ui-state.json']);
+export const OWNED_DIRS = new Set(['chats', 'attachments', 'images', 'index']);
+export const OWNED_PLAIN = new Set(['launch.json', 'vault.json', 'vault.json.bak', 'harness.lock', 'measurements.json', 'api-token', '.dev-keychain']);
+
+/** Is `file` (absolute, under dataDir) an encrypted-by-design file the backend owns? */
+export function isDataFile(file, dataDir) {
   const b = path.basename(file);
   if (isPlainFile(file)) return false;
   if (b.endsWith('.tmp') || b.includes('.corrupt-') || b.startsWith('.')) return false;
-  return true;
+  if (!dataDir) return true;
+  const rel = path.relative(dataDir, file);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  const parts = rel.split(path.sep);
+  return parts.length === 1 ? OWNED_FILES.has(parts[0]) : OWNED_DIRS.has(parts[0]);
 }
 
-/** Every data file under `dir` (sorted, so progress is stable), and stale temporaries removed. */
+async function walkFiles(root, out, { limit = 200000 } = {}) {
+  let entries;
+  try { entries = await fs.readdir(root, { withFileTypes: true }); } catch { return; }
+  for (const e of entries) {
+    if (out.length >= limit) return;
+    const full = path.join(root, e.name);
+    if (e.isSymbolicLink()) continue;
+    if (e.isDirectory()) await walkFiles(full, out, { limit });
+    else if (e.isFile()) out.push(full);
+  }
+}
+
+/** Every data file the backend owns under `dir` (sorted, so progress is stable); stale temporaries removed. */
 export async function listDataFiles(dir) {
+  const all = [];
+  for (const f of OWNED_FILES) { try { if ((await fs.lstat(path.join(dir, f))).isFile()) all.push(path.join(dir, f)); } catch { /* absent */ } }
+  for (const d of OWNED_DIRS) await walkFiles(path.join(dir, d), all);
   const out = [];
-  const walk = async (d) => {
-    let entries;
-    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      const full = path.join(d, e.name);
-      if (e.isSymbolicLink()) continue;
-      if (e.isDirectory()) { await walk(full); continue; }
-      if (!e.isFile()) continue;
-      if (e.name.endsWith(TMP_SUFFIX)) { await fs.rm(full, { force: true }); continue; }
-      if (isDataFile(full)) out.push(full);
-    }
-  };
-  await walk(dir);
+  for (const f of all) {
+    if (f.endsWith(TMP_SUFFIX)) { await fs.rm(f, { force: true }); continue; }
+    if (isDataFile(f, dir)) out.push(f);
+  }
   return out.sort();
+}
+
+/** Files under `dir` the backend does NOT own (launchers' files and anything else). */
+export async function listForeignFiles(dir, { limit = 20000 } = {}) {
+  let entries;
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return []; }
+  const out = [];
+  for (const e of entries) {
+    if (OWNED_FILES.has(e.name) || OWNED_DIRS.has(e.name) || OWNED_PLAIN.has(e.name) || e.isSymbolicLink()) continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) await walkFiles(full, out, { limit });
+    else if (e.isFile()) out.push(full);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/**
+ * Repair: an earlier 0.2 build encrypted files it did not own (desktop.json, native/, Electron/). Decrypt every
+ * such file back in place (verified, atomic) with the keys the directory cipher knows. Returns how many.
+ */
+export async function repairForeignFiles(dir) {
+  let fixed = 0;
+  for (const f of await listForeignFiles(dir)) {
+    const head = await readHead(f).catch(() => Buffer.alloc(0));
+    if (!isHXC(head) && !isHXL(head)) continue;
+    try { if ((await convertFile(f, null)) === 'converted') fixed++; } catch (e) { log.warn(`Could not decrypt a launcher file back (${path.relative(dir, f)}): ${e.code || e.message}`); }
+  }
+  return fixed;
 }
 
 /** True when any 0.1-style (plain) data file exists — an upgrade that needs a password to encrypt it. */
@@ -65,8 +112,9 @@ export async function hasEncryptedData(dir) {
   return false;
 }
 
-/** Fix permissions: directories 0700, files 0600 (best effort). */
+/** Fix permissions of what the backend owns: the data folder 0700; its own files 0600, its own folders 0700. */
 export async function fixPermissions(dir) {
+  await fs.chmod(dir, 0o700).catch(() => {});
   const walk = async (d) => {
     await fs.chmod(d, 0o700).catch(() => {});
     let entries;
@@ -78,7 +126,11 @@ export async function fixPermissions(dir) {
       else if (e.isFile()) await fs.chmod(full, 0o600).catch(() => {});
     }
   };
-  await walk(dir);
+  for (const name of [...OWNED_FILES, ...OWNED_PLAIN]) {
+    const f = path.join(dir, name);
+    try { if ((await fs.lstat(f)).isFile()) await fs.chmod(f, 0o600); } catch { /* absent */ }
+  }
+  for (const d of OWNED_DIRS) { try { if ((await fs.lstat(path.join(dir, d))).isDirectory()) await walk(path.join(dir, d)); } catch { /* absent */ } }
 }
 
 /**

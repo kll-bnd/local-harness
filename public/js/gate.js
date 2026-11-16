@@ -78,9 +78,10 @@ function lockFlow(sec) {
     let cancelCountdown = null;
     const err = h('div.gate-error', { role: 'alert' });
     const waitLine = h('div.gate-wait', { role: 'status' });
-    const pw = passwordField({ label: 'Password', autocomplete: 'current-password' });
+    const pw = passwordField({ label: 'Password', autocomplete: 'current-password', placeholder: 'Password' });
     const keyInput = h('textarea.input.rk-input', { id: 'rk-input', rows: 2, placeholder: 'HRK1-XXXX-XXXX-…', attrs: { 'aria-label': 'Recovery key', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false' } });
-    const submitBtn = h('button.btn.btn-primary.btn-large.gate-submit', { type: 'submit' }, 'Unlock');
+    const keychainFirst = mode === 'keychain' && sec.state === 'locked';
+    const submitBtn = h(`button.btn${keychainFirst ? '' : '.btn-primary'}.btn-large.gate-submit`, { type: 'submit' }, keychainFirst ? 'Unlock with password' : 'Unlock');
     const fieldBox = h('div.gate-field');
     const switchLink = h('button.btn-link.gate-switch', { type: 'button', on: { click: () => { useKey = !useKey; render(); } } });
     const keyNote = h('p.gate-note', { hidden: true }, 'Your recovery key is the one Harness showed you once when you chose your password (it starts with HRK1). After unlocking with it you can choose a new password.');
@@ -95,7 +96,9 @@ function lockFlow(sec) {
         : [pw.el]);
       switchLink.textContent = useKey ? 'Use your password instead' : 'Use recovery key instead';
       keyNote.hidden = !useKey;
-      (useKey ? keyInput : pw.input).focus();
+      if (keychainBtn && !useKey && !render.done) keychainBtn.focus();
+      else (useKey ? keyInput : pw.input).focus();
+      render.done = true;
     };
 
     const attempt = async (body) => {

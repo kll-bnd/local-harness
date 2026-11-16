@@ -489,9 +489,9 @@ async function main() {
     const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else files.push(f); } };
     walk(dataDir);
     const encrypted = files.filter((f) => { const h = Buffer.alloc(4); const fd = fs.openSync(f, 'r'); try { fs.readSync(fd, h, 0, 4, 0); } finally { fs.closeSync(fd); } return /^HX[CL]1$/.test(h.toString('latin1')); });
-    const modes = files.map((f) => fs.statSync(f).mode & 0o777).filter((m) => m !== 0o600);
+    const loose = files.filter((f) => (fs.statSync(f).mode & 0o777) !== 0o600).map((f) => `${path.relative(dataDir, f)} ${(fs.statSync(f).mode & 0o777).toString(8)}`);
     const dirMode = fs.statSync(dataDir).mode & 0o777;
-    if (modes.length || dirMode !== 0o700) fail(`permissions: data dir ${dirMode.toString(8)}, ${modes.length} file(s) not 0600`);
+    if (loose.length || dirMode !== 0o700) fail(`permissions: data dir ${dirMode.toString(8)}, not 0600: ${loose.join(', ')}`);
     return { key: `marker found through the API, in 0 of ${files.length} files on disk (${encrypted.length} encrypted, the rest plain by design); dir 0700, files 0600` };
   });
 

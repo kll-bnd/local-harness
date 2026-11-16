@@ -35,9 +35,11 @@ export function lockdown(reason = 'locked') {
   document.body.replaceChildren(root);
   document.documentElement.classList.remove('ready');
   document.title = 'Harness';
-  // A page that keeps being told it is locked right after reloading would loop; stop after a few tries.
+  // A page that is told it is locked right after opening the app, again and again, would reload in a loop (a
+  // backend that says "unlocked" but answers 423): count only such early lockdowns and stop after three.
   const st = history.state && typeof history.state === 'object' ? history.state : {};
-  const recent = (Array.isArray(st.harnessLockdowns) ? st.harnessLockdowns : []).filter((t) => Date.now() - t < 15000);
+  const early = performance.now() < 3000;
+  const recent = early ? (Array.isArray(st.harnessLockdowns) ? st.harnessLockdowns : []).filter((t) => Date.now() - t < 30000) : [];
   if (recent.length >= 3) {
     splash.innerHTML = '';
     const p = document.createElement('p');
@@ -50,6 +52,6 @@ export function lockdown(reason = 'locked') {
     splash.append(p, b);
     return;
   }
-  try { history.replaceState({ ...st, harnessLockdowns: [...recent, Date.now()] }, ''); } catch { /* ignore */ }
+  try { history.replaceState({ ...st, harnessLockdowns: early ? [...recent, Date.now()] : [] }, ''); } catch { /* ignore */ }
   location.reload();
 }

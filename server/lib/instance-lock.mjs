@@ -71,7 +71,7 @@ export async function acquireDataDirLock(dataDir) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const info = { pid: process.pid, url: null, port: null, startedAt: new Date().toISOString(), hostname: os.hostname(), dataDir: key };
     try {
-      const fd = fs.openSync(file, 'wx');
+      const fd = fs.openSync(file, 'wx', 0o600);
       try { fs.writeSync(fd, JSON.stringify(info)); } finally { fs.closeSync(fd); }
       const rec = { file, info };
       held.set(key, rec);
@@ -80,7 +80,7 @@ export async function acquireDataDirLock(dataDir) {
         update(patch) {
           Object.assign(rec.info, patch);
           const tmp = `${file}.${process.pid}.tmp`;
-          fs.writeFileSync(tmp, JSON.stringify(rec.info));
+          fs.writeFileSync(tmp, JSON.stringify(rec.info), { mode: 0o600 });
           fs.renameSync(tmp, file);
         },
         release() {

@@ -8,7 +8,7 @@ import { Vault } from './security/vault.mjs';
 import { NetworkGuard } from './security/network.mjs';
 import { Auth } from './security/auth.mjs';
 import { platformKeychain, KeychainError } from './security/keychain.mjs';
-import { listDataFiles, migrateDir, hasPlainData, hasEncryptedData, fixPermissions } from './security/migrate.mjs';
+import { listDataFiles, migrateDir, hasPlainData, hasEncryptedData, fixPermissions, repairForeignFiles } from './security/migrate.mjs';
 import { seal, unseal, wipe, keyIdOf, setKdfDefaults } from './security/crypto.mjs';
 import { setDirCipher, ensureDir, flushWrites } from './lib/fsx.mjs';
 import { HttpError } from './lib/errors.mjs';
@@ -361,6 +361,9 @@ export class Core extends EventEmitter {
       if (old) this._oldKeys = [old];
     }
     setDirCipher(this.dataDir, { key: this.vault.dek, oldKeys: this._oldKeys || [] });
+    // an earlier 0.2 build encrypted launcher files (desktop.json, native/, Electron/): give them back
+    const repaired = await repairForeignFiles(this.dataDir).catch(() => 0);
+    if (repaired) log.warn(`Decrypted ${repaired} launcher file(s) that an earlier version had encrypted by mistake.`);
     if (m) { this._startMigration(m.op, m.op === 'decrypt' ? null : this.vault.dek, { resume: true }); return; }
     if (!this.vault.encrypted && this.mode !== 'off') { this.vault.setEncrypted(true); this._startMigration('encrypt', this.vault.dek); return; }
     await this._open();
