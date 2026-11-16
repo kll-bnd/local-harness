@@ -15,7 +15,7 @@ const EXTRA = [
 export function openShortcuts() {
   const groups = new Map();
   for (const a of allActions()) {
-    if (!a.keys?.length || a.palette === false) continue;
+    if (!a.keys?.length) continue;
     const g = a.group || 'General';
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push([a.title, a.keys.slice(0, 2)]);
