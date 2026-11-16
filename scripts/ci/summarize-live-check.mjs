@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // CI-only: print a compact summary of a live-check JSON result (every check that did not pass).
+// Exits 1 when any check FAILed and 2 when there is no result, so the job cannot report success over a failure.
 import fs from 'node:fs';
 
 const file = process.argv[2];
 let j;
-try { j = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { console.log(`no live-check result at ${file}: ${e.message}`); process.exit(0); }
+try { j = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { console.log(`no live-check result at ${file}: ${e.message}`); process.exit(2); }
 const clip = (s, n) => { const t = typeof s === 'string' ? s : JSON.stringify(s); return t && t.length > n ? `${t.slice(0, n)}…` : t; };
 console.log(`live-check ${j.toolVersion}: ${JSON.stringify({ total: j.summary.total, PASS: j.summary.PASS, WARN: j.summary.WARN, FAIL: j.summary.FAIL, SKIP: j.summary.SKIP })} exit ${j.exitCode} in ${Math.round(j.durationMs / 1000)} s`);
 console.log(`by group: ${JSON.stringify(j.summary.byGroup)}`);
@@ -21,3 +22,4 @@ for (const c of j.checks.filter((x) => x.status !== 'PASS').sort((a, b) => order
 }
 const want = (process.argv[3] || '').split(',').filter(Boolean);
 for (const [name, sample] of Object.entries(j.samples || {})) if (want.some((w) => name.includes(w))) console.log(`sample ${name}: ${clip(sample, 900)}`);
+if (j.summary.FAIL > 0) { console.log(`${j.summary.FAIL} check(s) FAILED`); process.exit(1); }

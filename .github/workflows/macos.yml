@@ -13,7 +13,7 @@ on:
         description: "Which jobs to run"
         type: choice
         default: all
-        options: [all, backend, desktop, native, live, e2e, hub, ollama, nemotron]
+        options: [all, backend, desktop, ui, native, live, e2e, hub, ollama, nemotron]
       live_groups:
         description: "live-check groups to run"
         type: string
@@ -26,6 +26,10 @@ on:
         description: "Nemotron quant tag to pull from hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF"
         type: string
         default: UD-Q3_K_XL
+      ui_filter:
+        description: "ui job: only tests whose name matches this pattern (empty = all)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -111,12 +115,6 @@ jobs:
         run: |
           set -o pipefail
           HARNESS_E2E_APP="$PWD/dist/mac-arm64/Harness.app/Contents/MacOS/Harness" npm run test:e2e 2>&1 | grep -vE '^ok ' | tail -n 40
-      - name: UI tests in WebKit (Safari engine)
-        continue-on-error: true
-        run: |
-          npm install --no-save playwright > /dev/null 2>&1
-          npx playwright install webkit > /dev/null 2>&1
-          HARNESS_UI_BROWSER=webkit npm run test:ui 2>&1 | grep -E '^(not ok|# (tests|pass|fail))|^  +(error|message):' | head -n 80
       - uses: actions/upload-artifact@v4
         with:
           name: Harness-mac-arm64
@@ -135,6 +133,34 @@ jobs:
           xattr -l "$APP" | head -n 5 || true
           plutil -p "$APP/Contents/Info.plist" | grep -E 'CFBundle(Name|Identifier|ShortVersionString|IconFile)|LSMinimumSystemVersion'
           npx asar list "$APP/Contents/Resources/app.asar" | awk -F/ 'NF>1 {print $2}' | sort | uniq -c
+
+  ui:
+    name: Web UI in WebKit (the engine of the native app and Safari)
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'ui' }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      UI_FILTER: ${{ inputs.ui_filter }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Playwright and its WebKit build
+        run: |
+          npm install --no-save playwright > /dev/null 2>&1
+          npx playwright install webkit > /dev/null 2>&1
+          node -e "console.log('playwright ' + require('playwright/package.json').version)"
+      - name: UI tests in WebKit
+        # The job fails when a test fails. The log ends with the counts and the details of every failing test.
+        run: |
+          set +e
+          HARNESS_UI_BROWSER=webkit node --test --test-concurrency=2 --test-reporter=spec ${UI_FILTER:+--test-name-pattern="$UI_FILTER"} "test/ui/*.test.mjs" > "$RUNNER_TEMP/ui-webkit.log" 2>&1
+          code=$?
+          awk '/failing tests:/{p=1} p' "$RUNNER_TEMP/ui-webkit.log" | grep -vE 'node:(internal|async_hooks)' | cut -c1-700 | head -n 320
+          LC_ALL=C grep -aE '^[^a-zA-Z0-9]{1,5}(tests|suites|pass|fail|cancelled|skipped|duration_ms) [0-9.]+$' "$RUNNER_TEMP/ui-webkit.log"
+          echo "node --test exit code $code"
+          exit $code
 
   live:
     name: Live check against a real Ollama
@@ -167,6 +193,7 @@ jobs:
         run: |
           node scripts/live-check.mjs --only "${{ inputs.live_groups || 'env,ollama,e2e' }}" --allow-pull --allow-internet --timeout-scale 4 --quiet --no-color \
             --json /tmp/harness-live.json --markdown /tmp/harness-live.md || echo "live-check exit code $?"
+          # Prints every check that did not pass and exits non-zero when any check FAILed (warnings do not fail the job).
           node scripts/ci/summarize-live-check.mjs /tmp/harness-live.json "${{ inputs.live_samples }}"
 
   e2e:
