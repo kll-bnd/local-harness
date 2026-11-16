@@ -13,6 +13,8 @@ import { createFakeMemoryProbe } from './fake-memory-probe.mjs';
 import { startServer } from '../server/index.mjs';
 import { fileKeychain } from '../server/security/keychain.mjs';
 import { encryptHXC } from '../server/security/crypto.mjs';
+import { Vault } from '../server/security/vault.mjs';
+import { egressBlocked } from '../server/security/egress.mjs';
 
 const FAST = { N: 1024, r: 8, p: 1 };
 const PW = 'correct horse battery';
@@ -31,7 +33,8 @@ async function stack({ dataDir, mode, apiAuth, offlineLock, keychain, settings =
   const srv = await startServer({
     port: 0, dataDir, autodetect: false, logLevel: 'silent', processGuards: false,
     system: { totalMem: 16 * GiB, memoryProbe: createFakeMemoryProbe(fake) },
-    security: { kdf: FAST, ...(mode ? { mode } : { mode: 'password' }), ...(apiAuth === undefined ? { apiAuth: true } : { apiAuth }) },
+    // mode 'launch': no override at all — launch.json is the only hint, as for the shipped launchers
+    security: { kdf: FAST, ...(mode === 'launch' ? { mode: null } : mode ? { mode } : { mode: 'password' }), ...(apiAuth === undefined ? { apiAuth: true } : { apiAuth }) },
     offlineLock: offlineLock === undefined ? true : offlineLock,
     keychain: keychain || 'file', // never the real macOS Keychain from a test
   });
@@ -622,6 +625,354 @@ describe('UI state and backups', () => {
       await assert.rejects(readJson(f), (e) => e.code === 'wrong_key');
       assert.deepEqual(fss.readFileSync(f), other);
       assert.ok(c.status === 201);
+    } finally { await s.close(); }
+  });
+});
+
+// Review 02, findings F1/F2: files that are not authenticated (launch.json, the plain fields of vault.json) may only
+// make Harness MORE protective. What lowers protection comes from the password in this process or from the security
+// record sealed under the data key (docs/API.md §10.2).
+describe('plain files cannot lower protection (review 01, 05, 06)', () => {
+  const readJ = (dir, f) => JSON.parse(fss.readFileSync(path.join(dir, f), 'utf8'));
+  const writeVault = (dir, v) => { for (const f of ['vault.json', 'vault.json.bak']) fss.writeFileSync(path.join(dir, f), JSON.stringify(v, null, 2)); };
+  const editLaunch = (dir, patch) => fss.writeFileSync(path.join(dir, 'launch.json'), JSON.stringify({ ...readJ(dir, 'launch.json'), ...patch }));
+  const sec = async (s) => (await s.call('GET', '/api/security')).data;
+  const stopper = (dir) => { const f = path.join(dir, 'chats', 'zzzz-stopper.json'); fss.writeFileSync(f, encryptHXC(Buffer.alloc(32, 9), Buffer.from('{}'))); return f; };
+
+  test('review 01: a decryption written into vault.json by hand is not run — the data stays encrypted and lockable; reported until dismissed', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.call('POST', '/api/chats', { title: 'TAMPER-01-MARKER' });
+      await s.call('POST', '/api/memories', { content: 'TAMPER-01-MEMORY' });
+      await s.close({ keep: true });
+      const v = readJ(dataDir, 'vault.json');
+      v.migration = { op: 'decrypt', done: 0, total: 0, startedAt: new Date().toISOString(), error: null };
+      v.encrypted = false;
+      writeVault(dataDir, v);
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).state, 'locked');
+      assert.equal((await sec(s)).migration, null, 'the plain hint is not reported as a running conversion');
+      assert.equal((await s.unlock()).status, 200);
+      const st = await sec(s);
+      assert.equal(st.mode, 'password');
+      assert.equal(st.migration, null);
+      assert.deepEqual([...st.tamper.fields].sort(), ['vault.json: encrypted', 'vault.json: migration']);
+      assert.ok(Date.parse(st.tamper.at) > 0);
+      await s.call('POST', '/api/memories', { content: 'TAMPER-01-AFTER' });
+      const v2 = readJ(dataDir, 'vault.json');
+      assert.equal(v2.migration, null, 'the hint is rewritten');
+      assert.equal(v2.encrypted, true);
+      assert.equal((await s.call('POST', '/api/security/lock', {})).status, 200, 'still lockable');
+      assert.ok((await sec(s)).tamper, 'the notice outlives a lock');
+      await s.close({ keep: true });
+      assert.deepEqual(grepDir(dataDir, 'TAMPER-01'), [], 'nothing was decrypted, new data is encrypted too');
+      // the notice is kept in the record until the owner dismisses it
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).tamper, null, 'not known before the record is opened');
+      await s.unlock();
+      assert.ok((await sec(s)).tamper.fields.includes('vault.json: migration'));
+      assert.equal((await s.call('POST', '/api/security/tamper/dismiss', {}, { token: null })).status, 401, 'dismissing needs a session');
+      assert.deepEqual((await s.call('POST', '/api/security/tamper/dismiss', {})).data, { tamper: null });
+      assert.equal((await sec(s)).tamper, null);
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      assert.equal((await sec(s)).tamper, null);
+    } finally { await s.close(); }
+  });
+
+  test('review 05: launch.json "off" or "keychain" over an encrypted folder — still password mode, no api-token (a planted one is refused), idle lock on', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.call('POST', '/api/memories', { content: 'TAMPER-05-MEMORY' });
+      await s.close({ keep: true });
+      const planted = 'A'.repeat(43);
+      for (const encryption of ['off', 'keychain']) {
+        editLaunch(dataDir, { encryption });
+        fss.writeFileSync(path.join(dataDir, 'api-token'), planted + '\n');
+        s = await stack({ dataDir, mode: 'launch' });
+        const before = await sec(s);
+        assert.equal(before.state, 'locked');
+        assert.notEqual(before.mode, 'off');
+        assert.ok(!fss.existsSync(path.join(dataDir, 'api-token')), `no api-token before the key (${encryption})`);
+        assert.equal((await s.call('POST', '/api/auth/launch-code', {}, { token: planted })).status, 401);
+        assert.equal((await s.unlock()).status, 200);
+        const st = await sec(s);
+        assert.equal(st.mode, 'password');
+        assert.ok(st.idleLockAt, 'idle lock on');
+        assert.ok(!fss.existsSync(path.join(dataDir, 'api-token')));
+        assert.equal((await s.call('GET', '/api/memories', undefined, { token: planted })).status, 401);
+        assert.ok(st.tamper.fields.includes('launch.json: encryption'), JSON.stringify(st.tamper));
+        assert.equal(readJ(dataDir, 'launch.json').encryption, 'password', 'rewritten');
+        await s.call('POST', '/api/security/tamper/dismiss', {});
+        await s.close({ keep: true });
+      }
+      assert.deepEqual(grepDir(dataDir, 'TAMPER-05'), []);
+    } finally { await s.close(); }
+  });
+
+  test('review 06: launch.json cannot switch the blocker off or open a window — before the key it is on whatever the file says', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.close({ keep: true });
+      for (const patch of [{ offlineLock: false }, { offlineLockSuspendedUntil: new Date(Date.now() + 30 * 86400000).toISOString() }]) {
+        editLaunch(dataDir, patch);
+        s = await stack({ dataDir, mode: 'launch' });
+        let net = (await sec(s)).offlineLock;
+        assert.deepEqual([net.enabled, net.blocked, net.allowedUntil], [true, true, null], 'locked: on');
+        assert.equal(egressBlocked('https://huggingface.co'), true);
+        await s.unlock();
+        net = (await sec(s)).offlineLock;
+        assert.deepEqual([net.enabled, net.blocked, net.allowedUntil], [true, true, null], 'unlocked: the record decides');
+        assert.equal(egressBlocked('https://huggingface.co'), true);
+        assert.ok((await sec(s)).tamper.fields.includes(`launch.json: ${Object.keys(patch)[0]}`));
+        const lj = readJ(dataDir, 'launch.json');
+        assert.deepEqual([lj.offlineLock, lj.offlineLockSuspendedUntil], [true, null], 'rewritten');
+        await s.call('POST', '/api/security/tamper/dismiss', {});
+        await s.close({ keep: true });
+      }
+    } finally { await s.close(); }
+  });
+
+  test('an allow window cannot be extended (or opened) by editing launch.json; the owner\'s own window survives a restart', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      const a = await s.call('POST', '/api/network/allow', { minutes: 5, password: PW });
+      assert.equal(a.status, 200, JSON.stringify(a.data));
+      const until = a.data.offlineLock.allowedUntil;
+      const later = new Date(Date.now() + 2 * 3600000).toISOString();
+      editLaunch(dataDir, { offlineLockSuspendedUntil: later });
+      assert.equal((await sec(s)).offlineLock.allowedUntil, until, 'a running Harness does not read the file again');
+      await s.close({ keep: true });
+      editLaunch(dataDir, { offlineLockSuspendedUntil: later });
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).offlineLock.blocked, true, 'no window before the key');
+      await s.unlock();
+      const st = await sec(s);
+      assert.equal(st.offlineLock.allowedUntil, until, 'the recorded window, not the file\'s');
+      assert.ok(st.tamper.fields.includes('launch.json: offlineLockSuspendedUntil'));
+      assert.equal(readJ(dataDir, 'launch.json').offlineLockSuspendedUntil, until);
+      await s.call('POST', '/api/security/tamper/dismiss', {});
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      const st2 = await sec(s);
+      assert.equal(st2.offlineLock.allowedUntil, until, 'the owner\'s window, restored after the unlock');
+      assert.equal(st2.tamper, null);
+      // "block" while unlocked ends it for good (record and file)
+      await s.call('POST', '/api/network/block', {});
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      assert.equal((await sec(s)).offlineLock.allowedUntil, null);
+    } finally { await s.close(); }
+  });
+
+  test('launch.json asking for MORE protection is harmless: the blocker goes on; a "password" hint over keychain mode only costs one password prompt', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      assert.equal((await s.call('PUT', '/api/network', { enabled: false, password: PW })).status, 200);
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'keychain', password: PW })).status, 200);
+      await s.close({ keep: true });
+      editLaunch(dataDir, { offlineLock: true, encryption: 'password' });
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).state, 'locked', 'the hint said password: the Keychain was not asked');
+      await s.unlock();
+      const st = await sec(s);
+      assert.equal(st.offlineLock.enabled, true, 'the file may switch the blocker on');
+      assert.equal(st.mode, 'keychain', 'the record decides the mode (the Keychain holds our key)');
+      assert.equal(st.tamper, null, 'nothing was lowered: no notice');
+      assert.equal(readJ(dataDir, 'launch.json').encryption, 'keychain');
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).state, 'unlocked', 'keychain mode opens without a prompt again');
+      assert.equal((await sec(s)).offlineLock.enabled, true, 'the raise was written into the record');
+    } finally { await s.close(); }
+  });
+
+  test('keychain mode (listener): the api-token is written only once the record confirmed keychain mode, and is new at every start', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    const tokenFile = path.join(dataDir, 'api-token');
+    try {
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'keychain', password: PW })).status, 200);
+      const t1 = fss.readFileSync(tokenFile, 'utf8').trim();
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).state, 'unlocked', 'opened with the Keychain key, no prompt');
+      const t2 = fss.readFileSync(tokenFile, 'utf8').trim();
+      assert.notEqual(t2, t1);
+      assert.equal((await s.call('GET', '/api/chats', undefined, { token: t1 })).status, 401, 'the last start\'s secret is not accepted');
+      assert.equal((await s.call('GET', '/api/chats', undefined, { token: t2 })).status, 200);
+      await s.call('POST', '/api/security/lock', {}, { token: t2 });
+      assert.equal((await s.call('POST', '/api/security/unlock', {}, { token: t2 })).status, 200, 'a lock in this process keeps the verified mode');
+      assert.equal(fss.readFileSync(tokenFile, 'utf8').trim(), t2);
+    } finally { await s.close(); }
+  });
+
+  test('an interrupted decryption the owner started resumes after the next unlock (from the record)', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.call('POST', '/api/chats', { title: 'RESUME-DECRYPT-MARKER' });
+      await s.srv.app.chats.flush();
+      const stop = stopper(dataDir); // a file that cannot be decrypted stops the conversion half-way, as a crash would
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'off', password: PW })).status, 200);
+      await waitFor(async () => (await sec(s)).migration?.error, { timeout: 15000 });
+      await s.close({ keep: true });
+      fss.rmSync(stop);
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).state, 'locked', 'off mode with a key store still starts locked');
+      assert.equal((await s.unlock()).status, 200);
+      const st = await sec(s);
+      assert.equal(st.mode, 'off');
+      assert.equal(st.tamper, null);
+      assert.ok(grepDir(dataDir, 'RESUME-DECRYPT-MARKER').length >= 1, 'decrypted');
+      assert.equal(readJ(dataDir, 'vault.json').encrypted, false);
+      assert.ok(fss.existsSync(path.join(dataDir, 'api-token')), 'off mode, verified: the api-token');
+      // off mode keeps only the record key: the blocker can still be changed (password-confirmed)
+      assert.equal((await s.call('PUT', '/api/network', { enabled: false, password: PW })).status, 200);
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      assert.equal((await sec(s)).offlineLock.enabled, false, 'the owner\'s choice, from the record');
+    } finally { await s.close(); }
+  });
+
+  test('an interrupted first encryption (0.1 → 0.2) resumes after the next unlock — from the record, and from a 0.2.0 key store without one', async () => {
+    const dataDir = await tmpDir('harness-enc-resume-');
+    const fake = await startFakeOllama({ port: 0 });
+    let s = await stack({ dataDir, mode: 'off', apiAuth: false, offlineLock: false, fake });
+    try {
+      await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify({ providers: { builtin: { ollama: { baseUrl: fake.url } } }, ollama: { autoStart: false }, embeddings: { model: 'off' }, memory: { enabled: false }, titles: { auto: false } }));
+      const c = await s.call('POST', '/api/chats', { title: 'ENC-RESUME-MARKER' });
+      await s.close({ keep: true });
+      const chatFile = path.join(dataDir, 'chats', `${c.data.chat.id}.json`);
+      const plainCopy = fss.readFileSync(chatFile);
+      assert.ok(plainCopy.includes('ENC-RESUME-MARKER'));
+      s = await stack({ dataDir, fake });
+      await s.setup();
+      await s.close({ keep: true });
+      assert.deepEqual(grepDir(dataDir, 'ENC-RESUME-MARKER'), []);
+      for (const legacy of [false, true]) {
+        // the moment of a crash: this file not converted yet, the conversion recorded as running
+        fss.writeFileSync(chatFile, plainCopy);
+        const v = new Vault(dataDir, { kdf: FAST }).load();
+        await v.unlockWithPassword(PW);
+        const startedAt = new Date().toISOString();
+        if (legacy) {
+          delete v.meta.state;
+          v.meta.migration = { op: 'encrypt', done: 0, total: 9, startedAt, error: null };
+          v.save();
+        } else {
+          assert.equal(v.readState().status, 'ok');
+          v.commit({ migration: { op: 'encrypt', id: 'crash-test', startedAt } }, { mutate: (m) => { m.migration = { op: 'encrypt', id: 'crash-test', done: 3, total: 9, startedAt, error: null }; } });
+        }
+        v.lock();
+        s = await stack({ dataDir, fake, mode: 'launch' });
+        assert.equal((await s.unlock()).status, 200);
+        const st = await sec(s);
+        assert.deepEqual([st.migration, st.mode, st.tamper], [null, 'password', null]);
+        assert.ok((await s.call('GET', '/api/chats')).data.chats.some((x) => x.title === 'ENC-RESUME-MARKER'));
+        await s.close({ keep: true });
+        assert.deepEqual(grepDir(dataDir, 'ENC-RESUME-MARKER'), [], `encrypted again (${legacy ? '0.2.0 key store' : 'record'})`);
+        if (legacy) assert.ok(readJ(dataDir, 'vault.json').state, 'the record is written at the first unlock');
+      }
+    } finally { await s.close(); await fake.close(); }
+  });
+
+  test('a 0.2.0 key store (no record): its interrupted decryption is not resumed and the blocker comes back on — accepted once, then recorded', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.call('POST', '/api/memories', { content: 'LEGACY-020-MARKER' });
+      await s.close({ keep: true });
+      const v = readJ(dataDir, 'vault.json');
+      delete v.state;
+      v.migration = { op: 'decrypt', done: 1, total: 9, startedAt: new Date().toISOString(), error: null };
+      writeVault(dataDir, v);
+      fss.rmSync(path.join(dataDir, 'vault-seq.json'));
+      editLaunch(dataDir, { encryption: 'off', offlineLock: false });
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await sec(s)).state, 'locked');
+      assert.equal((await s.unlock()).status, 200);
+      const st = await sec(s);
+      assert.deepEqual([st.mode, st.offlineLock.enabled, st.migration, st.tamper], ['password', true, null, null]);
+      assert.ok(readJ(dataDir, 'vault.json').state, 'recorded at the first unlock');
+      assert.deepEqual([readJ(dataDir, 'launch.json').encryption, readJ(dataDir, 'launch.json').offlineLock], ['password', true]);
+      assert.equal((await s.call('POST', '/api/security/lock', {})).status, 200);
+      await s.close({ keep: true });
+      assert.deepEqual(grepDir(dataDir, 'LEGACY-020-MARKER'), []);
+    } finally { await s.close(); }
+  });
+
+  test('replays: an older vault.json alone is recognised; a decryption recorded under a key that was replaced cannot touch the data encrypted since', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    const snapshot = (names) => Object.fromEntries(names.map((f) => [f, fss.readFileSync(path.join(dataDir, f))]));
+    const restore = (snap) => { for (const [f, b] of Object.entries(snap)) fss.writeFileSync(path.join(dataDir, f), b); };
+    try {
+      // (a) vault.json from before the owner switched the blocker back on, put back on its own
+      assert.equal((await s.call('PUT', '/api/network', { enabled: false, password: PW })).status, 200);
+      const older = snapshot(['vault.json', 'vault.json.bak']);
+      assert.equal((await s.call('PUT', '/api/network', { enabled: true })).status, 200);
+      await s.close({ keep: true });
+      restore(older);
+      editLaunch(dataDir, { offlineLock: false });
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      let st = await sec(s);
+      assert.equal(st.offlineLock.enabled, true, 'the older record does not switch the blocker off');
+      assert.ok(st.tamper.fields.some((f) => f.startsWith('vault.json: security record')), JSON.stringify(st.tamper));
+      await s.call('POST', '/api/security/tamper/dismiss', {});
+      // (b) a decryption the owner started, snapshotted while it ran (all the files that describe it) …
+      const stop = stopper(dataDir);
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'off', password: PW })).status, 200);
+      await waitFor(async () => (await sec(s)).migration?.error, { timeout: 15000 });
+      const during = snapshot(['vault.json', 'vault.json.bak', 'vault-seq.json', 'launch.json']);
+      await s.close({ keep: true });
+      fss.rmSync(stop);
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      assert.equal((await sec(s)).mode, 'off');
+      // … finished; then encryption back on: a NEW data key (and recovery key)
+      const on = await s.call('POST', '/api/security/mode', { mode: 'password', password: PW });
+      assert.equal(on.status, 200, JSON.stringify(on.data));
+      assert.match(on.data.recoveryKey, /\w/);
+      await waitFor(async () => (await sec(s)).state === 'unlocked', { timeout: 15000 });
+      await s.call('POST', '/api/memories', { content: 'REPLAY-MARKER-AFTER' });
+      await s.close({ keep: true });
+      assert.deepEqual(grepDir(dataDir, 'REPLAY-MARKER'), []);
+      const data = () => new Map(filesUnder(dataDir).filter((f) => /\/(chats|memories|settings)/.test(f)).map((f) => [f, fss.readFileSync(f)]));
+      const current = snapshot(['vault.json', 'vault.json.bak', 'vault-seq.json', 'launch.json']);
+      const before = data();
+      for (const [label, files] of [['vault.json alone', { 'vault.json': during['vault.json'], 'vault.json.bak': during['vault.json.bak'] }], ['every file that describes it', during]]) {
+        restore(files);
+        s = await stack({ dataDir, mode: 'launch' });
+        const r = await s.call('POST', '/api/security/unlock', { password: PW, session: 'token' });
+        await new Promise((res) => setTimeout(res, 500)); // a resumed conversion would be running now
+        await s.close({ keep: true });
+        assert.deepEqual(grepDir(dataDir, 'REPLAY-MARKER'), [], `${label}: nothing decrypted (unlock ${r.status})`);
+        for (const [f, b] of before) assert.deepEqual(fss.readFileSync(f), b, `${label}: ${path.relative(dataDir, f)} untouched`);
+        restore(current);
+      }
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await s.unlock()).status, 200, 'the current key store still opens everything');
+      assert.ok((await s.call('GET', '/api/memories')).data.memories.some((m) => m.content === 'REPLAY-MARKER-AFTER'));
     } finally { await s.close(); }
   });
 });

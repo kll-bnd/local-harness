@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { LaunchConfig } from './security/launch.mjs';
 import { Vault } from './security/vault.mjs';
-import { NetworkGuard } from './security/network.mjs';
+import { NetworkGuard, MAX_ALLOW_MINUTES } from './security/network.mjs';
 import { Auth } from './security/auth.mjs';
 import { chooseKeychain, KeychainError } from './security/keychain.mjs';
 import { listDataFiles, migrateDir, hasPlainData, hasEncryptedData, fixPermissions, repairForeignFiles } from './security/migrate.mjs';
@@ -20,8 +20,21 @@ import { VERSION, ROOT_DIR } from './version.mjs';
 import crypto from 'node:crypto';
 
 const MODES = new Set(['password', 'keychain', 'off']);
+const RANK = { off: 0, keychain: 1, password: 2 }; // how protective a mode is
 const PASSWORD_RESET_MS = 10 * 60 * 1000;
 const IDLE_CHECK_MS = Number(process.env.HARNESS_IDLE_CHECK_MS) || 30000;
+const REKEY_AAD = 'harness-rekey-v1';
+
+const newId = () => crypto.randomBytes(8).toString('hex');
+/** The plain progress hint in vault.json for a conversion the record holds (never the old key). */
+const hintOf = (m) => (m ? { op: m.op, id: m.id, done: 0, total: 0, startedAt: m.startedAt, error: null } : null);
+/** An allow window from the record that is still running and no longer than the API allows. */
+function windowOf(rec) {
+  if (!rec.offlineLock || !rec.allowedUntil || !rec.allowFrom) return null;
+  const until = Date.parse(rec.allowedUntil);
+  const from = Date.parse(rec.allowFrom);
+  return until > Date.now() && until - from <= (MAX_ALLOW_MINUTES + 1) * 60000 ? rec.allowedUntil : null;
+}
 
 function envMode() {
   const v = process.env.HARNESS_ENCRYPTION;
@@ -63,7 +76,9 @@ export class Core extends EventEmitter {
     if (security.kdf) setKdfDefaults(security.kdf); // tests: cheap scrypt for every new wrap and backup
     this.network = null;
     this._lockOverride = lockOverride === false ? false : undefined;
-    this.auth = new Auth({ dataDir: this.dataDir, enabled: apiAuth !== false && transport === 'listener', mode: () => this.mode });
+    // the api-token is written and accepted only for a mode Harness verified (never on launch.json's word alone)
+    this.modeVerified = false;
+    this.auth = new Auth({ dataDir: this.dataDir, enabled: apiAuth !== false && transport === 'listener', mode: () => (this.modeVerified ? this.mode : 'password') });
     // 'file' | 'mac' | a store object (tests, the bridge's appKeychain); default: chooseKeychain's guarded choice
     this.keychain = keychain && typeof keychain === 'object' ? keychain : chooseKeychain(this.dataDir, { kind: typeof keychain === 'string' ? keychain : undefined });
     this.app = null;
@@ -72,6 +87,7 @@ export class Core extends EventEmitter {
     this.plainDataFound = false;
     this.migration = null;
     this.keychainError = null;
+    this.tamper = null; // { at, fields } — plain settings that disagreed with the security record (§10.2)
     this.passwordResetUntil = 0;
     this.inflight = 0;
     this.lastActivity = Date.now();
@@ -101,22 +117,25 @@ export class Core extends EventEmitter {
     let vaultError = null;
     try { this.vault.load(); } catch (e) { vaultError = e; }
     if (this.vault.restoredFromBackup) log.warn('vault.json was damaged; restored it from its verified copy vault.json.bak.');
-    this.network = new NetworkGuard({ launch: this.launch, enabledOverride: this._lockOverride });
+    // A key store means: locked in an encrypted mode until its security record is opened with the key (§10.2).
+    // Until then launch.json and the plain fields of vault.json may only make Harness MORE protective: "off" is
+    // ignored, no api-token exists, the blocker is on and no allow window counts.
+    const keyStore = this.vault.exists;
+    this.network = new NetworkGuard({ launch: this.launch, enabledOverride: this._lockOverride, trust: keyStore ? 'locked' : 'launch' });
+    this.network.persist = (v, o) => this._persistNetwork(v, o);
     this.network.ollamaInfo = () => {
       const p = this.ollamaProcess;
       return { managed: p.managed, sandboxed: !!p.sandboxed, external: !!p.external, osFallback: p.osFallback, osPending: p.managed && !p.sandboxed && p._useSandbox() };
     };
     this.network.on('change', (ev) => this._onNetworkChange(ev));
-    const launchMode = this.launch.get().encryption;
-    let mode = this.modeOverride || launchMode;
+    let mode = this.modeOverride || this.launch.get().encryption;
     if (!MODES.has(mode)) mode = 'password';
-    if (mode === 'off' && this.vault.encrypted && this.modeOverride === 'off') {
-      log.warn('The data in this folder is encrypted; ignoring the request to run without encryption.');
-      mode = launchMode === 'off' ? 'password' : launchMode;
-    }
+    if (keyStore && mode === 'off') mode = 'password';
     this.mode = mode;
-    this.migration = this.vault.meta?.migration || null;
-    this.auth.syncTokenFile();
+    // no key store and off mode: there is nothing to verify (and nothing a password protects)
+    this.modeVerified = !keyStore && mode === 'off';
+    this.migration = null;
+    this.auth.syncTokenFile({ adopt: this.modeVerified });
     this._startIdleTimer();
     // A damaged key store, or encrypted files without one, is a hard error: never offer a fresh setup over them
     // (a new key store would orphan every encrypted file).
@@ -136,13 +155,17 @@ export class Core extends EventEmitter {
       setDirCipher(this.dataDir, 'locked');
       return this;
     }
-    if (!this.vault.encrypted && mode === 'off' && !this.migration) { await this._open(); return this; }
     this.state = 'locked';
     setDirCipher(this.dataDir, 'locked');
     if (mode === 'keychain') {
       // No prompt possible for the dev file / the native app's key: wait for it. The macOS Keychain may show a
-      // prompt, so the server comes up locked and opens as soon as the Keychain answers.
-      const p = this._unlockWithKeychain().catch((e) => { this.keychainError = { code: e.code || 'keychain_failed', message: e.message }; if (e.fatal) throw e; });
+      // prompt, so the server comes up locked and opens as soon as the Keychain answers. The Keychain's key counts
+      // only if the security record says keychain (checked in _afterKey).
+      const p = this._unlockWithKeychain().catch((e) => {
+        this.keychainError = { code: e.code || 'keychain_failed', message: e.message };
+        if (e.code === 'keychain_not_enabled') this.mode = 'password';
+        if (e.fatal) throw e;
+      });
       if (this.keychain.kind === 'keychain') this._autoUnlock = p; else await p;
     }
     return this;
@@ -175,6 +198,7 @@ export class Core extends EventEmitter {
       session: authInfo ? { authenticated: !!authInfo.authenticated, via: authInfo.via || null } : { authenticated: false, via: null },
       transport: this.transport,
       offlineLock: this.network.status(),
+      tamper: this.tamper ? { at: this.tamper.at, fields: [...this.tamper.fields] } : null,
     };
   }
 
@@ -289,7 +313,7 @@ export class Core extends EventEmitter {
       await flushWrites().catch(() => {});
       this.app = null;
       setDirCipher(this.dataDir, 'locked');
-      this.vault.lock();
+      this.vault.lock(); // the record key too: nothing is written to the record while locked
       if (this._oldKeys) { for (const k of this._oldKeys) wipe(k); this._oldKeys = null; }
       if (this.mode !== 'keychain') this.auth.dropAll(); else this.auth.dropConfirmations();
       this.passwordResetUntil = 0;
@@ -312,27 +336,37 @@ export class Core extends EventEmitter {
     // Re-check right before creating keys: encrypted files or a key store must never be overwritten.
     this.vault.load();
     if (this.vault.exists || (await hasEncryptedData(this.dataDir))) throw new HttpError(409, 'already_set_up', 'This data folder already has a key store or encrypted files; setup was refused.');
-    const recoveryKey = await this.vault.create(password, { encrypted: true });
-    const mode = this.mode === 'off' ? 'password' : this.mode;
-    this.launch.set({ encryption: mode });
-    this.mode = mode;
-    this.auth.syncTokenFile();
+    const wanted = this.mode;
+    const plain = this.plainDataFound || (await listDataFiles(this.dataDir)).length > 0;
+    const recoveryKey = await this._createKeyStore(password, { plain });
     setDirCipher(this.dataDir, { key: this.vault.cipher.key });
-    if (this.plainDataFound || (await listDataFiles(this.dataDir)).length) {
-      this._startMigration('encrypt', this.vault.cipher.key);
-    } else {
-      await this._open();
-    }
-    if (mode === 'keychain') {
+    if (plain) this._startMigration('encrypt', this.vault.cipher.key, { resume: true });
+    else await this._open();
+    if (wanted === 'keychain') {
       // no password confirmation here: an existing item that is not ours is left alone (then: password mode)
-      await this._addKeychainWrap().catch((e) => {
-        this.keychainError = { code: e.code || 'keychain_failed', message: e.message };
-        this.mode = 'password';
-        this.launch.set({ encryption: 'password' });
-        this.auth.syncTokenFile();
-      });
+      await this._addKeychainWrap().catch((e) => { this.keychainError = { code: e.code || 'keychain_failed', message: e.message }; });
     }
     return { state: this.state, recoveryKey, migration: this.securityStatus().migration };
+  }
+
+  /**
+   * A new key store in password mode with its first security record: the blocker setting the owner had without a
+   * password carries over; `plain` data is to be encrypted (recorded as the conversion in progress).
+   */
+  async _createKeyStore(password, { plain }) {
+    const net = this.network.setting;
+    const until = net.enabled && net.allowedUntil && Date.parse(net.allowedUntil) > Date.now() ? net.allowedUntil : null;
+    const now = new Date().toISOString();
+    const migration = plain ? { op: 'encrypt', id: newId(), startedAt: now } : null;
+    const state = { mode: 'password', encrypted: true, offlineLock: net.enabled, allowedUntil: until, allowFrom: until ? now : null, migration };
+    const recoveryKey = await this.vault.create(password, { encrypted: true, migration: hintOf(migration), state });
+    this.launch.set({ encryption: 'password' });
+    this.mode = 'password';
+    this.modeVerified = true;
+    this.tamper = null;
+    this.auth.syncTokenFile();
+    this.network.setTrusted({ enabled: state.offlineLock, allowedUntil: until, allowFrom: state.allowFrom });
+    return recoveryKey;
   }
 
   /**
@@ -346,55 +380,212 @@ export class Core extends EventEmitter {
     if (this.state === 'needs_setup') throw new HttpError(423, 'needs_setup', 'Choose a Harness password first.');
     const { password, recoveryKey } = body;
     const already = this.state === 'unlocked' || this.state === 'migrating';
+    let via = null;
     if (typeof password === 'string' && password) {
-      if (already || !this.vault.encrypted) await this.confirmPassword(password);
-      else await this.vault.unlockWithPassword(password);
+      if (already) await this.confirmPassword(password);
+      else { await this.vault.unlockWithPassword(password); via = 'password'; }
     } else if (typeof recoveryKey === 'string' && recoveryKey) {
       await this.vault.unlockWithRecoveryKey(recoveryKey);
       if (already && !this.vault.encrypted) this._wipeIfPlain();
       this.passwordResetUntil = Date.now() + PASSWORD_RESET_MS;
+      via = 'recovery';
     } else {
       if (this.mode !== 'keychain') throw new HttpError(400, 'bad_request', 'Send { "password": "…" } or { "recoveryKey": "…" }.');
       if (!ctx.authenticated) throw new HttpError(401, 'auth_required', 'Open Harness from its launcher (or send the password).', { reason: 'missing', unlock: false });
       if (!already) await this._unlockWithKeychain();
     }
-    if (!already) await this._afterKey();
+    if (!already && via) await this._afterKey(via);
     return { state: this.state, passwordReset: this.passwordResetUntil > Date.now() ? { until: new Date(this.passwordResetUntil).toISOString() } : null };
   }
 
-  async _unlockWithKeychain() {
+  /** The Keychain's key, if it opens this key store's keychain wrap (thrown errors say why not). */
+  async _keychainKey() {
     let kek;
     try { kek = await this.keychain.get(); } catch (e) {
+      this._keychainFailed = true;
       if (e instanceof KeychainError) throw new HttpError(503, 'keychain_unavailable', e.message, { reason: e.reason });
       throw e;
     }
-    if (!kek) throw new HttpError(503, 'keychain_unavailable', 'The Keychain holds no Harness key. Enter the password instead.', { reason: 'not_found' });
+    if (!kek) { this._keychainFailed = true; throw new HttpError(503, 'keychain_unavailable', 'The Keychain holds no Harness key. Enter the password instead.', { reason: 'not_found' }); }
+    return kek;
+  }
+
+  async _unlockWithKeychain() {
+    const kek = await this._keychainKey();
     const dek = this.vault.unlockWithKeychainKey(kek);
     wipe(kek);
-    if (dek) this.keychainError = null;
     if (!dek) {
+      this._keychainFailed = true;
       const e = new HttpError(401, 'wrong_key', 'The key from the Keychain does not open this data. Enter the password instead.');
       if (this.keychain.kind === 'app') e.fatal = true;
       throw e;
     }
-    await this._afterKey();
+    this.keychainError = null;
+    this._keychainFailed = false;
+    await this._afterKey('keychain');
   }
 
-  /** The data key is in memory: finish an interrupted conversion, or open the data. */
-  async _afterKey() {
-    if (this.state === 'unlocked' || this.state === 'migrating') return;
-    const m = this.vault.meta.migration;
-    if (m?.op === 'reencrypt' && m.oldKey) {
-      const old = unseal(this.vault.dek, m.oldKey, 'harness-rekey-v1');
-      if (old) this._oldKeys = [old];
+  /**
+   * After a password or recovery-key unlock with a record that says keychain: keychain mode is in force only while
+   * the Keychain holds the key of THIS data (otherwise Harness runs as in password mode: idle lock, no api-token).
+   * A Keychain that already failed in this process is not asked again.
+   */
+  async _keychainHoldsOurKey() {
+    if (this._keychainFailed) return false;
+    try {
+      const k = await this._keychainKey();
+      const ours = this.vault.keychainKeyOpens(k);
+      wipe(k);
+      if (!ours) {
+        this._keychainFailed = true;
+        this.keychainError = { code: 'wrong_key', message: 'The key in the Keychain does not open this data; Harness asks for the password until you choose keychain mode again.' };
+      }
+      return ours;
+    } catch (e) {
+      this.keychainError = { code: e.code || 'keychain_failed', message: e.message };
+      return false;
     }
-    setDirCipher(this.dataDir, { key: this.vault.dek, oldKeys: this._oldKeys || [] });
-    // an earlier 0.2 build encrypted launcher files (desktop.json, native/, Electron/): give them back
-    const repaired = await repairForeignFiles(this.dataDir).catch(() => 0);
-    if (repaired) log.warn(`Decrypted ${repaired} launcher file(s) that an earlier version had encrypted by mistake.`);
-    if (m) { this._startMigration(m.op, m.op === 'decrypt' ? null : this.vault.dek, { resume: true }); return; }
-    if (!this.vault.encrypted && this.mode !== 'off') { this.vault.setEncrypted(true); this._startMigration('encrypt', this.vault.dek); return; }
-    await this._open();
+  }
+
+  /**
+   * The data key is in memory: open the security record, settle what the plain files claim against it, then
+   * finish a conversion the record holds, or open the data. Runs once at a time; a failure leaves Harness locked.
+   */
+  async _afterKey(via) {
+    if (this.state === 'unlocked' || this.state === 'migrating') return;
+    this._afterKeyP ||= (async () => {
+      try {
+        const rec = await this._settleRecord(via);
+        const m = rec.migration;
+        if (m?.op === 'reencrypt') {
+          const old = unseal(this.vault.dek, m.oldKey, REKEY_AAD);
+          if (old) this._oldKeys = [old];
+        }
+        setDirCipher(this.dataDir, { key: this.vault.dek, oldKeys: this._oldKeys || [] });
+        // an earlier 0.2 build encrypted launcher files (desktop.json, native/, Electron/): give them back
+        const repaired = await repairForeignFiles(this.dataDir).catch(() => 0);
+        if (repaired) log.warn(`Decrypted ${repaired} launcher file(s) that an earlier version had encrypted by mistake.`);
+        if (m) { this._startMigration(m.op, m.op === 'decrypt' ? null : this.vault.dek, { resume: true }); return; }
+        await this._open();
+        this._wipeIfPlain();
+      } catch (e) {
+        // still locked (the record refused, or the data did not open): no key stays in memory
+        if (this.state === 'locked') {
+          this.vault.lock();
+          setDirCipher(this.dataDir, 'locked');
+          if (this._oldKeys) { for (const k of this._oldKeys) wipe(k); this._oldKeys = null; }
+        }
+        throw e;
+      }
+    })().finally(() => { this._afterKeyP = null; });
+    return this._afterKeyP;
+  }
+
+  /**
+   * Decide from the security record (docs/API.md §10.2) and make everything else agree with it:
+   *   - a current, authentic record decides the mode, the blocker, the allow window and any conversion;
+   *   - none (a key store from 0.2.0) or one that is not authentic or current: the most protective reading;
+   *   - launch.json and the plain fields of vault.json only ever make it MORE protective; where they claim less,
+   *     they are rewritten, logged once and reported as `tamper` until the owner dismisses it;
+   *   - unlocking with the Keychain's key counts only when the record says keychain.
+   * Returns the record now in force (written when anything changed).
+   */
+  async _settleRecord(via) {
+    const r = this.vault.readState();
+    const launch = this.launch.get();
+    const pm = this.vault.meta.migration || null;
+    const report = r.status !== 'missing';
+    const fields = new Set(this._pendingTamper || []);
+    let rec;
+    if (r.status === 'ok') rec = { ...r.record };
+    else {
+      if (report) fields.add(`vault.json: security record (${r.status === 'stale' ? 'an older copy' : 'not sealed with this key'})`);
+      rec = await this._protectiveReading(r, via);
+    }
+    if (via === 'keychain' && rec.mode !== 'keychain') {
+      // the key store has a keychain wrap, but the authenticated record does not say keychain: the password decides
+      if (launch.encryption === 'keychain' || this.modeOverride === 'keychain') fields.add('launch.json: encryption');
+      this._pendingTamper = [...fields];
+      log.warn('The Keychain opened the key store, but the security record does not allow opening without the password; Harness stays locked.');
+      throw new HttpError(401, 'keychain_not_enabled', 'Keychain mode is not on for this data. Enter the password.');
+    }
+    this._pendingTamper = null;
+    // "not encrypted" must agree with the folder: encrypted files under such a record mean it is not this folder's truth
+    if (!rec.encrypted && (await hasEncryptedData(this.dataDir))) {
+      fields.add('vault.json: security record (says the data is not encrypted)');
+      rec = { ...rec, mode: 'password', encrypted: true, migration: null };
+    }
+    // the plain hints: lower than the record → ignored and reported; higher → harmless
+    if (RANK[launch.encryption] < RANK[rec.mode] && report) fields.add('launch.json: encryption');
+    if (this.vault.meta.encrypted === false && rec.encrypted && report) fields.add('vault.json: encrypted');
+    if (pm && pm.op !== 'encrypt' && pm.op !== rec.migration?.op && report) fields.add('vault.json: migration');
+    // a conversion TO encryption may resume from the plain hint alone (it only raises protection)
+    if (!rec.migration && rec.encrypted && pm?.op === 'encrypt') rec.migration = { op: 'encrypt', id: typeof pm.id === 'string' ? pm.id : newId(), startedAt: pm.startedAt || new Date().toISOString() };
+    // the blocker: launch.json may turn it on or shorten the window, never more
+    const lu = launch.offlineLockSuspendedUntil && Date.parse(launch.offlineLockSuspendedUntil) > Date.now() ? launch.offlineLockSuspendedUntil : null;
+    if (launch.offlineLock === false && rec.offlineLock && report) fields.add('launch.json: offlineLock');
+    if (launch.offlineLock !== false) rec.offlineLock = true;
+    let until = windowOf(rec);
+    if (lu && rec.offlineLock && (!until || Date.parse(lu) > Date.parse(until)) && report) fields.add('launch.json: offlineLockSuspendedUntil');
+    if (until && (!lu || Date.parse(lu) < Date.parse(until))) until = lu;
+    rec.allowedUntil = until;
+    rec.allowFrom = until ? rec.allowFrom : null;
+    if (fields.size) {
+      rec.tamper = { at: new Date().toISOString(), fields: [...new Set([...(rec.tamper?.fields || []), ...fields])] };
+      log.warn(`Security settings were changed outside Harness and were ignored (the authenticated record decides): ${[...fields].join('; ')}`);
+    }
+    // write what is now in force — the record (when it changed) and the plain files (when they disagree)
+    const keys = ['mode', 'encrypted', 'offlineLock', 'allowedUntil', 'allowFrom', 'migration', 'tamper'];
+    const changed = r.status !== 'ok' || keys.some((k) => JSON.stringify(rec[k] ?? null) !== JSON.stringify(r.record[k] ?? null));
+    const plainOk = this.vault.meta.encrypted === rec.encrypted && (pm?.op || null) === (rec.migration?.op || null) && (!pm || !pm.oldKey);
+    if (changed || !plainOk) {
+      const keep = pm && rec.migration && pm.op === rec.migration.op;
+      rec = this.vault.commit(Object.fromEntries(keys.map((k) => [k, rec[k] ?? null])), { mutate: (m) => { m.encrypted = rec.encrypted; m.migration = keep ? { ...hintOf(rec.migration), done: pm.done || 0, total: pm.total || 0 } : hintOf(rec.migration); } });
+    }
+    const hint = { encryption: rec.mode, offlineLock: rec.offlineLock, offlineLockSuspendedUntil: rec.allowedUntil };
+    if (Object.entries(hint).some(([k, v]) => (launch[k] ?? null) !== v)) { try { this.launch.set(hint); } catch (e) { log.warn(`Could not rewrite launch.json: ${e.code || e.message}`); } }
+    // in force from now on, in this process
+    this.tamper = rec.tamper || null;
+    this.network.setTrusted({ enabled: rec.offlineLock, allowedUntil: rec.allowedUntil, allowFrom: rec.allowFrom });
+    let mode = rec.mode;
+    if (mode === 'keychain' && via !== 'keychain' && !(await this._keychainHoldsOurKey())) mode = 'password';
+    this.mode = mode;
+    this.modeVerified = true;
+    this.auth.syncTokenFile({ fresh: !this._tokenIssued });
+    this._tokenIssued = true;
+    this.migration = null;
+    // the blocker is off by the owner's choice: an Ollama started while locked (sandboxed) leaves the sandbox
+    if (!this.network.blocked && this.ollamaProcess.sandboxed) this.ollamaProcess.applySandbox().catch((e) => log.warn(`Restarting Ollama outside the sandbox: ${e.message}`));
+    return rec;
+  }
+
+  /**
+   * No current, authentic record (a key store from 0.2.0, or one whose record was replaced or rolled back): the
+   * most protective reading of this folder. Encrypted unless the folder is genuinely plain AND both plain files say
+   * so (then nothing at rest is left to protect); keychain only for a 0.2.0 key store the Keychain itself opened;
+   * the blocker on, no allow window; a decryption is never resumed; re-encrypting to the current key and encrypting
+   * plain files are (they only raise protection).
+   */
+  async _protectiveReading(r, via) {
+    const launch = this.launch.get();
+    const pm = this.vault.meta.migration || null;
+    const now = new Date().toISOString();
+    const plainFolder = this.vault.meta.encrypted === false && launch.encryption === 'off' && !(await hasEncryptedData(this.dataDir));
+    const rec = { mode: 'password', encrypted: true, offlineLock: true, allowedUntil: null, allowFrom: null, migration: null, tamper: r.record?.tamper || null };
+    if (plainFolder) { rec.mode = 'off'; rec.encrypted = false; }
+    else if (r.status === 'missing' && via === 'keychain' && launch.encryption === 'keychain') rec.mode = 'keychain';
+    const legacyOld = r.status === 'missing' && pm?.op === 'reencrypt' && pm.oldKey ? unseal(this.vault.dek, pm.oldKey, REKEY_AAD) : null;
+    if (r.status === 'stale' && r.record.migration?.op === 'reencrypt') rec.migration = r.record.migration;
+    else if (legacyOld) rec.migration = { op: 'reencrypt', id: newId(), startedAt: pm.startedAt || now, oldKey: pm.oldKey, oldKeyId: pm.oldKeyId || null };
+    else if (rec.encrypted && (pm?.op === 'encrypt' || (await hasPlainData(this.dataDir)))) rec.migration = { op: 'encrypt', id: newId(), startedAt: now };
+    wipe(legacyOld);
+    if (pm?.op === 'decrypt') log.warn('A decryption that an earlier version had started was not resumed: Harness keeps the data encrypted (and encrypts any file it had already decrypted). To store the data without encryption, choose "off" again in Settings with your password.');
+    if (r.status === 'missing') {
+      if (launch.offlineLock === false || launch.offlineLockSuspendedUntil) log.warn('The internet blocker is on again after this update (its setting had no authenticated record yet); turn it off in Settings with your password if you want it off.');
+      if (launch.encryption === 'keychain' && rec.mode !== 'keychain') log.warn('Keychain mode was not confirmed by the Keychain at this first start after the update; Harness asks for the password. Choose keychain mode again in Settings if you want it.');
+      log.info('This key store had no security record yet (Harness 0.2.0): written now.');
+    }
+    return rec;
   }
 
   /**
@@ -411,7 +602,27 @@ export class Core extends EventEmitter {
 
   /** Off mode keeps no key in memory between operations. */
   _wipeIfPlain() {
-    if (!this.vault.encrypted && !this.migration && this.state !== 'migrating') this.vault.lock();
+    // only the key that seals the security record stays (off mode has no lock; the blocker's changes need it)
+    if (!this.vault.encrypted && !this.migration && this.state !== 'migrating') this.vault.lock({ keepStateKey: true });
+  }
+
+  /** The internet blocker changed (NetworkGuard.persist): into the security record. Lowering needs the key. */
+  _persistNetwork(v, { lowering }) {
+    if (!this.vault.stateKey) {
+      if (lowering) throw new HttpError(423, 'locked', 'Harness is locked.');
+      return;
+    }
+    this.vault.commit({ offlineLock: v.enabled, allowedUntil: v.allowedUntil, allowFrom: v.allowFrom });
+  }
+
+  /** POST /api/security/tamper/dismiss: the owner has seen the notice. */
+  dismissTamper() {
+    this.requireApp();
+    if (!this.tamper) return { tamper: null };
+    if (!this.vault.stateKey) throw new HttpError(423, 'locked', 'Harness is locked.');
+    this.vault.commit({ tamper: null });
+    this.tamper = null;
+    return { tamper: null };
   }
 
   /**
@@ -455,52 +666,76 @@ export class Core extends EventEmitter {
     if (!this.vault.exists) {
       // off mode, never had a password: turning encryption on needs a new one
       if (mode === 'off') return { mode: this.mode, state: this.state };
-      recoveryKey = await this.vault.create(newPassword, { encrypted: true });
+      recoveryKey = await this._createKeyStore(newPassword, { plain: true });
       this.app && await this._closeForMigration();
-      this.launch.set({ encryption: mode });
-      this.mode = mode;
-      this.auth.syncTokenFile();
-      this._startMigration('encrypt', this.vault.dek);
+      this._startMigration('encrypt', this.vault.dek, { resume: true });
       if (mode === 'keychain') await this._addKeychainWrap({ confirmed: true });
       return { mode, state: this.state, recoveryKey };
     }
     await this.requireConfirmation({ password, header, sessionHash, needKey: true });
-    const from = this.mode;
+    // the record's mode: in force, or keychain while the Keychain does not hold the key (then Harness runs as in
+    // password mode until keychain mode is chosen again)
+    const from = this.vault.record?.mode || this.mode;
+    if (mode === from && mode === 'keychain' && this.mode !== 'keychain') { await this._addKeychainWrap({ confirmed: true }); return { mode: this.mode, state: this.state }; }
     if (mode === from && (mode !== 'off' || !this.vault.encrypted)) { this._wipeIfPlain(); return { mode, state: this.state }; }
     let rekeyRecommended = false;
+    let ours = false;
     if (from === 'keychain' && mode !== 'keychain') {
       // password-confirmed; still, only an item that holds THIS data's key is deleted
-      let ours = false;
       try { const k = await this.keychain.get(); ours = !!k && this.vault.keychainKeyOpens(k); if (k) wipe(k); } catch (e) { log.warn(`Could not read the Keychain item: ${e.reason || e.message}`); }
-      this.vault.setKeychainWrap(false);
-      if (ours) await this.keychain.delete().catch((e) => log.warn(`Could not remove the Keychain item: ${e.reason || e.message}`));
-      else log.info('Left the Keychain item alone: it does not hold the key of this data.');
       rekeyRecommended = true;
     }
+    const dropItem = async () => {
+      if (from !== 'keychain' || mode === 'keychain') return;
+      if (ours) await this.keychain.delete().catch((e) => log.warn(`Could not remove the Keychain item: ${e.reason || e.message}`));
+      else log.info('Left the Keychain item alone: it does not hold the key of this data.');
+    };
     if (mode === 'off') {
+      // lowering: the record first (with the keychain wrap gone in the same save), then launch.json
+      const mig = { op: 'decrypt', id: newId(), startedAt: new Date().toISOString() };
+      this.vault.commit({ mode: 'off', migration: mig }, { mutate: (m) => { delete m.wraps.keychain; m.migration = hintOf(mig); } });
+      await dropItem();
       this.launch.set({ encryption: 'off' });
       this.mode = 'off';
       this.auth.syncTokenFile();
       await this._closeForMigration();
-      this._startMigration('decrypt', null);
+      this._startMigration('decrypt', null, { resume: true });
       return { mode, state: this.state, rekeyRecommended: false };
     }
     if (from === 'off') {
-      this.vault.setEncrypted(true);
-      this.launch.set({ encryption: mode });
-      this.mode = mode;
-      this.auth.syncTokenFile();
+      // Back to encryption: under a NEW data key (and a new recovery key, shown once), so that nothing recorded
+      // under the old key — a decryption in progress, say — can ever apply to the data encrypted from now on.
+      if (!(typeof password === 'string' && password) || !this.vault.dek) throw new HttpError(403, 'confirmation_required', 'Enter your Harness password: turning encryption on makes a new data key, which the password wraps.');
+      const oldDek = Buffer.from(this.vault.dek);
+      const newDek = crypto.randomBytes(32);
+      const mig = { op: 'encrypt', id: newId(), startedAt: new Date().toISOString() };
       await this._closeForMigration();
-      this._startMigration('encrypt', this.vault.dek);
+      try {
+        recoveryKey = await this.vault.replaceKey(newDek, password, { migration: hintOf(mig), mutate: (m) => { m.encrypted = true; }, state: { mode: 'password', encrypted: true, migration: mig } });
+      } catch (e) {
+        wipe(oldDek);
+        this.state = 'locked';
+        await this._open();
+        this._wipeIfPlain();
+        throw e;
+      }
+      this._oldKeys = [oldDek]; // a file still under the old key stays readable while converting
+      this.launch.set({ encryption: 'password' });
+      this.mode = 'password';
+      this.auth.syncTokenFile();
+      this._startMigration('encrypt', newDek, { resume: true });
       if (mode === 'keychain') await this._addKeychainWrap({ confirmed: true });
-      return { mode, state: this.state };
+      return { mode, state: this.state, recoveryKey };
     }
     if (mode === 'keychain') {
       await this._addKeychainWrap({ confirmed: true });
     } else {
-      this.launch.set({ encryption: mode });
-      this.mode = mode;
+      // keychain → password raises protection: launch.json first, then the record (and the wrap) in one save
+      this.launch.set({ encryption: 'password' });
+      this.mode = 'password';
       this.auth.syncTokenFile();
+      this.vault.setKeychainWrap(false, { state: { mode: 'password' } });
+      await dropItem();
     }
     return { mode: this.mode, state: this.state, ...(rekeyRecommended ? { rekeyRecommended } : {}) };
   }
@@ -519,18 +754,20 @@ export class Core extends EventEmitter {
       wipe(existing);
       if (!ours && !confirmed) throw new HttpError(409, 'keychain_item_exists', 'The Keychain already holds a Harness key that does not open this data; it was left alone. Choose keychain mode in the settings (with your password) to replace it.');
     }
-    const kek = this.vault.setKeychainWrap(true);
-    const prevMode = this.mode;
+    // lowering: the record says keychain in the same save that adds the wrap, before launch.json does
+    const kek = this.vault.setKeychainWrap(true, { state: { mode: 'keychain' } });
     this.launch.set({ encryption: 'keychain' });
     this.mode = 'keychain';
     this.auth.syncTokenFile();
     try {
       await this.keychain.set(kek);
+      this.keychainError = null;
+      this._keychainFailed = false;
     } catch (e) {
-      this.vault.setKeychainWrap(false);
-      this.launch.set({ encryption: prevMode === 'keychain' ? 'password' : prevMode });
-      this.mode = prevMode === 'keychain' ? 'password' : prevMode;
+      this.launch.set({ encryption: 'password' });
+      this.mode = 'password';
       this.auth.syncTokenFile();
+      this.vault.setKeychainWrap(false, { state: { mode: 'password' } });
       throw new HttpError(503, 'keychain_unavailable', e.message || 'Could not store the key in the Keychain.', { reason: e.reason || 'failed' });
     } finally { wipe(kek); }
   }
@@ -547,8 +784,10 @@ export class Core extends EventEmitter {
     await this._closeForMigration();
     let recoveryKey;
     try {
-      // the old key travels sealed under the new one until every file is converted (crash → resumed at unlock)
-      recoveryKey = await this.vault.replaceKey(newDek, password, { migration: { op: 'reencrypt', done: 0, total: 0, startedAt: new Date().toISOString(), error: null, oldKey: seal(newDek, oldDek, 'harness-rekey-v1'), oldKeyId: keyIdOf(oldDek).toString('hex') } });
+      // the old key travels sealed under the new one, inside the security record, until every file is converted
+      // (crash → resumed at unlock, from the record only)
+      const mig = { op: 'reencrypt', id: newId(), startedAt: new Date().toISOString(), oldKey: seal(newDek, oldDek, REKEY_AAD), oldKeyId: keyIdOf(oldDek).toString('hex') };
+      recoveryKey = await this.vault.replaceKey(newDek, password, { migration: hintOf(mig), state: { migration: mig } });
     } catch (e) {
       wipe(oldDek);
       this.state = 'locked';
@@ -575,7 +814,9 @@ export class Core extends EventEmitter {
   _startMigration(op, toKey, { resume = false } = {}) {
     this.state = 'migrating';
     const prev = this.vault.meta.migration;
-    const m = { ...(resume && prev?.op === op ? prev : {}), op, done: 0, total: 0, startedAt: (resume && prev?.startedAt) || new Date().toISOString(), error: null };
+    const recM = this.vault.record?.migration?.op === op ? this.vault.record.migration : null;
+    // the plain hint carries progress only (never the old key: that lives in the security record)
+    const m = { op, id: recM?.id || (resume && prev?.op === op && prev.id) || newId(), done: 0, total: 0, startedAt: recM?.startedAt || (resume && prev?.op === op && prev.startedAt) || new Date().toISOString(), error: null };
     this.migration = m;
     this.vault.setMigration(m);
     if (op === 'decrypt') setDirCipher(this.dataDir, { key: null, oldKeys: [this.vault.dek, ...(this._oldKeys || [])].filter(Boolean) });
@@ -595,12 +836,13 @@ export class Core extends EventEmitter {
             if (Date.now() - lastSave > 1000 || done === total) { lastSave = Date.now(); this.vault.setMigration({ ...m }); }
           },
         });
-        if (op === 'decrypt') this.vault.setEncrypted(false);
-        this.vault.setMigration(null);
+        // finished: the record and the plain hints in one save
+        const plain = op === 'decrypt';
+        this.vault.commit({ migration: null, ...(plain ? { encrypted: false } : {}) }, { mutate: (meta) => { meta.migration = null; if (plain) meta.encrypted = false; } });
         this.migration = null;
         if (this._oldKeys) { for (const k of this._oldKeys) wipe(k); this._oldKeys = null; }
         // migrating → unlocked directly (no locked moment in between)
-        if (op === 'decrypt') { setDirCipher(this.dataDir, null); this.vault.lock(); } else setDirCipher(this.dataDir, { key: this.vault.dek });
+        if (plain) { setDirCipher(this.dataDir, null); this.vault.lock({ keepStateKey: true }); } else setDirCipher(this.dataDir, { key: this.vault.dek });
         await this._open();
       } catch (e) {
         m.error = e.code === 'migration_verify_failed' ? 'A converted file did not read back correctly; nothing was replaced. Try again.' : `Could not convert a file (${e.code || 'error'}).`;

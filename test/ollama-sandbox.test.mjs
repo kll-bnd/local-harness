@@ -282,7 +282,7 @@ describe('the server around it', () => {
       const gen = fetch(`${s.srv.url}/api/chats/${c.data.chat.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'long answer 300' }) }).then((r) => r.text());
       await waitFor(() => core.app.engine.active.size > 0);
       const pidDuring = core.ollamaProcess.child.pid;
-      core.network.launch.set({ offlineLockSuspendedUntil: new Date(Date.now() + 30).toISOString() });
+      core.network.rec.allowedUntil = new Date(Date.now() + 30).toISOString(); // the window ends in 30 ms (the verified value; launch.json is only a hint)
       core.network._arm();
       await waitFor(() => core.network.blocked);
       await new Promise((r) => setTimeout(r, 400));
@@ -308,7 +308,7 @@ describe('the server around it', () => {
       process.env.HARNESS_RECONCILE_MS = '600000'; // no timer help this time
       core._stopReconcileTimer();
       const pid2 = core.ollamaProcess.child.pid;
-      core.network.launch.set({ offlineLockSuspendedUntil: new Date(Date.now() + 30).toISOString() });
+      core.network.rec.allowedUntil = new Date(Date.now() + 30).toISOString(); // the window ends in 30 ms (the verified value; launch.json is only a hint)
       core.network._arm();
       await waitFor(() => core.network.blocked);
       await new Promise((r) => setTimeout(r, 300));

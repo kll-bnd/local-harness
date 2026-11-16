@@ -2,8 +2,9 @@
 //
 // Password mode: a session (HttpOnly SameSite=Strict cookie, or the same token as a Bearer header for CLI tools)
 // exists only after a successful setup/unlock in that client; locking drops all of them. There is no api-token file.
-// Keychain/off modes: additionally a per-install secret in <dataDir>/api-token (0600) authorises Bearer requests,
-// and one-time launch codes (in the URL fragment) let a browser obtain a session cookie.
+// Keychain/off modes: additionally a secret in <dataDir>/api-token (0600) authorises Bearer requests, and one-time
+// launch codes (in the URL fragment) let a browser obtain a session cookie. With a key store the secret exists only
+// for a mode the security record confirmed, and is new at every start (docs/API.md §10.2, §10.5).
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -43,18 +44,31 @@ export class Auth {
     this.apiToken = null;
   }
 
-  /** Keychain/off modes keep the per-install secret file; password mode must not have one. */
-  syncTokenFile() {
+  /**
+   * Keychain/off modes keep the secret file; password mode — and any mode Harness has not verified
+   * yet (the core reports 'password' then) — must not have one. `fresh`: a new secret (the first verified mode of
+   * a key store in this process: a file left from before is never accepted). Otherwise the secret in memory is kept
+   * (and written back if the file went missing); `adopt` (off mode without a key store, where nothing is protected
+   * by a password) keeps the file's secret across restarts.
+   */
+  syncTokenFile({ fresh = false, adopt = false } = {}) {
     if (this.mode() === 'password') {
       fs.rmSync(this.tokenFile, { force: true });
       this.apiToken = null;
       return null;
     }
-    try { const t = fs.readFileSync(this.tokenFile, 'utf8').trim(); if (/^[A-Za-z0-9_-]{43}$/.test(t)) { this.apiToken = t; return t; } } catch { /* create below */ }
-    const t = token();
-    fs.writeFileSync(this.tokenFile, t + '\n', { mode: 0o600 });
-    this.apiToken = t;
-    return t;
+    if (adopt && !fresh && !this.apiToken) {
+      try { const t = fs.readFileSync(this.tokenFile, 'utf8').trim(); if (/^[A-Za-z0-9_-]{43}$/.test(t)) this.apiToken = t; } catch { /* create below */ }
+    }
+    if (fresh || !this.apiToken) this.apiToken = token();
+    let onDisk = null;
+    try { onDisk = fs.readFileSync(this.tokenFile, 'utf8').trim(); } catch { /* missing */ }
+    if (onDisk !== this.apiToken) {
+      const tmp = `${this.tokenFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, this.apiToken + '\n', { mode: 0o600 });
+      fs.renameSync(tmp, this.tokenFile);
+    }
+    return this.apiToken;
   }
 
   createSession() {

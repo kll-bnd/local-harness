@@ -1,7 +1,13 @@
 // The key store of an encrypted data directory: vault.json (plain, 0600) holds only WRAPPED copies of the random
 // data key — under a key derived from the user's password (scrypt), under the recovery key (HKDF) and, in keychain
-// mode, under a random key kept in the Keychain — plus the unlock throttle and migration progress. The data key
-// itself exists only in memory while Harness is unlocked.
+// mode, under a random key kept in the Keychain — plus the unlock throttle, migration progress and the SECURITY
+// RECORD (`state`). The data key itself exists only in memory while Harness is unlocked.
+//
+// The security record (docs/API.md §10.2) is the authenticated truth about what lowers protection: the mode, the
+// internet blocker and its allow window, and a conversion in progress. It is sealed (AES-256-GCM) under a key
+// derived from the data key, so nobody without the key can write or change it; a counter (`seq`) is mirrored into
+// vault-seq.json (sealed the same way), so an older copy of vault.json put back on its own is recognised as stale.
+// Every other field of vault.json and all of launch.json are hints that may only ever make Harness MORE protective.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -10,6 +16,25 @@ import { HttpError } from '../lib/errors.mjs';
 
 export const MIN_PASSWORD = 8;
 const AAD = (name) => `harness-wrap-v1:${name}`;
+const STATE_AAD = (keyId) => `harness-state-v1:${keyId}`;
+const MIRROR_AAD = (keyId) => `harness-state-mirror-v1:${keyId}`;
+export const STATE_MIRROR = 'vault-seq.json';
+export const STATE_MODES = Object.freeze(['password', 'keychain', 'off']);
+const MIGRATION_OPS = new Set(['encrypt', 'decrypt', 'reencrypt']);
+const ISO = (v) => v === null || (typeof v === 'string' && !Number.isNaN(Date.parse(v)));
+
+/** Shape check of an opened security record (it authenticated; this guards against our own older formats). */
+export function validState(s) {
+  if (!s || typeof s !== 'object' || s.v !== 1 || !Number.isInteger(s.seq) || s.seq < 1) return false;
+  if (!STATE_MODES.includes(s.mode) || typeof s.encrypted !== 'boolean' || typeof s.offlineLock !== 'boolean') return false;
+  if (!ISO(s.allowedUntil ?? null) || !ISO(s.allowFrom ?? null) || typeof s.keyId !== 'string') return false;
+  const m = s.migration;
+  if (m !== null && (typeof m !== 'object' || !MIGRATION_OPS.has(m.op) || typeof m.id !== 'string')) return false;
+  if (m?.op === 'reencrypt' && !isSealed(m.oldKey)) return false;
+  const t = s.tamper;
+  if (t !== null && (typeof t !== 'object' || !Array.isArray(t.fields))) return false;
+  return true;
+}
 
 /**
  * Unlock throttle: the wait before the next attempt after `failures` counted attempts — attempts 1–3 free, then
@@ -32,6 +57,7 @@ export function validVault(m) {
   if (!isSealed(w.password) || !w.password.kdf || w.password.kdf.name !== 'scrypt' || !Number.isInteger(w.password.kdf.N) || typeof w.password.kdf.salt !== 'string') return false;
   if (w.recovery !== undefined && w.recovery !== null && (!isSealed(w.recovery) || typeof w.recovery.kdf?.salt !== 'string')) return false;
   if (w.keychain !== undefined && !isSealed(w.keychain)) return false;
+  if (m.state !== undefined && m.state !== null && !isSealed(m.state)) return false;
   return true;
 }
 
@@ -48,6 +74,10 @@ export class Vault {
     this.kdfParams = kdf || null;
     this.meta = null;
     this.dek = null;
+    this.stateKey = null; // seals the security record; derived from the data key (kept alone in off mode)
+    this.stateSeq = 0; // the highest record counter seen or written in this process
+    this.record = null; // the last security record opened (current) or written in this process
+    this.mirrorFile = path.join(dataDir, STATE_MIRROR);
   }
 
   /**
@@ -96,29 +126,33 @@ export class Vault {
 
   // ----------------------------------------------------------------------------------------- creation
   /** First setup: a new data key wrapped under the password and a new recovery key (returned once). */
-  async create(password, { encrypted = true } = {}) {
+  async create(password, { encrypted = true, state, migration = null } = {}) {
     if (typeof password !== 'string' || password.length < MIN_PASSWORD) throw new HttpError(400, 'weak_password', `Choose a password of at least ${MIN_PASSWORD} characters.`);
     const dek = crypto.randomBytes(32);
-    this.meta = { version: 1, encrypted, keyId: keyIdOf(dek).toString('hex'), wraps: {}, throttle: { failures: 0, lastFailureAt: null }, migration: null, createdAt: new Date().toISOString() };
+    this.meta = { version: 1, encrypted, keyId: keyIdOf(dek).toString('hex'), wraps: {}, throttle: { failures: 0, lastFailureAt: null }, migration, createdAt: new Date().toISOString() };
     await this._wrapPassword(dek, password);
     const recoveryKey = this._wrapRecovery(dek);
     this.dek = dek;
+    this._deriveStateKey();
+    this.record = null;
+    const rec = state ? this._sealState({ prevKeyId: null, tamper: null, ...state }) : null;
     this.save();
+    if (rec) { this.record = rec; this.stateSeq = rec.seq; this._writeMirror(rec.seq); }
     return recoveryKey;
   }
 
-  async _wrapPassword(dek, password) {
+  async _wrapPassword(dek, password, meta = this.meta) {
     const kdf = newKdf(this.kdfParams || kdfDefaultsNow());
     const kek = await deriveKey(password, kdf);
-    this.meta.wraps.password = { kdf, ...seal(kek, dek, AAD('password')) };
+    meta.wraps.password = { kdf, ...seal(kek, dek, AAD('password')) };
     wipe(kek);
   }
 
-  _wrapRecovery(dek) {
+  _wrapRecovery(dek, meta = this.meta) {
     const rk = crypto.randomBytes(32);
     const salt = crypto.randomBytes(16);
     const kek = hkdf(rk, salt, 'harness recovery v1');
-    this.meta.wraps.recovery = { kdf: { name: 'hkdf-sha256', salt: salt.toString('base64') }, ...seal(kek, dek, AAD('recovery')), createdAt: new Date().toISOString() };
+    meta.wraps.recovery = { kdf: { name: 'hkdf-sha256', salt: salt.toString('base64') }, ...seal(kek, dek, AAD('recovery')), createdAt: new Date().toISOString() };
     const text = formatRecoveryKey(rk);
     wipe(kek);
     wipe(rk);
@@ -161,6 +195,7 @@ export class Vault {
       wipe(this.dek);
     }
     this.dek = dek;
+    this._deriveStateKey();
     return dek;
   }
 
@@ -204,6 +239,7 @@ export class Vault {
     if (!dek) return null;
     if (this.dek) { if (this.dek.equals(dek)) { wipe(dek); return this.dek; } wipe(this.dek); }
     this.dek = dek;
+    this._deriveStateKey();
     return dek;
   }
 
@@ -244,44 +280,162 @@ export class Vault {
     return { recoveryKey: text, createdAt: this.meta.wraps.recovery.createdAt };
   }
 
-  /** Add (a new random key, returned) or remove the keychain wrap. */
-  setKeychainWrap(enabled) {
+  /**
+   * Add (a new random key, returned) or remove the keychain wrap — with `state`, the security record changes in
+   * the same save (so the wrap and the record's mode never disagree on disk).
+   */
+  setKeychainWrap(enabled, { state } = {}) {
     this._need();
-    if (!enabled) { delete this.meta.wraps.keychain; this.save(); return null; }
+    if (!enabled) { this._saveWith((m) => { delete m.wraps.keychain; }, state); return null; }
     const kek = crypto.randomBytes(32);
-    this.meta.wraps.keychain = seal(kek, this.dek, AAD('keychain'));
-    this.save();
+    const wrap = seal(kek, this.dek, AAD('keychain'));
+    this._saveWith((m) => { m.wraps.keychain = wrap; }, state);
     return kek;
+  }
+
+  _saveWith(mutate, state) {
+    if (state) { this.commit(state, { mutate }); return; }
+    mutate(this.meta);
+    this.save();
   }
 
   /**
    * Re-keying: wrap `newDek` under the password and a NEW recovery key (returned once), drop the keychain wrap
-   * (the caller adds a new one), record `migration` (which carries the old key sealed under the new one) — all in
-   * one save, so a crash leaves either the old or the new key store, never a mix.
+   * (the caller adds a new one), write the plain `migration` hint and the security record (under the new key,
+   * carrying `state` — for a re-key the old key sealed under the new one) — all in one save, so a crash leaves
+   * either the old or the new key store, never a mix.
    */
-  async replaceKey(newDek, password, { migration }) {
+  async replaceKey(newDek, password, { migration = null, state = {}, mutate } = {}) {
     this._need();
-    const meta = JSON.parse(JSON.stringify(this.meta));
-    const saved = this.meta;
-    this.meta = meta;
+    const meta = structuredClone(this.meta);
+    const oldKeyId = meta.keyId;
+    let newStateKey = null;
     try {
-      await this._wrapPassword(newDek, password);
-      const recoveryKey = this._wrapRecovery(newDek);
+      await this._wrapPassword(newDek, password, meta);
+      const recoveryKey = this._wrapRecovery(newDek, meta);
       delete meta.wraps.keychain;
       meta.keyId = keyIdOf(newDek).toString('hex');
       meta.migration = migration;
-      this.save();
+      meta.throttle = this.meta.throttle; // counted while the key derivation ran
+      mutate?.(meta);
+      newStateKey = stateKeyOf(newDek, meta.keyId);
+      const rec = this._sealState({ ...state, prevKeyId: oldKeyId }, { meta, key: newStateKey });
+      const saved = this.meta;
+      this.meta = meta;
+      try { this.save(); } catch (e) { this.meta = saved; throw e; }
       wipe(this.dek);
+      wipe(this.stateKey);
       this.dek = newDek;
+      this.stateKey = newStateKey;
+      newStateKey = null;
+      this.record = rec;
+      this.stateSeq = rec.seq;
+      this._writeMirror(rec.seq);
       return recoveryKey;
-    } catch (e) { this.meta = saved; throw e; }
+    } finally { wipe(newStateKey); }
   }
 
   setEncrypted(flag) { this.meta.encrypted = !!flag; this.save(); }
   setMigration(m) { this.meta.migration = m; this.save(); }
 
+  // ----------------------------------------------------------------------------------------- security record
+  _deriveStateKey() {
+    wipe(this.stateKey);
+    this.stateKey = this.dek && this.meta ? stateKeyOf(this.dek, this.meta.keyId) : null;
+  }
+
+  /** The next record (patch over the last one), sealed into `meta.state`; nothing is saved here. */
+  _sealState(patch, { meta = this.meta, key = this.stateKey } = {}) {
+    if (!key) throw new HttpError(423, 'locked', 'Harness is locked.');
+    const seq = this.stateSeq + 1;
+    const rec = {
+      v: 1, mode: 'password', encrypted: true, offlineLock: true, allowedUntil: null, allowFrom: null, migration: null, tamper: null, prevKeyId: null,
+      ...(this.record || {}), ...patch, seq, at: new Date().toISOString(), keyId: meta.keyId,
+    };
+    if (!validState(rec)) throw new HttpError(500, 'state_invalid', 'Could not write the Harness security record; nothing was changed.');
+    meta.state = { seq, ...seal(key, Buffer.from(JSON.stringify(rec)), STATE_AAD(meta.keyId)) };
+    return rec;
+  }
+
+  /**
+   * Write the security record (`patch` over the current one) — and, in the same save, any other change of
+   * vault.json (`mutate(meta)`) — then its counter into vault-seq.json. Needs the data key (or, in off mode, the
+   * record key kept from the unlock).
+   */
+  commit(patch = {}, { mutate } = {}) {
+    if (!this.stateKey) throw new HttpError(423, 'locked', 'Harness is locked.');
+    const meta = structuredClone(this.meta);
+    mutate?.(meta);
+    const rec = this._sealState(patch, { meta });
+    const saved = this.meta;
+    this.meta = meta;
+    try { this.save(); } catch (e) { this.meta = saved; throw e; }
+    this.record = rec;
+    this.stateSeq = rec.seq;
+    this._writeMirror(rec.seq);
+    return rec;
+  }
+
+  /**
+   * Open the security record with the key now in memory → { status, record, mirror }:
+   *   ok       authentic and current — it decides
+   *   missing  a key store from before records existed (Harness 0.2.0)
+   *   invalid  present, but not sealed under this key (written by someone who does not have it)
+   *   stale    authentic, but older than the counter in vault-seq.json (an older vault.json was put back)
+   */
+  readState() {
+    if (!this.stateKey) throw new HttpError(423, 'locked', 'Harness is locked.');
+    const mirror = this._readMirror();
+    if (mirror.status === 'ok') this.stateSeq = Math.max(this.stateSeq, mirror.seq);
+    const sealed = this.meta?.state;
+    if (!sealed) return { status: 'missing', record: null, mirror };
+    let rec = null;
+    const buf = isSealed(sealed) ? unseal(this.stateKey, sealed, STATE_AAD(this.meta.keyId)) : null;
+    if (buf) { try { const r = JSON.parse(buf.toString('utf8')); if (validState(r) && r.keyId === this.meta.keyId) rec = r; } catch { /* not a record */ } }
+    if (!rec) return { status: 'invalid', record: null, mirror };
+    this.stateSeq = Math.max(this.stateSeq, rec.seq);
+    let fresh;
+    if (mirror.status === 'ok') fresh = mirror.seq <= rec.seq; // the mirror is written after the record: it may lag, never lead
+    else if (mirror.status === 'other_key') fresh = !!rec.prevKeyId && mirror.keyId === rec.prevKeyId; // lags a key change
+    else if (mirror.status === 'missing') fresh = rec.seq === 1; // the very first record, the mirror not yet written
+    else fresh = false;
+    this.record = fresh ? rec : null;
+    return { status: fresh ? 'ok' : 'stale', record: rec, mirror };
+  }
+
+  _readMirror() {
+    let raw;
+    try { raw = JSON.parse(fs.readFileSync(this.mirrorFile, 'utf8')); } catch (e) { return { status: e.code === 'ENOENT' ? 'missing' : 'invalid', seq: 0 }; }
+    if (!raw || typeof raw !== 'object' || typeof raw.keyId !== 'string' || !isSealed(raw)) return { status: 'invalid', seq: 0 };
+    if (raw.keyId !== this.meta?.keyId || !this.stateKey) return { status: 'other_key', keyId: raw.keyId, seq: 0 };
+    let seq = 0;
+    try { const j = JSON.parse(unseal(this.stateKey, raw, MIRROR_AAD(raw.keyId))?.toString('utf8') || 'null'); if (Number.isInteger(j?.seq) && j.seq > 0) seq = j.seq; } catch { /* invalid */ }
+    return seq ? { status: 'ok', seq, keyId: raw.keyId } : { status: 'invalid', seq: 0 };
+  }
+
+  /** Best effort: a failed mirror write only weakens the detection of an older vault.json put back. */
+  _writeMirror(seq) {
+    try {
+      const body = { version: 1, keyId: this.meta.keyId, seq, ...seal(this.stateKey, Buffer.from(JSON.stringify({ seq })), MIRROR_AAD(this.meta.keyId)) };
+      const tmp = `${this.mirrorFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(body, null, 2) + '\n', { mode: 0o600 });
+      fs.renameSync(tmp, this.mirrorFile);
+      return true;
+    } catch { return false; }
+  }
+
   /** The file cipher while unlocked. */
   get cipher() { return this.dek ? { key: this.dek } : null; }
 
-  lock() { wipe(this.dek); this.dek = null; }
+  /** Forget the data key; `keepStateKey` (off mode) keeps only the key that seals the security record. */
+  lock({ keepStateKey = false } = {}) {
+    wipe(this.dek);
+    this.dek = null;
+    if (!keepStateKey) { wipe(this.stateKey); this.stateKey = null; }
+  }
+}
+
+/** The key that seals the security record: HKDF of the data key, salted with its id (never the data key itself). */
+function stateKeyOf(dek, keyId) {
+  return hkdf(dek, Buffer.from(keyId, 'hex'), 'harness security state v1');
 }

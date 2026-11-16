@@ -116,6 +116,68 @@ describe('key store (vault.json)', () => {
     assert.equal(throttleDelay(40), 300000);
   });
 
+  test('the security record (review 01): sealed under the data key; edited, forged, older or orphaned copies are told apart', async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, 'vault.json');
+    const base = { mode: 'password', encrypted: true, offlineLock: true, allowedUntil: null, allowFrom: null, migration: null };
+    const v = new Vault(dir, { kdf: FAST });
+    await v.create('correct horse', { state: base });
+    assert.equal(v.readState().status, 'ok');
+    const first = fss.readFileSync(file);
+    assert.ok(!first.includes('"mode"') && !first.includes('offlineLock'), 'the record is not readable in vault.json');
+    v.commit({ offlineLock: false });
+    v.lock();
+    const open = async () => { const w = new Vault(dir, { kdf: FAST }).load(); await w.unlockWithPassword('correct horse'); return w; };
+    let w = await open();
+    let r = w.readState();
+    assert.equal(r.status, 'ok');
+    assert.equal(r.record.offlineLock, false);
+    assert.equal(r.record.seq, 2);
+    // an older vault.json put back on its own: vault-seq.json is ahead → stale (authentic, but not current)
+    const second = fss.readFileSync(file);
+    fss.writeFileSync(file, first);
+    w = await open();
+    r = w.readState();
+    assert.equal(r.status, 'stale');
+    assert.equal(r.record.offlineLock, true);
+    // the plain fields can be edited, the record cannot: a byte changed, or one sealed under another key → invalid
+    fss.writeFileSync(file, second);
+    const m = JSON.parse(second);
+    const data = Buffer.from(m.state.data, 'base64');
+    data[3] ^= 1;
+    fss.writeFileSync(file, JSON.stringify({ ...m, state: { ...m.state, data: data.toString('base64') } }));
+    assert.equal((await open()).readState().status, 'invalid');
+    const { seal } = await import('../server/security/crypto.mjs');
+    const forged = seal(key(), Buffer.from(JSON.stringify({ v: 1, seq: 99, keyId: m.keyId, ...base, offlineLock: false, tamper: null, prevKeyId: null })), `harness-state-v1:${m.keyId}`);
+    fss.writeFileSync(file, JSON.stringify({ ...m, state: { seq: 99, ...forged } }));
+    assert.equal((await open()).readState().status, 'invalid');
+    // no record (a 0.2.0 key store) → missing; the counter file removed while the record is past its first write → stale
+    fss.writeFileSync(file, JSON.stringify({ ...m, state: undefined }));
+    assert.equal((await open()).readState().status, 'missing');
+    fss.writeFileSync(file, second);
+    fss.rmSync(path.join(dir, 'vault-seq.json'));
+    assert.equal((await open()).readState().status, 'stale');
+    // a new data key: the record moves to it; a counter file still under the old key (crash in between) is accepted
+    w = await open();
+    w.readState();
+    w.commit({});
+    const oldSeq = fss.readFileSync(path.join(dir, 'vault-seq.json'));
+    await w.replaceKey(crypto.randomBytes(32), 'correct horse', { state: { migration: null } });
+    assert.equal(w.readState().status, 'ok');
+    fss.writeFileSync(path.join(dir, 'vault-seq.json'), oldSeq);
+    r = (await open()).readState();
+    assert.equal(r.status, 'ok');
+    assert.equal(r.record.prevKeyId, m.keyId);
+    // the record key is not the data key, and off mode keeps only it
+    w = await open();
+    assert.ok(w.stateKey && !w.stateKey.equals(w.dek));
+    w.lock({ keepStateKey: true });
+    assert.equal(w.dek, null);
+    assert.ok(w.stateKey);
+    w.lock();
+    assert.equal(w.stateKey, null);
+  });
+
   test('password change re-wraps only; a new recovery key replaces the old one', async () => {
     const dir = await tmpDir();
     const v = new Vault(dir, { kdf: FAST });

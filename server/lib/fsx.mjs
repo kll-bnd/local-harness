@@ -17,7 +17,7 @@ import { isHXC, isHXL, decryptHXC, decryptHXL, hxcEncryptor, hxcDecryptor, hxlHe
 const queues = new Map();
 
 /** Never encrypted: needed before the data is open, or not sensitive (docs/API.md §10.4). */
-export const PLAIN_FILES = new Set(['launch.json', 'vault.json', 'vault.json.bak', 'harness.lock', 'measurements.json', 'api-token', '.dev-keychain']);
+export const PLAIN_FILES = new Set(['launch.json', 'vault.json', 'vault.json.bak', 'vault-seq.json', 'harness.lock', 'measurements.json', 'api-token', '.dev-keychain']);
 const LOCKED = Symbol('locked');
 const ciphers = new Map(); // dir → { key, oldKeys? } | { key: null, oldKeys } (decrypting) | LOCKED
 

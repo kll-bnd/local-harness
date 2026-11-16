@@ -21,7 +21,7 @@ const TMP_SUFFIX = '.harness-migrate.tmp';
  */
 export const OWNED_FILES = new Set(['settings.json', 'presets.json', 'calibration.json', 'memories.json', 'model-copies.json', 'ui-state.json']);
 export const OWNED_DIRS = new Set(['chats', 'attachments', 'images', 'index']);
-export const OWNED_PLAIN = new Set(['launch.json', 'vault.json', 'vault.json.bak', 'harness.lock', 'measurements.json', 'api-token', '.dev-keychain']);
+export const OWNED_PLAIN = new Set(['launch.json', 'vault.json', 'vault.json.bak', 'vault-seq.json', 'harness.lock', 'measurements.json', 'api-token', '.dev-keychain']);
 
 /** Is `file` (absolute, under dataDir) an encrypted-by-design file the backend owns? */
 export function isDataFile(file, dataDir) {

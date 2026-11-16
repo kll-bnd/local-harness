@@ -129,6 +129,15 @@ plain-text file in the data directory, and every launcher (native app, Electron 
 
 A missing file means the defaults shown above.
 
+`launch.json` is **a hint for launchers; the backend never lowers protection because of it.** Anyone who can
+write the data folder can edit it, so once a key store exists the backend takes the mode, the blocker and an
+allow window only from its security record, which is sealed under the data key (docs/API.md §10.2): until the
+first unlock it runs locked in an encrypted mode with the blocker on, whatever this file says, and after it the
+backend rewrites the file to match the record (a value that claimed less protection is reported in
+`GET /api/security` → `tamper`). A launcher that follows a tampered file can only start the backend outside the
+sandbox or offer the Keychain; the backend blocks in code and asks for the password all the same. Keep reading
+it before every start (the backend may have rewritten it), and do not write it yourself.
+
 ## Locking
 
 In password mode the backend starts locked. The UI is served as usual and shows a lock screen; it sends

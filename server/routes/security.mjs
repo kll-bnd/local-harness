@@ -88,6 +88,9 @@ export function registerSecurityRoutes(r, core) {
     return core.rekey({ password: body.password, header: confirmHeader(req), sessionHash: auth.sessionHash });
   });
 
+  // The owner has seen the notice that plain settings disagreed with the security record (§10.2).
+  r.post('/api/security/tamper/dismiss', () => core.dismissTamper());
+
   // The explicit "the user is here" signal (at most once a minute while the user interacts; data-free).
   r.post('/api/security/activity', () => core.touch());
 
