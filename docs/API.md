@@ -1017,7 +1017,7 @@ No session needed (it contains no user data). Also embedded in `GET /api/system`
   names: `launch.json: encryption`, `launch.json: offlineLock`, `launch.json: offlineLockSuspendedUntil`, `vault.json:
   encrypted`, `vault.json: migration`, `vault.json: security record (an older copy)`, `vault.json: security record
   (not sealed with this key)`, `vault.json: security record (removed)`, `vault.json: security record (damaged;
-  restored from vault.json.bak)`, `vault.json: security record (says the data is not encrypted)`, and `vault-seq.json:
+  restored from vault.json.bak)`, `vault.json: a key wrap (damaged; restored from vault.json.bak)`, `vault.json: security record (says the data is not encrypted)`, and `vault-seq.json:
   <what is wrong> — an older vault.json cannot be told from the current one, …` when the counter file is not a
   readable file (then the most protective settings apply at every unlock until it is one again; logged once).
 

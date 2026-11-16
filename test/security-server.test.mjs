@@ -1114,6 +1114,27 @@ describe('key material is never lost; without an intact record only the most pro
     await fs.rm(dataDir, { recursive: true, force: true });
   });
 
+  test('a damaged password wrap in vault.json is taken from vault.json.bak (an unlock attempt never overwrites it there)', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.call('POST', '/api/memories', { content: 'WRAP-SURVIVES' });
+      await s.close({ keep: true });
+      const v = readJ(dataDir, 'vault.json');
+      const b = Buffer.from(v.wraps.password.data, 'base64');
+      b[3] ^= 0xff;
+      writeJ(dataDir, 'vault.json', { ...v, wraps: { ...v.wraps, password: { ...v.wraps.password, data: b.toString('base64') } } });
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await s.call('POST', '/api/security/unlock', { password: 'wrong wrong' }, { token: null })).status, 401);
+      assert.equal(readJ(dataDir, 'vault.json.bak').wraps.password.data, v.wraps.password.data, 'the counted wrong attempt kept the intact copy');
+      assert.equal((await s.unlock()).status, 200);
+      assert.ok(await hasMemory(s, 'WRAP-SURVIVES'));
+      assert.ok((await sec(s)).tamper.fields.includes('vault.json: a key wrap (damaged; restored from vault.json.bak)'));
+      assert.equal(readJ(dataDir, 'vault.json').wraps.password.data, v.wraps.password.data, 'put back');
+    } finally { await s.close(); }
+  });
+
   test('review 30: a removed record never means off mode — whatever both hints and the folder say; reported, new data encrypted', async () => {
     let s = await stack();
     await s.setup();

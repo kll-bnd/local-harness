@@ -297,6 +297,15 @@ export class Vault {
         }
       }
     }
+    if (dek && !previous && this.meta.wraps.previous) {
+      // the previous-key wrap did not open from vault.json: its copy in vault.json.bak (only when it differs)
+      const bak = this._bakWraps();
+      if (bak?.wraps.previous && JSON.stringify(bak.wraps.previous) !== JSON.stringify(this.meta.wraps.previous)) {
+        const o = await openPasswordWraps(bak, password);
+        wipe(o.dek);
+        if (o.previous) { previous = o.previous; this.meta = { ...this.meta, wraps: { ...this.meta.wraps, previous: bak.wraps.previous } }; this.restoredWraps = true; }
+      }
+    }
     if (dek) { this.verified.add('password'); if (previous) this.verified.add('previous'); this._setPrevious(previous); } else wipe(previous);
     return dek;
   }

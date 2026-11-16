@@ -514,6 +514,11 @@ export class Core extends EventEmitter {
       fields.add('vault.json: security record (damaged; restored from vault.json.bak)');
       log.warn('The security record in vault.json was damaged; restored it from its verified copy vault.json.bak.');
     }
+    if (this.vault.restoredWraps) {
+      this.vault.restoredWraps = false;
+      fields.add('vault.json: a key wrap (damaged; restored from vault.json.bak)');
+      log.warn('A key wrap in vault.json did not open; the one in its verified copy vault.json.bak did and is used again.');
+    }
     let rec;
     if (r.status === 'ok') rec = { ...r.record };
     else {
