@@ -263,7 +263,8 @@ real page, `native/Sources/SelfTest.swift` on the native side).
   backend's own `POST /api/network/test` under the lock reported the code layer blocking huggingface.co,
   ollama.com and registry.ollama.ai before any name lookup and the OS layer refusing a direct TCP connection to
   1.1.1.1:443 with `EPERM`.
-* The last full run: workflow run 43829649835 (commit 3ce3e9e, the final code): mock 34/34, real backend 23/23,
+* The last full run: workflow run 43857288986 (commit f6ce16e, the final code, after the security-record changes to
+  the backend; the same result as run 43829649835 on 3ce3e9e before them): mock 34/34, real backend 23/23,
   default-folder Keychain 5/5, idle 2/2 — "RESULT: all checks passed". The job fails when a check fails: run
   43828511347 (commit 587d9cf, before the backend's Keychain fix) ended with "RESULT: FAILED" and the two failing
   checks printed last.
