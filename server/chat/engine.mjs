@@ -28,12 +28,15 @@ export function resolveThink(s, info, provider) {
   return t;
 }
 
+/** Sampling options a user/preset/chat may set; num_ctx and keep_alive are always ours (sized from RAM). */
+export const SAMPLING_KEYS = new Set(['temperature', 'top_p', 'top_k', 'min_p', 'repeat_penalty', 'seed', 'num_predict', 'stop', 'presence_penalty', 'frequency_penalty']);
+
 export function buildOptions(info, s, numCtx, providerKind) {
   const o = {};
-  if (providerKind === 'ollama') o.num_ctx = numCtx;
   const mf = info.modelfileParameters || {};
-  for (const [k, v] of Object.entries(info.profile?.sampling || {})) if (mf[k] === undefined) o[k] = v;
-  Object.assign(o, nonNull(s.params));
+  for (const [k, v] of Object.entries(info.profile?.sampling || {})) if (mf[k] === undefined && SAMPLING_KEYS.has(k)) o[k] = v;
+  for (const [k, v] of Object.entries(nonNull(s.params))) if (SAMPLING_KEYS.has(k)) o[k] = v;
+  if (providerKind === 'ollama') o.num_ctx = numCtx;
   return o;
 }
 
@@ -250,39 +253,43 @@ export class ChatEngine {
 
   /** Manual "compact now": summarize everything except a minimal recent tail. */
   async compactNow(chat, { keepRecentMessages, signal } = {}) {
-    if (this.busy(chat.id)) throw new HttpError(409, 'chat_busy', 'A generation is in progress for this chat');
     const path = activePath(chat);
     if (path.length < 2) throw new HttpError(400, 'nothing_to_compact', 'Not enough messages to compact');
-    const t = await this.target(chat);
-    const leaf = path[path.length - 1];
-    const { asm, summary } = await this.assembleFor(chat, t, leaf.id, { pinned: this.app.memories.pinned() }, []);
-    const plan = planCompaction({ live: asm.live, liveTokens: asm.liveTokens, fixedTokens: asm.fixedTokens, budgets: { ...t.budgets, keepRecentTokens: 0, compactTarget: 0 }, minKeepMessages: keepRecentMessages ?? t.s.compaction?.minKeepMessages ?? 2, force: true });
-    if (!plan) throw new HttpError(400, 'nothing_to_compact', 'Nothing can be compacted (the recent tail is the whole live history)');
-    this.app.foreground++;
+    const rec = this.reserve(chat.id, 'compaction');
+    const onAbort = () => rec.controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    let lease = null;
     try {
-      const { entry } = await this.compact(chat, t, { path, summary, plan, signal });
+      const t = await this.target(chat);
+      const leaf = path[path.length - 1];
+      const { asm, summary } = await this.assembleFor(chat, t, leaf.id, { pinned: this.app.memories.pinned() }, []);
+      const plan = planCompaction({ live: asm.live, liveTokens: asm.liveTokens, fixedTokens: asm.fixedTokens, budgets: { ...t.budgets, keepRecentTokens: 0, compactTarget: 0 }, minKeepMessages: keepRecentMessages ?? t.s.compaction?.minKeepMessages ?? 2, force: true });
+      if (!plan) throw new HttpError(400, 'nothing_to_compact', 'Nothing can be compacted (the recent tail is the whole live history)');
+      lease = await this.app.ram.acquire('llm', { owner: rec.generationId, signal: rec.controller.signal });
+      const { entry } = await this.compact(chat, t, { path, summary, plan, signal: rec.controller.signal });
       return { summary: entry, messagesSummarized: plan.evict.length, tokensBefore: asm.usage.used, keptMessages: asm.live.length - plan.boundary };
     } finally {
-      this.app.foreground--;
-      this.app.background.kick();
+      lease?.release();
+      signal?.removeEventListener('abort', onAbort);
+      this.release(chat.id, rec);
     }
   }
 
   /** Context usage preview for the active path (+ optional draft text) without generating. */
-  async preview(chat, { draft = '' } = {}) {
-    const t = await this.target(chat);
+  async preview(liveChat, { draft = '' } = {}) {
+    const t = await this.target(liveChat);
+    // Work on a shallow copy: the live chat is never modified (no draft message visible to concurrent requests).
+    const chat = { ...liveChat, messages: { ...liveChat.messages } };
     const path = activePath(chat);
-    const fake = draft ? { id: '__draft__', role: 'user', content: draft, parentId: path.at(-1)?.id ?? null, createdAt: nowIso() } : null;
+    const fake = draft ? { id: '__draft__', role: 'user', content: String(draft).slice(0, 1_000_000), parentId: path.at(-1)?.id ?? null, createdAt: nowIso() } : null;
     if (fake) chat.messages[fake.id] = fake;
-    try {
+    {
       const anchor = fake?.id || path.at(-1)?.id;
       const retrieval = anchor ? await this.retrieve(chat, t, pathTo(chat, anchor), draft || path.at(-1)?.content || '', undefined) : { pinned: [] };
       const tools = toolSchemas(await this.toolsFor(chat, t), { compact: t.budgets.numCtx <= 8192 });
       if (!anchor) return { context: emptyUsage(t, tools), plan: t.plan };
       const { asm, summary } = await this.assembleFor(chat, t, anchor, retrieval, tools);
       return { context: { ...asm.usage, needsCompaction: asm.needsCompaction, summaryId: summary?.id || null, truncation: asm.truncation }, plan: t.plan, model: { providerId: t.provider.id, model: t.model } };
-    } finally {
-      if (fake) delete chat.messages[fake.id];
     }
   }
 

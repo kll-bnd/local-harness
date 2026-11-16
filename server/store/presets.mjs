@@ -4,7 +4,9 @@ import { readJson, writeJsonAtomic } from '../lib/fsx.mjs';
 import { newId } from '../lib/ids.mjs';
 import { nowIso } from '../lib/util.mjs';
 import { badRequest, notFound, HttpError } from '../lib/errors.mjs';
-import { obj, str, any, validatePatch } from './schema.mjs';
+import { obj, str, validatePatch, sanitizeValue } from './schema.mjs';
+import { PARAMS_SCHEMA } from './settings.mjs';
+import { isSafeId } from '../lib/ids.mjs';
 
 export const BUILTIN_PRESETS = [
   {
@@ -44,7 +46,8 @@ export const BUILTIN_PRESETS = [
   },
 ];
 
-const PRESET_SCHEMA = obj({ name: str({ nullable: false, max: 100 }), description: str({ max: 500 }), systemPrompt: str({ nullable: false, max: 50000 }), params: any(), icon: str({ max: 50 }) });
+// `params` only accepts sampling parameters (never num_ctx / keep_alive, which are sized from RAM).
+const PRESET_SCHEMA = obj({ name: str({ nullable: false, max: 100 }), description: str({ max: 500 }), systemPrompt: str({ nullable: false, max: 50000 }), params: PARAMS_SCHEMA, icon: str({ max: 50 }) });
 
 export class PresetStore {
   constructor(dataDir, bus) {
@@ -55,7 +58,12 @@ export class PresetStore {
 
   async load() {
     const j = await readJson(this.file, { version: 1, items: [] });
-    this.user = j.items || [];
+    this.user = [];
+    for (const p of Array.isArray(j?.items) ? j.items : []) {
+      if (!p || !isSafeId(p.id, 'preset') || typeof p.name !== 'string' || typeof p.systemPrompt !== 'string') continue;
+      p.params = sanitizeValue(PARAMS_SCHEMA, p.params && typeof p.params === 'object' ? p.params : {}).value || {};
+      this.user.push(p);
+    }
     return this;
   }
 

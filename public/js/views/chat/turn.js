@@ -287,7 +287,8 @@ export class TurnView {
     const isLast = this.ctx.view.isLastTurn(this.key);
     const live = isLast ? this.ctx.model.live : null;
     const liveSig = live ? `${live.phase}:${live.compaction?.status}:${live.modelStatus?.phase}:${[...this.ctx.model.tool.values()].map((t) => `${t.phase}${t.progress}${t.images.length}${t.status}`).join()}` : '';
-    const s = `${sig(turn.user)}|${turn.chain.map(sig).join('|')}|${liveSig}|${isLast}|${this.ctx.model.generating}|${this.ctx.view.editing || ''}`;
+    const trailN = turn.chain.reduce((n, m) => n + (this.ctx.model.trail.get(m.id)?.length || 0), 0);
+    const s = `${sig(turn.user)}|${turn.chain.map(sig).join('|')}|${liveSig}|${isLast}|${this.ctx.model.generating}|${this.ctx.view.editing || ''}|${trailN}`;
     if (!force && s === this.sigs) return;
     this.sigs = s;
     this.renderUser(turn.user);
@@ -363,11 +364,11 @@ export class TurnView {
       if (!oldEditor) add(this.stepsEl, editor(last.content, { label: 'Edit answer', submitLabel: 'Save', hint: 'Saved as an edited copy; the original stays available as a version.', onCancel: () => this.ctx.view.setEditing(null), onSubmit: (text) => this.ctx.view.submitAssistantEdit(last, text) }));
     } else oldEditor?.remove();
 
-    // live status line
+    // what the machine did during this turn (kept after the fact) + what it is doing right now
     const d = isLast ? describeLive(model) : null;
-    const comp = isLast ? model.live?.compaction : null;
-    mount(this.statusEl, 
-      comp?.status === 'done' ? h('span.status-line.done', icon('summary', { size: 13 }), `Summarized ${plural(comp.messages || 0, 'earlier message')} to make room`) : null,
+    const trail = chain.flatMap((m) => model.trail.get(m.id) || []);
+    mount(this.statusEl,
+      ...trail.map((t) => h('span.status-line.done', icon(t.icon, { size: 13 }), t.text)),
       d ? h(`span.status-line.phase-${d.phase}`, h('span.spinner.small'), d.label) : null,
     );
     this.statusEl.hidden = !this.statusEl.childNodes.length;

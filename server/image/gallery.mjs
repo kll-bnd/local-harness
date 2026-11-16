@@ -2,12 +2,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { readJson, writeJsonAtomic, writeFileAtomic, ensureDir, removeFile } from '../lib/fsx.mjs';
-import { newId } from '../lib/ids.mjs';
+import { newId, isSafeId } from '../lib/ids.mjs';
 import { nowIso } from '../lib/util.mjs';
 import { notFound } from '../lib/errors.mjs';
 import { imageSize } from '../docs/extract.mjs';
 
 const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
+const FILE_RE = /^img_[0-9a-z]{8,64}\.(png|jpg|webp)$/;
 
 export class Gallery {
   constructor({ dataDir, bus }) {
@@ -20,13 +21,16 @@ export class Gallery {
   async load() {
     await ensureDir(this.dir);
     const j = await readJson(this.indexFile, { version: 1, items: [] });
-    for (const it of j.items || []) this.items.set(it.id, it);
+    for (const it of j.items || []) if (it && isSafeId(it.id, 'img') && FILE_RE.test(it.file || '')) this.items.set(it.id, it);
     return this;
   }
 
   async saveIndex() { await writeJsonAtomic(this.indexFile, { version: 1, items: [...this.items.values()] }); }
 
-  filePath(rec) { return path.join(this.dir, rec.file); }
+  filePath(rec) {
+    if (!isSafeId(rec?.id, 'img') || !FILE_RE.test(rec.file || '') || !rec.file.startsWith(`${rec.id}.`)) throw new Error('Unsafe image file name');
+    return path.join(this.dir, rec.file);
+  }
 
   async add({ buffer, mime, meta }) {
     const id = newId('img');
@@ -61,7 +65,8 @@ export class Gallery {
 
   async update(id, patch) {
     const r = this.get(id);
-    Object.assign(r, patch);
+    const { id: _i, file: _f, ...safe } = patch || {};
+    Object.assign(r, safe);
     await this.saveIndex();
     return r;
   }

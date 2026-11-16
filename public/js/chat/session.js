@@ -36,6 +36,7 @@ export class ChatModel extends Emitter {
     this.summaryInfo = null; // GET /summary
     this.noticed = new Set();
     this.timing = new Map(); // messageId → { reasoningStart, reasoningEnd, start }
+    this.trail = new Map(); // assistant step id → [{ icon, text }] — what the machine did during that turn
   }
 
   get title() { return this.chat?.title || 'New chat'; }
@@ -206,6 +207,7 @@ function handleEvent(model, ev) {
       if (ev.status === 'started') setLive(model, { compaction: { status: 'running', ...ev } });
       else if (ev.status === 'completed') {
         setLive(model, { compaction: { status: 'done', ...ev } });
+        addTrail(model, { key: 'compaction', icon: 'summary', text: `Summarized ${ev.messages || 'earlier'} earlier message${ev.messages === 1 ? '' : 's'} to make room (${ev.usedBefore ?? '?'} → ${ev.usedAfter ?? '?'} tokens)` });
         if (model.chat) model.chat = { ...model.chat, summary: ev.summary };
         model.emit('summary');
         model.emit('reset');
@@ -237,6 +239,11 @@ function handleEvent(model, ev) {
       break;
     }
     case 'model_status': {
+      if (ev.phase === 'loading') model.reloadStarted = Date.now();
+      if (ev.phase === 'ready') {
+        const secs = model.reloadStarted ? (Date.now() - model.reloadStarted) / 1000 : null;
+        addTrail(model, { key: 'reload', icon: 'regenerate', text: `Reloaded the chat model after the image${secs != null ? ` (${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s)` : ''}` });
+      }
       setLive(model, { modelStatus: ev.phase === 'loading' ? ev : null });
       changed(model, model.live?.assistantId);
       break;
@@ -305,7 +312,10 @@ function handleEvent(model, ev) {
         st.phase = ev.phase;
         if (!st.phases.includes(ev.phase)) st.phases.push(ev.phase);
         if (ev.message) st.message = ev.message;
-        if (ev.phase === 'unloading') st.unload = { models: ev.models, reason: ev.reason, message: ev.message };
+        if (ev.phase === 'unloading') {
+          st.unload = { models: ev.models, reason: ev.reason, message: ev.message };
+          addTrail(model, { key: `unload:${st.jobId}`, icon: 'eject', text: `Unloaded ${(ev.models || []).join(', ') || 'the chat model'} to free memory for the image` });
+        }
         if (ev.phase === 'starting') { st.params = ev.params; st.family = ev.family; st.warnings = ev.warnings || []; }
       }
       if (t === 'image_progress') Object.assign(st, { progress: ev.progress, step: ev.step, steps: ev.steps, eta: ev.etaSeconds });
@@ -340,6 +350,15 @@ function handleEvent(model, ev) {
 
 const BUDGET_CODES = ['model_exceeds_budget', 'exceeds_budget', 'measured_exceeds_budget', 'cpu_offload'];
 const noticedOnce = new Set();
+
+/** Remember a notable machine event for the turn being generated (shown under the answer). */
+function addTrail(model, entry) {
+  const id = model.live?.assistantId;
+  if (!id) return;
+  const list = model.trail.get(id) || [];
+  if (entry.key && list.some((x) => x.key === entry.key)) return;
+  model.trail.set(id, [...list, entry]);
+}
 
 function noticeTitle(ev) {
   switch (ev.code) {

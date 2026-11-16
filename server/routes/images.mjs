@@ -94,59 +94,21 @@ export function registerImageRoutes(r, app) {
     const ireq = validateImageRequest(body);
     const stream = body.stream !== false;
     let chat = null;
+    let reservation = null;
     if (body.chatId) {
       chat = app.chats.get(body.chatId);
-      if (app.engine.busy(chat.id)) throw new HttpError(409, 'chat_busy', 'A generation is already running for this chat');
       if (body.parentId && !chat.messages[body.parentId]) throw new HttpError(400, 'bad_parent', 'parentId not found in this chat');
-    }
-    // Fail fast (before SSE) when no provider is reachable.
-    const provider = await app.imageProviders.resolve(ireq.providerId);
-    ireq.providerId = provider.id;
-
-    const sse = stream ? openSse(req, res) : null;
-    const emit = (t, d) => sse?.send(t, d);
-    const controller = new AbortController();
-    if (sse) sse.signal.addEventListener('abort', () => controller.abort(), { once: true });
-    else req.on('close', () => { if (!res.writableEnded) controller.abort(); });
-
-    let um = null;
-    let am = null;
-    if (chat) {
-      const parentId = body.parentId === undefined ? chat.activeLeafId : body.parentId;
-      um = { id: newId('msg'), parentId: parentId ?? null, role: 'user', kind: 'image_request', content: ireq.prompt, imageRequest: { ...ireq }, createdAt: nowIso(), status: 'complete' };
-      addMessage(chat, um);
-      am = { id: newId('msg'), parentId: um.id, role: 'assistant', kind: 'image_result', content: '', images: [], status: 'streaming', model: { providerId: provider.id, model: ireq.model || null, kind: 'image' }, createdAt: nowIso() };
-      addMessage(chat, am);
-      setActiveLeaf(chat, am.id);
-      if (!chat.titleSource) { chat.title = ireq.prompt.slice(0, 60); chat.titleSource = 'provisional'; }
-      app.engine.active.set(chat.id, { generationId: newId('gen'), controller, assistantMessageId: am.id, startedAt: nowIso(), kind: 'image' });
-      app.chats.touch(chat);
-      emit('message', { message: publicMessage(um) });
-      emit('message', { message: publicMessage(am) });
+      reservation = app.engine.reserve(chat.id, 'image'); // synchronous: no await between check and reservation
     }
     try {
-      const { job, images } = await app.images.generate(ireq, { signal: controller.signal, emit, chatId: chat?.id || null, messageId: am?.id || null, source: 'user' });
-      if (am) {
-        am.images = images.map(imageRef);
-        am.status = 'complete';
-        am.model.model = images[0]?.model || am.model.model;
-        am.imageJobId = job.id;
-        am.updatedAt = nowIso();
-      }
-      const payload = { job, images: images.map(publicImage), ...(am ? { message: publicMessage(am), userMessage: publicMessage(um), chat: chatSummary(chat) } : {}) };
-      if (sse) sse.send('done', payload); else sendJson(res, 200, payload);
-    } catch (e) {
-      const aborted = controller.signal.aborted || e.name === 'AbortError';
-      if (am) { am.status = aborted ? 'aborted' : 'error'; am.error = aborted ? null : e.message; am.updatedAt = nowIso(); }
-      if (sse) sse.send('error', { code: aborted ? 'aborted' : e.code || 'image_error', message: e.message, ...(am ? { messageId: am.id } : {}) });
-      else if (!res.headersSent) throw e;
+      // Fail fast (before SSE) when no provider is reachable.
+      const provider = await app.imageProviders.resolve(ireq.providerId);
+      ireq.providerId = provider.id;
+      if (chat && app.chats.chats.get(chat.id) !== chat) throw new HttpError(404, 'not_found', 'Chat not found');
+      if (chat && body.parentId && !chat.messages[body.parentId]) throw new HttpError(400, 'bad_parent', 'parentId not found in this chat');
+      await runImageTurn({ app, req, res, chat, reservation, ireq, provider, stream, parentId: chat ? (body.parentId === undefined ? chat.activeLeafId : body.parentId) : null });
     } finally {
-      if (chat) {
-        app.engine.active.delete(chat.id);
-        app.chats.touch(chat);
-        await app.chats.saveNow(chat).catch(() => {});
-      }
-      sse?.end();
+      if (reservation) app.engine.release(chat.id, reservation);
     }
   });
 
@@ -167,4 +129,74 @@ export function registerImageRoutes(r, app) {
   });
 
   r.delete('/api/images/:id', async ({ params }) => { await app.gallery.delete(params.id); return { ok: true }; });
+}
+
+/**
+ * One image generation, optionally linked to a chat (adds an image_request user message — unless `userMessage`
+ * is given, e.g. for regenerate — and an image_result assistant message). Streams SSE unless `stream` is false.
+ */
+export async function runImageTurn({ app, req, res, chat, reservation, ireq, provider, stream = true, parentId = null, userMessage = null, chatStyle = false }) {
+  const sse = stream ? openSse(req, res) : null;
+  const emit = (t, d) => sse?.send(t, d);
+  const controller = reservation?.controller || new AbortController();
+  if (sse) sse.signal.addEventListener('abort', () => controller.abort(), { once: true });
+  else req.on('close', () => { if (!res.writableEnded) controller.abort(); });
+  let um = userMessage;
+  let am = null;
+  if (chat) {
+    if (!um) {
+      um = { id: newId('msg'), parentId: parentId ?? null, role: 'user', kind: 'image_request', content: ireq.prompt, imageRequest: { ...ireq }, createdAt: nowIso(), status: 'complete' };
+      addMessage(chat, um);
+    }
+    am = { id: newId('msg'), parentId: um.id, role: 'assistant', kind: 'image_result', content: '', images: [], status: 'streaming', model: { providerId: provider.id, model: ireq.model || null, kind: 'image' }, createdAt: nowIso() };
+    addMessage(chat, am);
+    setActiveLeaf(chat, am.id);
+    if (reservation) reservation.assistantMessageId = am.id;
+    if (!chat.titleSource) { chat.title = ireq.prompt.slice(0, 60); chat.titleSource = 'provisional'; }
+    app.chats.touch(chat);
+    if (chatStyle) emit('start', { generationId: reservation?.generationId || null, chatId: chat.id, userMessage: null, assistantMessage: publicMessage(am), model: { providerId: provider.id, model: ireq.model || null, kind: 'image' } });
+    if (!userMessage) emit('message', { message: publicMessage(um) });
+    emit('message', { message: publicMessage(am) });
+  }
+  try {
+    const { job, images } = await app.images.generate(ireq, { signal: controller.signal, emit, chatId: chat?.id || null, messageId: am?.id || null, source: 'user' });
+    if (am) {
+      am.images = images.map(imageRef);
+      am.status = 'complete';
+      am.model.model = images[0]?.model || am.model.model;
+      am.imageJobId = job.id;
+      am.updatedAt = nowIso();
+    }
+    const payload = { job, images: images.map(publicImage), ...(am ? { message: publicMessage(am), userMessage: publicMessage(um), chat: chatSummary(chat) } : {}) };
+    if (chatStyle) Object.assign(payload, { generationId: reservation?.generationId || null, reason: 'stop', createdMessageIds: [am.id] });
+    if (sse) sse.send('done', payload); else sendJson(res, 200, payload);
+  } catch (e) {
+    const aborted = controller.signal.aborted || e.name === 'AbortError';
+    if (am) { am.status = aborted ? 'aborted' : 'error'; am.error = aborted ? null : e.message; am.updatedAt = nowIso(); }
+    if (sse) sse.send('error', { code: aborted ? 'aborted' : e.code || 'image_error', message: e.message, ...(am ? { messageId: am.id } : {}) });
+    else if (!res.headersSent) throw e;
+  } finally {
+    if (chat) {
+      if (reservation) app.engine.release(chat.id, reservation);
+      app.chats.touch(chat);
+      await app.chats.saveNow(chat).catch(() => {});
+    }
+    sse?.end();
+  }
+}
+
+/** `POST /api/chats/:id/messages/:mid/regenerate` on an image turn: a new image result under the same request. */
+export async function regenerateImage(ctx, chat, anchor) {
+  const { app, req, res } = ctx;
+  const reservation = app.engine.reserve(chat.id, 'image');
+  try {
+    const ireq = validateImageRequest({ ...(anchor.imageRequest || {}), prompt: anchor.imageRequest?.prompt || anchor.content });
+    if (!anchor.imageRequest?.seed && anchor.imageRequest?.seed !== 0) delete ireq.seed; // a new random seed
+    const provider = await app.imageProviders.resolve(ireq.providerId);
+    ireq.providerId = provider.id;
+    if (!chat.messages[anchor.id]) throw new HttpError(409, 'message_deleted', 'The message to answer no longer exists');
+    await runImageTurn({ app, req, res, chat, reservation, ireq, provider, stream: true, userMessage: anchor, chatStyle: true });
+  } finally {
+    app.engine.release(chat.id, reservation);
+  }
 }

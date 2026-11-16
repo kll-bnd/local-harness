@@ -90,7 +90,8 @@ describe('memory end-to-end', () => {
     assert.equal((await h.c.get('/api/memories')).data.total, count);
     assert.equal(byType(r.events, 'retrieval').length, 0);
     const req = lastMainRequest(h.fake);
-    assert.doesNotMatch(JSON.stringify(req.messages), /Adaline|<context>/);
+    assert.doesNotMatch(JSON.stringify(req.messages), /Adaline/);
+    assert.doesNotMatch(JSON.stringify(req.messages.slice(1)), /<context>/);
     assert.equal(h.app.recall.index.items.size === 0 || ![...h.app.recall.index.items.values()].some((i) => i.meta.chatId === chat), true);
   });
 

@@ -64,6 +64,7 @@ async function streamTurn(ctx, chat, { prepare, modelRef }) {
     const prepared = await app.engine.target(chat, modelRef);
     if (app.chats.chats.get(chat.id) !== chat) throw notFound('Chat');
     const { anchorId, userMessage } = prepare();
+    if (!chat.messages[anchorId]) throw new HttpError(409, 'message_deleted', 'The message to answer no longer exists');
     sse = openSse(req, res);
     await app.engine.run({ chat, anchorId, userMessage, emit: (t, d) => sse.send(t, d), signal: sse.signal, modelRef, prepared, reservation });
   } catch (e) {

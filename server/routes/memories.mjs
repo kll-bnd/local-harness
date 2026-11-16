@@ -23,7 +23,7 @@ export function registerMemoryRoutes(r, app) {
     const body = await readJson(req);
     const content = requireString(body.content, 'content', { max: 2000 });
     if (body.category !== undefined && !MEMORY_CATEGORIES.includes(body.category)) throw badRequest(`category must be one of ${MEMORY_CATEGORIES.join(', ')}`);
-    const res = await app.memories.add({ content, category: body.category || 'other', pinned: !!body.pinned, origin: 'manual', dedupe: body.dedupe !== false });
+    const res = await app.memories.add({ content, category: body.category || 'other', pinned: !!body.pinned, origin: 'manual', dedupe: body.dedupe !== false, allowSecret: body.allowSecret === true });
     return created(res);
   });
 
@@ -38,22 +38,25 @@ export function registerMemoryRoutes(r, app) {
   r.post('/api/memories/extract', async ({ req }) => {
     const body = await readJson(req);
     const chat = app.chats.get(requireString(body.chatId, 'chatId'));
-    if (app.engine.busy(chat.id)) throw new HttpError(409, 'chat_busy', 'A generation is in progress for this chat');
-    if (body.full) chat.memoryCursor = null;
-    app.foreground++;
+    const rec = app.engine.reserve(chat.id, 'memory_extraction');
+    let lease = null;
     try {
-      const res = await extractMemories(app, chat);
+      if (body.full) chat.memoryCursor = null;
+      lease = await app.ram.acquire('llm', { owner: rec.generationId, signal: rec.controller.signal });
+      const res = await extractMemories(app, chat, { signal: rec.controller.signal });
       return { added: res.added, updated: res.updated, skipped: res.skipped };
     } finally {
-      app.foreground--;
-      app.background.kick();
+      lease?.release();
+      app.engine.release(chat.id, rec);
     }
   });
 
   r.patch('/api/memories/:id', async ({ req, params }) => {
     const body = await readJson(req);
-    for (const k of Object.keys(body)) if (!['content', 'category', 'pinned'].includes(k)) throw badRequest(`Unknown field ${k}`);
-    return { memory: await app.memories.update(params.id, body) };
+    for (const k of Object.keys(body)) if (!['content', 'category', 'pinned', 'needsReview', 'allowSecret'].includes(k)) throw badRequest(`Unknown field ${k}`);
+    if (body.needsReview !== undefined && body.needsReview !== false) throw badRequest('needsReview can only be set to false (confirm the memory)');
+    const { allowSecret, ...patch } = body;
+    return { memory: await app.memories.update(params.id, patch, { origin: 'manual', allowSecret: allowSecret === true }) };
   });
 
   r.delete('/api/memories/:id', async ({ params }) => { await app.memories.delete(params.id); return { ok: true }; });
@@ -65,11 +68,13 @@ export function registerMemoryRoutes(r, app) {
 
   // ---- attachments ------------------------------------------------------------------------------
   r.post('/api/attachments', async ({ req, query }) => {
-    const name = query.get('name') || req.headers['x-filename'] || 'file';
+    let name = query.get('name');
+    if (!name && req.headers['x-filename']) { try { name = decodeURIComponent(String(req.headers['x-filename'])); } catch { name = String(req.headers['x-filename']); } }
+    name ||= 'file';
     const chatId = query.get('chatId') || null;
     if (chatId) app.chats.get(chatId);
     const buffer = await readBody(req, MAX_UPLOAD_BYTES);
-    const a = await app.attachments.create({ name: decodeURIComponent(String(name)), mime: req.headers['content-type'] || null, buffer, chatId });
+    const a = await app.attachments.create({ name: String(name), mime: req.headers['content-type'] || null, buffer, chatId });
     return created({ attachment: publicAttachment(a) });
   });
 
@@ -78,7 +83,18 @@ export function registerMemoryRoutes(r, app) {
   r.get('/api/attachments/:id/content', async ({ params, res }) => {
     const a = app.attachments.get(params.id);
     const buf = await app.attachments.readOriginal(a.id);
-    res.writeHead(200, { 'content-type': a.mime || 'application/octet-stream', 'content-length': buf.length, 'cache-control': 'private, max-age=3600', 'content-disposition': `inline; filename="${encodeURIComponent(a.name)}"`, 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'" });
+    // Only raster images are shown inline; everything else (HTML, SVG, PDF, text, …) is a sandboxed download,
+    // so an uploaded file can never run as active content on the app's own origin.
+    const inlineImage = a.kind === 'image' && ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(a.mime);
+    const fname = encodeURIComponent(a.name).replace(/'/g, '%27');
+    res.writeHead(200, {
+      'content-type': inlineImage ? a.mime : 'application/octet-stream',
+      'content-length': buf.length,
+      'cache-control': 'private, max-age=3600',
+      'content-disposition': `${inlineImage ? 'inline' : 'attachment'}; filename*=UTF-8''${fname}`,
+      'x-content-type-options': 'nosniff',
+      'content-security-policy': inlineImage ? "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox" : "default-src 'none'; sandbox",
+    });
     res.end(buf);
   });
 

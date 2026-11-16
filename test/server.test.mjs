@@ -53,12 +53,20 @@ describe('server basics & security', () => {
     }
     const cs = await rawRequest(h.srv.port, { headers: { host: '127.0.0.1', 'sec-fetch-site': 'cross-site' } });
     assert.equal(cs.status, 403);
+    // Only the app's own origin is allowed by default — another localhost port is a different site.
+    const own = await rawRequest(h.srv.port, { method: 'POST', path: '/api/chats', headers: { host: `127.0.0.1:${h.srv.port}`, origin: `http://127.0.0.1:${h.srv.port}`, 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(own.status, 201);
+    const otherPort = await rawRequest(h.srv.port, { headers: { host: '127.0.0.1:4747', origin: 'http://localhost:5173' } });
+    assert.equal(otherPort.status, 403);
+    // An explicit dev allow-list (settings.security.allowedOrigins or HARNESS_ALLOWED_ORIGINS) enables CORS for it.
+    await h.c.patch('/api/settings', { security: { allowedOrigins: ['http://localhost:5173', 'http://127.0.0.1:3000'] } });
     const ok = await rawRequest(h.srv.port, { headers: { host: '127.0.0.1:4747', origin: 'http://localhost:5173' } });
     assert.equal(ok.status, 200);
     assert.equal(ok.headers['access-control-allow-origin'], 'http://localhost:5173');
     const pre = await rawRequest(h.srv.port, { method: 'OPTIONS', path: '/api/chats', headers: { host: '127.0.0.1', origin: 'http://127.0.0.1:3000', 'access-control-request-method': 'POST' } });
     assert.equal(pre.status, 204);
     assert.match(pre.headers['access-control-allow-methods'], /PATCH/);
+    await h.c.patch('/api/settings', { security: { allowedOrigins: [] } });
   });
 
   test('error format, 404/405/415/400', async () => {
