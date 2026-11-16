@@ -194,7 +194,7 @@ export class ProviderRegistry {
       const provider = this.get(m.providerId);
       if (!provider) continue;
       try {
-        const plan = await this.contextPlan(provider, m.model, s);
+        const plan = await this.contextPlan(provider, m.model, s, { ignoreLoaded: true });
         const fits = plan.fits !== false && !(plan.warnings || []).some((w) => ['model_exceeds_budget', 'model_too_big'].includes(w.code));
         if (fits) { pick = m; break; }
       } catch { /* metadata unavailable: try the next one */ }
@@ -264,7 +264,7 @@ export class ProviderRegistry {
    * Context plan for a model under effective settings `s`.
    * `opts.otherModelsBytes` lets callers account for another resident model (embeddings).
    */
-  async contextPlan(provider, model, s, { info, otherModelsBytes = 0, modeOverride } = {}) {
+  async contextPlan(provider, model, s, { info, otherModelsBytes = 0, modeOverride, loadedCtx, ignoreLoaded = false } = {}) {
     info ||= await this.modelInfo(provider, model);
     const mode = modeOverride ?? s.context?.mode ?? 'auto';
     const kvInfo = this.kvCacheTypeInfo(s);
@@ -291,6 +291,8 @@ export class ProviderRegistry {
       otherModelsBytes,
       measurements,
       kvCacheTypeSource: provider.kind === 'ollama' ? kvInfo.source : null,
+      // the window the model is loaded with now (auto mode does not grow it until the next cold load)
+      loadedCtx: provider.kind !== 'ollama' || ignoreLoaded ? null : (loadedCtx !== undefined ? loadedCtx : this.loadedCtxFor?.(provider.id, model) ?? null),
       smaller: smallerVariantFor(model, { totalMem: this.system?.totalMem, sizeBytes: info.sizeBytes }),
     });
     plan.providerId = provider.id;

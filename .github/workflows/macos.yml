@@ -155,7 +155,7 @@ jobs:
 
   e2e:
     name: Real Nemotron through Harness, end to end
-    if: ${{ inputs.jobs == 'e2e' }}
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'e2e' }}
     runs-on: macos-latest
     timeout-minutes: 55
     env:

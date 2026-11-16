@@ -204,14 +204,17 @@ export function fitMeasurements(samples, { estModelOnly, perToken, modelBytes = 
     A = g.M - B * g.n;
     method = 'offset';
   }
-  A = Math.max(A, modelBytes * 0.5);
+  // The resident need is at least the model file: every layer is touched for every token. A resident size below the
+  // weights means pages not yet touched after the load (mmap) or already evicted under pressure — not a smaller model.
+  const flooredToWeights = modelBytes > 0 && A < modelBytes;
+  A = Math.max(A, modelBytes);
   // GPU capacity: the smallest GPU-resident size seen while the model was split across CPU/GPU,
   // unless a later fully-GPU sample proves more fits.
   const splits = ok.filter(isCpuSplit);
   let gpuCapBytes = splits.length ? Math.min(...splits.map((x) => x.vramBytes)) : null;
   if (gpuCapBytes !== null && ok.some((x) => !isCpuSplit(x) && x.totalBytes >= gpuCapBytes && String(x.at || '') > String(splits.find((y) => y.vramBytes === gpuCapBytes).at || ''))) gpuCapBytes = null;
   return {
-    usable: true, method, fixedBytes: Math.round(A), perTokenBytes: Math.round(B), samples: ok.length, distinctContexts: groups.length, rejected,
+    usable: true, method, fixedBytes: Math.round(A), perTokenBytes: Math.round(B), samples: ok.length, distinctContexts: groups.length, rejected, flooredToWeights,
     latest: { numCtx: latest.numCtx, totalBytes: latest.totalBytes, vramBytes: latest.vramBytes, at: latest.at || null, cpuSplit: isCpuSplit(latest) },
     gpuCapBytes,
   };
@@ -235,6 +238,7 @@ export function computeContextPlan(p) {
     measurements = null,
     kvCacheTypeSource = null, // 'setting' | 'managed' | 'assumed' (Ollama not started by Harness: f16 assumed)
     smaller = null, // next smaller recommended file { model, approxSizeBytes, textOnly } (for "too big" advice)
+    loadedCtx = null, // num_ctx the model is loaded with right now (auto mode does not grow it), or null when cold
   } = p;
   const totalMem = system.totalMem;
   const budget = memoryBudget({ totalMem, platform: system.platform, arch: system.arch, memoryFraction });
@@ -330,7 +334,13 @@ export function computeContextPlan(p) {
           ...(smaller ? { smallerModel: smaller.model } : {}),
         });
       } else {
-        const cap = Math.max(MIN_CTX, roundCtx(pLimit.numCtx / 2));
+        // One step, not repeated halving (each step is a model reload): take the swap + compressor growth the load
+        // caused off the window at the corrected per-token cost, at least one notch below the pressured window.
+        const pz = pLimit.sample.pressure || {};
+        const excess = Math.max(0, pz.swapDeltaBytes || 0) + Math.max(0, pz.compressedDeltaBytes || 0);
+        const perTok = corr?.perTokenBytes || kv.perToken || 0;
+        const cut = perTok > 0 ? Math.ceil(excess / perTok) : Infinity;
+        const cap = Math.max(MIN_CTX, Math.min(roundCtx(pLimit.numCtx - Math.max(cut, 512)), roundCtx(pLimit.numCtx - 1)));
         if (numCtx > cap) {
           numCtx = cap;
           limitedBy = 'memory_pressure';
@@ -340,6 +350,14 @@ export function computeContextPlan(p) {
     } else if (numCtx >= pLimit.numCtx) {
       warnings.push({ code: 'memory_pressure', message: `Loading this model at ${formatTokensK(pLimit.numCtx)} made macOS swap (${what}). Your context setting was kept: lower it or switch to auto.` });
     }
+  }
+  // Auto mode never GROWS the window of a model that is loaded right now (that would reload it mid-conversation):
+  // a larger window waits for the next cold load (unload / expiry / image job / restart). Shrinking is immediate.
+  let pendingNumCtx = null;
+  if (effMode === 'auto' && Number.isFinite(loadedCtx) && loadedCtx >= 512 && numCtx > loadedCtx) {
+    pendingNumCtx = numCtx;
+    numCtx = loadedCtx;
+    limitedBy = 'loaded';
   }
   const total = estimate(numCtx);
   const fits = total <= budget.budgetBytes;
@@ -388,6 +406,8 @@ export function computeContextPlan(p) {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — limited by RAM${corr?.gpuCapBytes && gpuFitMax !== null && gpuFitMax <= fitMax ? ' (what fits on the GPU)' : ''}; ${est}. Max mode (${formatTokensK(modelMax)}) would need ~${formatBytes(maxTotal)}${alternatives.max.fits ? '' : ' and would likely swap'}.`;
   } else if (limitedBy === 'user') {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context (manual); ${est}.`;
+  } else if (limitedBy === 'loaded') {
+    explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — the window the model is loaded with; it will use ${formatTokensK(pendingNumCtx)} next time the model loads (a larger window now would reload it mid-conversation); ${est}.`;
   } else if (limitedBy === 'memory_pressure') {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — limited by what this ${machine} handled without swapping; ${est}.`;
   } else if (limitedBy === 'low_ram_cap') {
@@ -408,11 +428,12 @@ export function computeContextPlan(p) {
     explanation += ' KV cache precision unknown (this Ollama was not started by Harness): assuming f16 to be safe — set context.kvCacheType if you know it.';
   }
   if (corr) {
-    explanation += ` Memory use is calibrated from ${corr.samples} measurement${corr.samples === 1 ? '' : 's'} of this model (last: ${formatBytes(corr.latest.totalBytes)} at ${formatTokensK(corr.latest.numCtx)}).`;
+    explanation += ` Memory use is calibrated from ${corr.samples} measurement${corr.samples === 1 ? '' : 's'} of this model (last: ${formatBytes(corr.latest.totalBytes)} at ${formatTokensK(corr.latest.numCtx)}${corr.flooredToWeights ? `; below the ${formatBytes(modelBytes)} model file — not all of it was resident yet, so the file size is used as the minimum` : ''}).`;
   }
 
   return {
     numCtx, mode: effMode, modelMax, modelMaxSource, advertisedMax, limitedBy, fits, fitMax: Math.min(fitMax, 10_000_000),
+    pendingNumCtx,
     memory: {
       ...memBase, modelBytes, overheadBytes: overhead, kvBytesPerToken: kv.perToken, kvFixedBytes: kv.fixedFor(numCtx), kvCacheType, kvCacheTypeSource, kvSource: kv.source,
       kvMaxBytes, contextCheap,
@@ -424,7 +445,7 @@ export function computeContextPlan(p) {
         method: fit.method, samples: fit.samples, distinctContexts: fit.distinctContexts, rejected: fit.rejected,
         fixedBytes: fit.usable ? fit.fixedBytes : null, perTokenBytes: fit.usable ? fit.perTokenBytes : null,
         estimatedFixedBytes: Math.round(modelBytes + overhead + kv.fixedFor(Number.MAX_SAFE_INTEGER)), estimatedPerTokenBytes: kv.perToken,
-        gpuCapBytes: fit.gpuCapBytes, latest: fit.latest,
+        gpuCapBytes: fit.gpuCapBytes, latest: fit.latest, flooredToWeights: !!fit.flooredToWeights,
       } : null,
     },
     alternatives, warnings, explanation,

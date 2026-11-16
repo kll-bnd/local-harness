@@ -477,14 +477,20 @@ async function main() {
     needChat();
     // 512 is the API minimum, but its 128-token prompt budget leaves the summarizer no room; 1024 keeps it fast.
     const chat = await newChat({ context: { mode: 1024 }, params: { num_predict: 8, temperature: 0.5 }, memory: { enabled: false }, recall: { enabled: false } });
-    const filler = (i) => `Note ${i}: the lighthouse keeper logs wind, rain, ships and gulls every hour; today the wind was strong from the north-west, two fishing boats came back early, and the lamp was cleaned twice. Reply with just OK.`;
+    // Deterministic: two short turns give the summarizer something old to evict; from then on each message is sized
+    // (from the context event: used / compactAt) to push the next prompt past the compaction threshold.
+    const SENTENCE = 'The lighthouse keeper logged wind, rain, ships and gulls; the lamp was cleaned and the log was signed. ';
+    const sized = (i, tokens) => `Note ${i}: ${SENTENCE.repeat(Math.max(1, Math.ceil((tokens * 4) / SENTENCE.length)))}Reply with just OK.`;
     let compacted = null;
+    let need = 30;
     const deadline = Math.min(Date.now() + 9 * MIN, T0 + BUDGET_MS - MIN);
     for (let i = 1; i <= 6 && !compacted && Date.now() < deadline; i++) {
-      const r = await send(chat, filler(i), `compaction turn ${i}`, Math.max(MIN, deadline - Date.now()));
+      const r = await send(chat, i <= 2 ? `Short note ${i}: the wind is from the north. Reply with just OK.` : sized(i, need), `compaction turn ${i}`, Math.max(MIN, deadline - Date.now()));
       const comp = byType(r.events, 'compaction');
       const ctx = byType(r.events, 'context')[0];
-      say(`turn ${i}`, `${secs(r.ms)}, used ${ctx?.used}/${ctx?.budget} (compactAt ${ctx?.compactAt}), compaction ${comp.map((c) => c.status).join(',') || '-'}${byType(r.events, 'error')[0] ? `, error ${byType(r.events, 'error')[0].code}` : ''}`);
+      const reply = byType(r.events, 'stats').at(-1)?.completionTokens || 8;
+      if (ctx?.compactAt) need = Math.min(600, Math.max(40, ctx.compactAt - (ctx.used + reply) + 60));
+      say(`turn ${i}`, `${secs(r.ms)}, used ${ctx?.used}/${ctx?.budget} (compactAt ${ctx?.compactAt}), compaction ${comp.map((c) => c.status).join(',') || '-'}, next message ~${need} tok${byType(r.events, 'error')[0] ? `, error ${byType(r.events, 'error')[0].code}` : ''}`);
       for (const c of comp) {
         if (c.status === 'started') say('compaction started', `${c.messages} msgs, ${c.tokens} tok, kept ${c.keptMessages}, used ${c.usedBefore}, threshold ${c.threshold}`);
         if (c.status === 'completed') { compacted = c; say('compaction completed', `${c.messages} msgs, ${c.calls} call(s), ${c.usedBefore} → ${c.usedAfter} tok`); say('summary', clip(c.summary?.content?.replace(/\s+/g, ' '), 280)); }

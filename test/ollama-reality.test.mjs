@@ -175,7 +175,8 @@ describe('R3 memory measured as the Mac experiences it', () => {
       assert.match(n2.message, new RegExp(`Loading ${COPY.replace(/[.]/g, '\\.')} at \\d+K made macOS swap \\(\\+\\d+(\\.\\d)? [GM]B swap, \\+\\d+(\\.\\d)? [GM]B compressed\\)\\. From the next message the context window will be \\d+K`));
       const p3 = (await h.c.get(`/api/models/context?model=${encodeURIComponent(COPY)}`)).data.contextPlan;
       assert.equal(p3.limitedBy, 'memory_pressure');
-      assert.equal(p3.numCtx, Math.max(2048, p2.numCtx / 2));
+      // one step to what the swap growth allows (1.25 GB over ≫ the KV cost of the window → the minimum), not halving
+      assert.equal(p3.numCtx, 2048, `${p2.numCtx} → ${p3.numCtx}`);
       assert.match(p3.explanation, /made macOS swap .*auto mode reduced the window/);
       assert.equal(p3.memory.pressure.numCtx, p2.numCtx);
       // explicit context: warned, kept

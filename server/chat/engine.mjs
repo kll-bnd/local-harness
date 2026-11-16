@@ -60,6 +60,21 @@ export class ChatEngine {
 
   loadedCtxFor(providerId, model) { return this.loadedCtx.get(`${providerId}/${model}`) ?? null; }
 
+  /** True the first time a plan warning `code` is seen for this chat and model (notices are not repeated). */
+  firstPlanNotice(chatId, model, code) {
+    this.planNoticed ||= new Map();
+    let set = this.planNoticed.get(chatId);
+    if (!set) {
+      set = new Set();
+      this.planNoticed.set(chatId, set);
+      if (this.planNoticed.size > 2000) this.planNoticed.delete(this.planNoticed.keys().next().value);
+    }
+    const k = `${model}|${code}`;
+    if (set.has(k)) return false;
+    set.add(k);
+    return true;
+  }
+
   /**
    * After a real request: read what the model actually occupies (runner RSS on macOS, swap/compressor growth across
    * a load), store it, and surface bad outcomes (over the safe budget / partly on CPU / the load made macOS swap).
@@ -174,7 +189,18 @@ export class ChatEngine {
       const tag = await this.app.registry.findModel(emb.ref.model, provider.id);
       otherModelsBytes = tag?.sizeBytes || embeddingProfileFor(emb.ref.model).approxSizeBytes || 0;
     }
-    const plan = await this.app.registry.contextPlan(provider, model, s, { info, otherModelsBytes });
+    const key = `${provider.id}/${model}`;
+    // Unloaded for an image job → the next request loads it cold anyway (a pending larger window may apply).
+    const cold = this.app.modelState.unloadedForImage && this.app.modelState.models.includes(model);
+    let plan = await this.app.registry.contextPlan(provider, model, s, { info, otherModelsBytes, ...(cold ? { loadedCtx: null } : {}) });
+    if (plan.pendingNumCtx && provider.kind === 'ollama') {
+      // A larger window is waiting for a cold load: is the model really still loaded (keep_alive may have expired)?
+      const ps = await Promise.race([provider.ps().catch(() => null), new Promise((r) => setTimeout(r, 300, null))]);
+      if (ps && !ps.some((m) => m.model === model || m.name === model || m.model === `${model}:latest`)) {
+        this.loadedCtx.delete(key);
+        plan = await this.app.registry.contextPlan(provider, model, s, { info, otherModelsBytes, loadedCtx: null });
+      }
+    }
     const budgets = budgetsFor(plan.numCtx, s);
     const counter = this.app.calibrator.counter(provider.id, model, { imageTokens: info.profile?.imageTokens || 576 });
     return { s, provider, model, info, plan, budgets, counter };
@@ -428,7 +454,7 @@ export class ChatEngine {
       // --- auto-compaction -------------------------------------------------------------------
       const recentFailure = chat.compaction?.lastErrorAt && Date.now() - Date.parse(chat.compaction.lastErrorAt) < 5 * 60 * 1000;
       if (asm.needsCompaction && s.compaction?.enabled !== false && !recentFailure) {
-        const plan = planCompaction({ live: asm.live, liveTokens: asm.liveTokens, fixedTokens: asm.fixedTokens, budgets: t.budgets, minKeepMessages: s.compaction?.minKeepMessages ?? 2 });
+        const plan = planCompaction({ live: asm.live, liveTokens: asm.liveTokens, fixedTokens: asm.fixedTokens, budgets: t.budgets, minKeepMessages: s.compaction?.minKeepMessages ?? 2, minEvictTokens: t.budgets.maxSummaryTokens });
         if (plan) {
           const before = asm.usage.used;
           emit('compaction', { status: 'started', messages: plan.evict.length, tokens: plan.evictTokens, keptMessages: asm.live.length - plan.boundary, usedBefore: before, threshold: t.budgets.compactAt });
@@ -445,7 +471,8 @@ export class ChatEngine {
         }
       }
       if (asm.truncation) emit('notice', { code: 'context_truncated', message: `Context was over budget: ${asm.truncation.droppedMessages} older message(s) left out and ${asm.truncation.truncatedMessages} shortened for this request (stored messages are unchanged).`, ...asm.truncation });
-      for (const w of t.plan.warnings || []) emit('notice', { code: w.code, message: w.message });
+      // Plan warnings are part of the plan (shown persistently by the UI): as notices, once per chat and model.
+      for (const w of t.plan.warnings || []) if (this.firstPlanNotice(chat.id, t.model, w.code)) emit('notice', { code: w.code, message: w.message });
       if (retrieval.pinned.length && asm.usage.breakdown.memories > t.budgets.memories * 1.5) emit('notice', { code: 'pinned_memories_large', message: 'Pinned memories use more than their share of this small context window.' });
       emit('context', { ...asm.usage, summaryId: summary?.id || null, messageId: asst.id, contextPlan: { numCtx: t.plan.numCtx, limitedBy: t.plan.limitedBy, explanation: t.plan.explanation } });
       asst.context = { ...asm.usage, summaryId: summary?.id || null };

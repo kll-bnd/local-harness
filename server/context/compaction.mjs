@@ -25,7 +25,7 @@ export function activeSummary(chat, path) {
  * Decide what to evict. `live` = messages after the current summary boundary, `liveTokens` their costs.
  * Returns null (nothing to do / nothing evictable) or `{ boundary, evict, evictTokens, keepTokens }`.
  */
-export function planCompaction({ live, liveTokens, fixedTokens, budgets, minKeepMessages = 2, force = false }) {
+export function planCompaction({ live, liveTokens, fixedTokens, budgets, minKeepMessages = 2, force = false, minEvictTokens = 0 }) {
   const n = live.length;
   if (n < 2) return null;
   const total = fixedTokens + liveTokens.reduce((a, b) => a + b, 0);
@@ -52,7 +52,11 @@ export function planCompaction({ live, liveTokens, fixedTokens, budgets, minKeep
     if (b2 !== null && (b === null || tail(b2) < tail(b))) b = b2;
   }
   if (b === null || b <= 0) return null;
-  return { boundary: b, evict: live.slice(0, b), evictTokens: total - fixedTokens - tail(b), keepTokens: tail(b), tailBudget };
+  const evictTokens = total - fixedTokens - tail(b);
+  // Automatic compaction must make the prompt smaller: a span shorter than the summary that replaces it (e.g. when
+  // the newest message alone fills the window) is not worth a summarizer call — hard truncation still applies.
+  if (!force && evictTokens < minEvictTokens) return null;
+  return { boundary: b, evict: live.slice(0, b), evictTokens, keepTokens: tail(b), tailBudget };
 }
 
 /** Plain-text transcript lines for a span of stored messages. */

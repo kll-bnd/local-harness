@@ -242,7 +242,9 @@ export function registerModelRoutes(r, app) {
     const body = await readJson(req);
     const provider = app.registry.require(body.providerId || 'ollama');
     if (!provider.capabilities.unload) throw new HttpError(400, 'unsupported', `${provider.name} cannot unload models through its API`);
-    await provider.unload(requireString(body.model, 'model'));
+    const model = requireString(body.model, 'model');
+    await provider.unload(model);
+    app.engine.loadedCtx.delete(`${provider.id}/${model}`); // the next load is cold: a pending larger window applies
     return { ok: true };
   });
 

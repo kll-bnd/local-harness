@@ -96,6 +96,7 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.loadFailures = new LoadFailures();
   app.modelCopies = await new ModelCopies(dataDir).load();
   app.engine = new ChatEngine(app);
+  app.registry.loadedCtxFor = (providerId, model) => app.engine.loadedCtxFor(providerId, model);
   app.llm = new LLM(app);
   app.images = new ImageService(app);
   app.background = new BackgroundQueue(app);
