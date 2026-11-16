@@ -145,8 +145,9 @@ final class MainWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDe
         webView?.evaluateJavaScript(js, completionHandler: nil)
     }
 
-    private func sendFullscreen() {
-        evaluate("window.__harnessNative && window.__harnessNative.fullscreen(\(window.styleMask.contains(.fullScreen) ? "true" : "false"))")
+    private func sendFullscreen(_ on: Bool? = nil) {
+        let v = on ?? window.styleMask.contains(.fullScreen)
+        evaluate("window.__harnessNative && window.__harnessNative.fullscreen(\(v ? "true" : "false"))")
     }
 
     func setProgress(_ text: String?) {
@@ -205,6 +206,9 @@ final class MainWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDe
         if !app.quitting && !app.config.hideOnClose { dropWebView() }
     }
 
+    // The class changes as the transition starts (the traffic lights go away then) and is confirmed at its end.
+    func windowWillEnterFullScreen(_ notification: Notification) { sendFullscreen(true) }
+    func windowWillExitFullScreen(_ notification: Notification) { sendFullscreen(false) }
     func windowDidEnterFullScreen(_ notification: Notification) { sendFullscreen() }
 
     func windowDidExitFullScreen(_ notification: Notification) {

@@ -208,6 +208,35 @@ test('auto-lock: after the chosen idle time Harness locks and the page goes to t
   } finally { await app.close(); await stack.close(); }
 });
 
+test('a minute before auto-lock a quiet hint offers to stay unlocked; using the page keeps Harness open', async () => {
+  const stack = await startStack({ secure: true });
+  const app = await openApp(stack);
+  try {
+    const { page } = app;
+    await setupViaUi(page);
+    await stack.unlock(PASSWORD);
+    await stack.api('PATCH', '/api/settings', { security: { idleLockMinutes: 1 } });
+    await page.waitForFunction(async () => (await (await fetch('/api/security')).json()).idleLockMinutes === 1);
+    await page.reload();
+    await page.waitForSelector('.app .sidebar');
+    assert.equal(await page.locator('.idle-hint').count(), 0);
+    // Let most of the minute pass on the page's clock (no requests meanwhile).
+    await page.clock.install();
+    await page.clock.fastForward('00:45');
+    await page.waitForSelector('.idle-hint', { timeout: 5000 });
+    assert.match(await page.locator('.idle-hint').textContent(), /locks in \d+ s/);
+    await app.shot('35-idle-hint');
+    // "Stay unlocked" tells Harness the user is here.
+    const before = (await stack.api('GET', '/api/security')).data.idleLockAt;
+    await page.locator('.idle-hint button', { hasText: 'Stay unlocked' }).click();
+    await page.waitForSelector('.idle-hint', { state: 'detached' });
+    const after = (await stack.api('GET', '/api/security')).data.idleLockAt;
+    assert.ok(Date.parse(after) > Date.parse(before), 'the activity signal moved the lock time');
+    assert.equal((await stack.api('GET', '/api/security')).data.state, 'unlocked');
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
 test('desktop menu: the `lock` action locks Harness', async () => {
   const stack = await startStack({ secure: true });
   const app = await openApp(stack, { desktop: true });

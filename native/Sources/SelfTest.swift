@@ -110,7 +110,7 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
     func finish(status: String) {
         results["status"] = status
         writeResults()
-        DispatchQueue.main.async { NSApp.terminate(nil) }
+        AppController.quitSoon()
     }
 
     private func writeState() {

@@ -91,7 +91,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
         for sig in [SIGINT, SIGTERM] {
             signal(sig, SIG_IGN)
             let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-            src.setEventHandler { NSApp.terminate(nil) }
+            src.setEventHandler { AppController.quitSoon() }
             src.resume()
             signalSources.append(src)
         }
@@ -580,6 +580,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
     }
 
     // MARK: - quitting
+
+    /// Quit from a GCD block. NSApp.terminate run inside a main-queue block would wait for the backend in a nested
+    /// run loop that cannot run the other main-queue blocks (the backend's exit notice among them): measured as a
+    /// hang on the runner. A run-loop perform is not a GCD block, so the wait works.
+    static func quitSoon() {
+        NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if shutdownDone { return .terminateNow }

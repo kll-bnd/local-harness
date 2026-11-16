@@ -110,16 +110,13 @@ export const OLLAMA_MODELS = [
 // More library entries so the list pages (24 per page in the backend).
 for (let i = 0; i < 30; i++) OLLAMA_MODELS.push({ name: `community-model-${i}`, desc: `A smaller community model number ${i}.`, caps: i % 3 ? ['tools'] : [], sizes: [`${(i % 7) + 1}b`], pulls: `${100 - i}K`, updated: i + 1 });
 
+/** One library entry in the real ollama.com markup (captured live by the coordinator; no x-test-* attributes). */
 function libraryItem(m) {
-  return `<li x-test-model class="flex">
-  <a href="/library/${m.name}" class="group w-full">
-    <div><h2><span x-test-search-response-title>${m.name}</span></h2>
-    <p class="max-w-lg break-words text-neutral-800">${m.desc.replace(/'/g, '&#39;')}</p></div>
-    <div class="flex">${m.caps.map((c) => `<span x-test-capability class="badge">${c}</span>`).join('')}${m.sizes.map((s) => `<span x-test-size class="badge">${s}</span>`).join('')}</div>
-    <p class="flex"><span><span x-test-pull-count>${m.pulls}</span> <span>Pulls</span></span>
-    <span><span x-test-updated title="Updated ${new Date(T0 - m.updated * DAY).toUTCString()}">${m.updated} days ago</span></span></p>
-  </a>
-</li>`;
+  const updated = new Date(T0 - m.updated * DAY);
+  const stamp = `${updated.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })} ${updated.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'UTC' })} UTC`;
+  const caps = m.caps.map((c) => `<span class="inline-flex items-center rounded-md bg-indigo-50 px-2 py-[2px] text-xs sm:text-[13px] font-medium text-indigo-600">${c}</span>`).join(' ');
+  const sizes = m.sizes.map((z) => `<span class="inline-flex items-center rounded-md bg-[#ddf4ff] px-2 py-[2px] text-xs sm:text-[13px] font-medium text-blue-600">${z}</span>`).join(' ');
+  return `<li class="flex items-baseline border-b border-neutral-200 py-6"> <a href="/library/${m.name}" class="group w-full space-y-5"> <div title="${m.name}" class="flex flex-col"> <h2 class="truncate text-xl font-medium underline-offset-2 group-hover:underline md:text-2xl"> <div class="flex items-center"> <span class="group-hover:underline truncate">${m.name}</span> </div> </h2> <p class="max-w-lg break-words text-neutral-800 text-md">${m.desc.replace(/'/g, '&#39;')}</p> </div> <div class="flex flex-col space-y-2"> <div class="flex flex-wrap space-x-2"> ${caps} ${sizes} </div> <p class="flex space-x-5 text-[13px] font-medium text-neutral-500"> <span class="flex items-center"> <svg class="mr-1.5 h-[14px] w-[14px]" viewBox="0 0 24 24"></svg> <span >${m.pulls}</span> <span class="hidden sm:flex">&nbsp;Pulls</span> </span> <span class="flex items-center"> <svg class="mr-1.5 h-[14px] w-[14px]" viewBox="0 0 24 24"></svg> <span >${m.sizes.length + 1}</span> <span class="hidden sm:flex">&nbsp;Tags</span> </span> <span class="flex items-center" title="${stamp}"> <svg class="mr-1.5 h-[14px] w-[14px]" viewBox="0 0 24 24"></svg> <span class="hidden sm:flex">Updated&nbsp;</span> <span >${m.updated} days ago</span> </span> </p> </div> </a> </li>`;
 }
 
 function tagsFor(m) {

@@ -175,13 +175,13 @@
 
   await check('externalNavigationBlocked', async () => {
     const before = location.href;
-    const a = document.createElement('a');
-    a.href = 'https://example.com/from-link';
-    document.body.append(a);
-    a.click();
-    a.remove();
+    const click = (href, target) => { const a = document.createElement('a'); a.href = href; if (target) a.target = target; document.body.append(a); a.click(); a.remove(); };
     window.open('https://example.com/from-window-open', '_blank');
-    await sleep(600);
+    await sleep(400);
+    click('https://example.com/from-link');
+    await sleep(400);
+    click('https://example.com/from-blank-link', '_blank');
+    await sleep(400);
     const okHttp = await window.harnessDesktop.openExternal('https://example.com/api');
     const noFile = await window.harnessDesktop.openExternal('file:///etc/passwd');
     const noJs = await window.harnessDesktop.openExternal('javascript:alert(1)');
@@ -189,8 +189,8 @@
     const s = await native('state');
     const opened = s.records.lists.openExternal || [];
     return {
-      ok: location.href === before && okHttp === true && !noFile && !noJs && !noData && opened.includes('https://example.com/from-link') && opened.includes('https://example.com/from-window-open'),
-      stayed: location.href === before, opened, rejected: { file: !noFile, js: !noJs, data: !noData },
+      ok: location.href === before && okHttp === true && !noFile && !noJs && !noData && opened.includes('https://example.com/from-link') && opened.includes('https://example.com/from-blank-link'),
+      stayed: location.href === before, opened, windowOpenReachedApp: opened.includes('https://example.com/from-window-open'), rejected: { file: !noFile, js: !noJs, data: !noData },
     };
   });
 
@@ -226,13 +226,14 @@
   });
 
   await check('fullScreenClass', async () => {
+    const has = () => document.documentElement.classList.contains('desktop-fullscreen');
+    const waitClass = async (want) => { for (let i = 0; i < 40; i++) { if (has() === want) return true; await sleep(100); } return false; };
     const on = await native('fullscreen', { on: true });
-    await sleep(300);
-    const clsOn = document.documentElement.classList.contains('desktop-fullscreen');
+    const clsOn = await waitClass(true);
     const off = await native('fullscreen', { on: false });
-    await sleep(300);
-    const clsOff = document.documentElement.classList.contains('desktop-fullscreen');
-    return { ok: on.ok && clsOn && off.ok && !clsOff, entered: on, classWhileFull: clsOn, classAfter: clsOff };
+    const clsOff = await waitClass(false);
+    await sleep(800);
+    return { ok: on.ok && clsOn && off.ok && clsOff, entered: on.ok, classWhileFull: clsOn, classRemovedAfter: clsOff };
   });
 
   await check('hideOnCloseAndReopen', async () => {

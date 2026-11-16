@@ -92,13 +92,17 @@ for (let n = 1; n <= launches; n++) {
   const ollama = sh('pgrep', ['-x', 'ollama']).trim();
   say(`launch${n}.cleanQuit`, { ok: exited?.code === 0 && leftovers.length === 0, status: res.status || null, leftoverProcesses: leftovers, ollamaRunning: ollama ? ollama.split('\n').length : 0 });
   if (exited?.code === 0 && leftovers.length === 0) pass++; else fail++;
+  const passed = [];
   for (const [k, v] of Object.entries(res).filter(([k]) => k.startsWith('page.') && k !== 'page.marker')) {
     const ok = v && v.ok === true;
-    if (ok) pass++; else fail++;
+    if (ok) { pass++; passed.push(k.slice(5)); continue; }
+    fail++;
     const detail = { ...v };
     delete detail.ok;
-    say(`${ok ? 'PASS' : 'FAIL'} ${k.slice(5)}`, detail);
+    say(`FAIL ${k.slice(5)}`, detail);
   }
+  if (passed.length) say(`launch${n}.PASS`, passed.join(' '));
+  for (const k of (opt('show', '') || '').split(',').filter(Boolean)) if (res[`page.${k}`]) say(`detail ${k}`, res[`page.${k}`]);
   if (res['page.marker']?.marker) marker = res['page.marker'].marker;
   lastRes = res;
   if (n < launches) await sleep(1000);

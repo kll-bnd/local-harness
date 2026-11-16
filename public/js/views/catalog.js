@@ -34,17 +34,42 @@ export const fmtParams = (n) => {
 const fmtCount = (n) => (n == null ? null : n >= 1e6 ? `${(n / 1e6).toFixed(1).replace(/\.0$/, '')}M` : n >= 1e3 ? `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1).replace(/\.0$/, '')}K` : String(n));
 
 /**
- * The at-a-glance fit chip for a list row. An estimate from the parameter count alone is worded as such
- * ("Probably …"); the model page sizes every file and gives the firm answer.
+ * The list's fit answer, normalised to one of three: 'comfortable' (fits as listed), 'smaller' (fits with a smaller
+ * file of the same model) or 'too_big'; plus whether it is only an estimate. Accepts today's { fits: boolean } and
+ * the three-way answer the backend is moving to (a `verdict`/`fits` string), so the badge does not care which.
  */
+export function fitVerdict(fit) {
+  if (!fit) return null;
+  const raw = fit.verdict ?? fit.answer ?? fit.fits;
+  let v;
+  if (raw === true) v = 'comfortable';
+  else if (raw === false) v = 'too_big';
+  else {
+    const t = String(raw || '').toLowerCase();
+    if (/small/.test(t)) v = 'smaller';
+    else if (/too|no|big|exceed/.test(t)) v = 'too_big';
+    else if (/comfort|fit|yes|ok/.test(t)) v = 'comfortable';
+    else return null;
+  }
+  return { verdict: v, estimate: typeof fit.estimate === 'boolean' ? fit.estimate : fit.basis === 'parameters' };
+}
+
+const FIT_LABEL = {
+  comfortable: ['Fits this Mac', 'Probably fits'],
+  smaller: ['Fits with a smaller file', 'Fits with a smaller file'],
+  too_big: ['Too big for this Mac', 'Probably too big'],
+};
+
+/** The at-a-glance fit chip for a list row; the model page sizes every file and gives the firm answer. */
 function fitChip(fit) {
-  if (!fit) return h('span.fit-chip.unknown', { title: 'Size not known yet — open it to see every file' }, 'Size unknown');
+  const f = fitVerdict(fit);
+  if (!f) return h('span.fit-chip.unknown', { title: 'Size not known yet — open it to see every file' }, 'Size unknown');
   const size = fit.sizeBytes ? `≈ ${fmtBytes(fit.sizeBytes)}` : '';
-  const guess = fit.basis === 'parameters';
-  const note = `${fit.note || ''}${guess ? `${fit.note ? ' — ' : ''}estimated from the parameter count; open it for every file` : ''}`;
-  return fit.fits
-    ? h('span.fit-chip.ok', { title: note || 'Estimated to fit this Mac' }, icon('check', { size: 12 }), h('span', guess ? 'Probably fits' : 'Fits this Mac'), size ? h('span.faint', ` · ${size}`) : null)
-    : h('span.fit-chip.no', { title: note || 'Estimated not to fit this Mac' }, h('span', guess ? 'Probably too big' : 'Too big for this Mac'), size ? h('span.faint', ` · ${size}`) : null);
+  const label = FIT_LABEL[f.verdict][f.estimate ? 1 : 0];
+  const title = `${fit.note || ''}${f.estimate ? `${fit.note ? ' — ' : ''}an estimate; open it to see every file` : ''}` || label;
+  const cls = f.verdict === 'comfortable' ? 'ok' : f.verdict === 'smaller' ? 'smaller' : 'no';
+  return h(`span.fit-chip.${cls}`, { title, dataset: { verdict: f.verdict } },
+    f.verdict === 'too_big' ? null : icon('check', { size: 12 }), h('span', label), size && f.verdict !== 'smaller' ? h('span.faint', ` · ${size}`) : null);
 }
 
 // ------------------------------------------------------------------------------------------------ list
@@ -189,7 +214,8 @@ export class CatalogBrowser {
   }
 
   row(it) {
-    const unfit = it.fit && !it.fit.fits;
+    const fv = fitVerdict(it.fit);
+    const unfit = fv?.verdict === 'too_big';
     const meta = [
       fmtParams(it.parameters) ? `${fmtParams(it.parameters)} parameters` : null,
       it.contextLength ? `${fmtTokens(it.contextLength)} context` : null,
@@ -198,7 +224,7 @@ export class CatalogBrowser {
       it.updatedAt ? `updated ${fmtRelative(it.updatedAt)}` : null,
     ].filter(Boolean);
     const href = `#/models/${this.source}/${it.id.split('/').map(encodeURIComponent).join('/')}`;
-    return h(`a.cat-item${unfit ? '.unfit' : ''}`, { href, role: 'listitem', dataset: { id: it.id, fits: it.fit ? String(!!it.fit.fits) : 'unknown' } },
+    return h(`a.cat-item${unfit ? '.unfit' : ''}`, { href, role: 'listitem', dataset: { id: it.id, fits: fv ? String(fv.verdict !== 'too_big') : 'unknown', verdict: fv?.verdict || 'unknown' } },
       h('div.cat-main',
         h('div.cat-title-row',
           h('span.cat-name', it.name || it.id),
