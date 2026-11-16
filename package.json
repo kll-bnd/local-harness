@@ -1,17 +1,72 @@
 {
   "name": "harness",
+  "productName": "Harness",
   "version": "0.1.0",
   "description": "Harness: a local app for chatting with open-source LLMs (Ollama, llama.cpp, LM Studio, MLX) with long context, auto-summarization, long-term memory, tools and local image generation.",
   "private": true,
   "type": "module",
-  "main": "server/index.mjs",
+  "main": "electron/main.cjs",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "start": "node server/index.mjs",
-    "test": "node --test --test-concurrency=4 \"test/*.test.mjs\"",
-    "dev:fake": "node scripts/dev-fake.mjs"
+    "test": "node --test --test-concurrency=4 \"test/*.test.mjs\" \"electron/test/*.test.mjs\"",
+    "dev:fake": "node scripts/dev-fake.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "app": "electron .",
+    "dist": "electron-builder --mac --arm64",
+    "dist:app": "electron-builder --mac dir --arm64",
+    "dist:linux-dir": "electron-builder --linux dir",
+    "test:e2e": "node electron/test/e2e.mjs",
+    "icons": "electron scripts/make-icons.cjs"
   },
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "electron": "44.10.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "local.harness.desktop",
+    "productName": "Harness",
+    "copyright": "Harness",
+    "asar": false,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "package.json",
+      "server/**/*",
+      "public/**/*",
+      "electron/**/*",
+      "!electron/test{,/**/*}",
+      "!**/*.test.mjs",
+      "!**/.DS_Store"
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64"]
+        }
+      ],
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "notarize": false,
+      "minimumSystemVersion": "12.0",
+      "darkModeSupport": true
+    },
+    "dmg": {
+      "title": "Harness ${version}",
+      "writeUpdateInfo": false
+    },
+    "linux": {
+      "target": ["dir"],
+      "icon": "build/icon.png",
+      "category": "Utility"
+    }
+  }
 }
