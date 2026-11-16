@@ -1,5 +1,5 @@
 // Image generation: providers, models, direct generation (SSE), gallery, jobs.
-import { HttpError, badRequest, notFound } from '../lib/errors.mjs';
+import { HttpError, badRequest, notFound, streamErrorDetails } from '../lib/errors.mjs';
 import { openSse, readJson, sendJson } from '../http/http.mjs';
 import { newId } from '../lib/ids.mjs';
 import { nowIso } from '../lib/util.mjs';
@@ -184,7 +184,7 @@ export async function runImageTurn({ app, req, res, chat, reservation, ireq, pro
       app.chats.touch(chat);
       await app.chats.saveNow(chat).catch(() => {});
     }
-    if (sse) sse.send('error', { code: aborted ? 'aborted' : e.code || 'image_error', message: e.message, ...(am ? { messageId: am.id } : {}) });
+    if (sse) sse.send('error', { code: aborted ? 'aborted' : e.code || 'image_error', message: e.message, ...(am ? { messageId: am.id } : {}), ...streamErrorDetails(e) });
     else if (!res.headersSent) throw e;
   } finally {
     if (chat) {

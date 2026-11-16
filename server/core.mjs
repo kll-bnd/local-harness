@@ -162,6 +162,7 @@ export class Core extends EventEmitter {
       state: this.state,
       ...(this.state === 'error' ? { error: this.error } : {}),
       mode: this.mode,
+      passwordSet: this.vault.hasPassword,
       plainDataFound: this.state === 'needs_setup' ? this.plainDataFound : false,
       migration: this.migration ? { op: this.migration.op, done: this.migration.done, total: this.migration.total, startedAt: this.migration.startedAt, error: this.migration.error || null } : null,
       unlock: { failedAttempts: this.vault.meta?.throttle?.failures || 0, retryAfterMs: this.vault.exists ? this.vault.retryAfterMs() : 0, ...(this.keychainError ? { keychainError: this.keychainError } : {}) },

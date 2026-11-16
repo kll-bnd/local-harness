@@ -27,6 +27,14 @@ export class ProviderError extends Error {
   }
 }
 
+/**
+ * `details` an SSE `error` event carries — the same object as the HTTP error form (docs/API.md §10.6): for
+ * `offline_lock` that is { what, host, allow } (the "Allow internet for 15 minutes" button).
+ */
+export function streamErrorDetails(e) {
+  return e?.code === 'offline_lock' && e.details ? { details: e.details } : {};
+}
+
 export function isAbortError(e) {
   return !!e && (e.name === 'AbortError' || e.code === 'ABORT_ERR');
 }

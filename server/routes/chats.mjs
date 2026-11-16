@@ -1,5 +1,5 @@
 // Chat, message-tree, generation, summary, export/import and search routes.
-import { HttpError, notFound, badRequest } from '../lib/errors.mjs';
+import { HttpError, notFound, badRequest, streamErrorDetails } from '../lib/errors.mjs';
 import { openSse, readJson, sendJson } from '../http/http.mjs';
 import { chatSummary, serializeMessages, publicMessage, newChat } from '../store/chats.mjs';
 import { validateChatSettings } from '../store/settings.mjs';
@@ -76,7 +76,7 @@ async function streamTurn(ctx, chat, { prepare, modelRef }) {
   } catch (e) {
     app.engine.release(chat.id, reservation);
     if (!sse) throw e;
-    sse.send('error', { code: e.code || 'internal_error', message: e.message, ...(e.code === 'offline_lock' && e.details ? { details: e.details } : {}) });
+    sse.send('error', { code: e.code || 'internal_error', message: e.message, ...streamErrorDetails(e) });
   } finally {
     app.engine.release(chat.id, reservation);
     sse?.end();

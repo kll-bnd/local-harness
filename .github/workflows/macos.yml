@@ -63,6 +63,10 @@ jobs:
           set -o pipefail
           # The spec reporter repeats every failing test with its error at the end of the output.
           node --test --test-concurrency=4 --test-reporter=spec "test/*.test.mjs" "electron/test/*.test.mjs" "scripts/test/*.test.mjs" 2>&1 | tail -n 170
+      - name: Real Keychain check (a throw-away item, removed afterwards)
+        run: |
+          set -o pipefail
+          HARNESS_TEST_REAL_KEYCHAIN=1 node --test --test-reporter=spec test/keychain-real.test.mjs 2>&1 | tail -n 45
       - name: Server boots with no node_modules (0.2 defaults - needs_setup, data routes refused)
         run: |
           set -euo pipefail

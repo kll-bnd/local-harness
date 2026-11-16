@@ -129,6 +129,7 @@ function cleanMessage(raw, fallbackDate) {
     if (['length', 'tool_limit', 'aborted'].includes(raw.finishReason)) m.finishReason = raw.finishReason;
     if (typeof raw.error === 'string') m.error = raw.error.slice(0, 2000);
     if (typeof raw.errorCode === 'string' && /^[a-z_]{1,40}$/.test(raw.errorCode)) m.errorCode = raw.errorCode;
+    if (isPlainObject(raw.errorDetails)) { const d = jsonSmall(raw.errorDetails, 2000); if (d) m.errorDetails = d; }
     if (Array.isArray(raw.nextSteps)) { const ns = jsonSmall(raw.nextSteps.slice(0, 5), 4000); if (ns) m.nextSteps = ns; }
     if (['image', 'tool_summary'].includes(raw.fallback)) m.fallback = raw.fallback;
     if (m.kind === 'image_result') m.images = raw.images;

@@ -106,6 +106,33 @@ describe('the blocker', () => {
   });
 });
 
+describe('offline_lock inside a stream', () => {
+  test('a chat turn refused mid-stream carries the same details (what, host, allow) as the HTTP error, also on the stored message', async () => {
+    const { setup } = await import('./helpers.mjs');
+    const { OfflineLockError } = await import('../server/security/egress.mjs');
+    const h = await setup();
+    try {
+      const sec = (await h.c.get('/api/security')).data;
+      assert.equal(sec.passwordSet, false, 'off mode, never a password');
+      const ollama = h.app.registry.ollama();
+      const orig = ollama.chat;
+      ollama.chat = async function* () { throw new OfflineLockError('remote_provider', 'api.remote.example'); };
+      try {
+        const c = await h.c.post('/api/chats', {});
+        const r = await h.c.sse(`/api/chats/${c.data.chat.id}/messages`, { content: 'hi' });
+        const err = r.events.find((e) => e.type === 'error');
+        assert.ok(err, JSON.stringify(r.events.slice(-2)));
+        assert.equal(err.code, 'offline_lock');
+        assert.deepEqual(err.details, { what: 'remote_provider', host: 'api.remote.example', allow: { method: 'POST', path: '/api/network/allow', body: { minutes: 15 }, needsPassword: true, label: 'Allow internet for 15 minutes' } });
+        const d = (await h.c.get(`/api/chats/${c.data.chat.id}`)).data;
+        const asst = (Array.isArray(d.messages) ? d.messages : Object.values(d.messages)).find((m) => m.role === 'assistant');
+        assert.equal(asst.errorCode, 'offline_lock');
+        assert.deepEqual(asst.errorDetails, err.details);
+      } finally { ollama.chat = orig; }
+    } finally { await h.close(); }
+  });
+});
+
 describe('the OS layer around a managed Ollama', () => {
   async function withSandbox(mode, fn) {
     const dir = await tmpDir('harness-sbx-');

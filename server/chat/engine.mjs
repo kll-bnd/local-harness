@@ -3,7 +3,7 @@
 import { newId } from '../lib/ids.mjs';
 import { egressBlocked, OfflineLockError } from '../security/egress.mjs';
 import { nowIso, deepMerge, clone, formatBytes, formatTokensK } from '../lib/util.mjs';
-import { HttpError, isAbortError, ProviderError } from '../lib/errors.mjs';
+import { HttpError, isAbortError, ProviderError, streamErrorDetails } from '../lib/errors.mjs';
 import { log } from '../lib/log.mjs';
 import { addMessage, pathTo, setActiveLeaf, activePath } from './tree.mjs';
 import { ThinkTagParser } from './reasoning.mjs';
@@ -654,12 +654,12 @@ export class ChatEngine {
           e = loadFailureError(e, { model: target.model, providerId: target.provider.kind === 'ollama' ? target.provider.id : null, info: target.info, totalMem: this.app.system.totalMem });
         }
         log.warn(`Generation failed for ${chat.id}: ${e.message}`);
-        if (asst) { asst.status = 'error'; asst.error = e.message; asst.errorCode = e.code || 'internal_error'; if (e.nextSteps) asst.nextSteps = e.nextSteps; }
+        if (asst) { asst.status = 'error'; asst.error = e.message; asst.errorCode = e.code || 'internal_error'; if (e.nextSteps) asst.nextSteps = e.nextSteps; if (e.code === 'offline_lock' && e.details) asst.errorDetails = e.details; }
         // Close any tool messages left running.
         for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'error'; m.content ||= `Error: ${e.message}`; m.isError = true; } }
         finishUp();
         await savedP;
-        emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId, ...(e.nextSteps ? { nextSteps: e.nextSteps } : {}), ...(e.code === 'offline_lock' && e.details ? { details: e.details } : {}) });
+        emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId, ...(e.nextSteps ? { nextSteps: e.nextSteps } : {}), ...streamErrorDetails(e) });
         return asst;
       }
     } finally {

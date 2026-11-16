@@ -93,7 +93,7 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
     ? { security: { kdf: { N: 1024, r: 8, p: 1 } }, ...(offlineLock === undefined ? {} : { offlineLock }) }
     : { security: { mode: 'off', apiAuth: false }, offlineLock: offlineLock ?? false };
   const sys = { totalMem: ram * GiB, platform: 'darwin', arch: 'arm64' };
-  const srv = await startServer({ port: 0, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false, ...securityOpts });
+  const srv = await startServer({ port: 0, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false, keychain: 'file', ...securityOpts });
   let token = null; // a CLI-style session for stack.api() on secure stacks
   const api = async (method, p, body, headers = {}) => {
     const h = { ...(body ? { 'content-type': 'application/json' } : {}), ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers };
@@ -133,7 +133,7 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
     /** Start it again on the same port and data dir. */
     async startServerAgain() {
       const port = Number(new URL(stack.url).port);
-      stack.srv = await startServer({ port, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false, ...securityOpts });
+      stack.srv = await startServer({ port, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false, keychain: 'file', ...securityOpts });
       if (stack.srv.url !== stack.url) throw new Error(`restarted on ${stack.srv.url}, expected ${stack.url}`);
     },
     async close() {

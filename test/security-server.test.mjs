@@ -89,6 +89,7 @@ describe('password setup and sessions', () => {
       const sec = await s.call('GET', '/api/security');
       assert.equal(sec.data.state, 'needs_setup');
       assert.equal(sec.data.mode, 'password');
+      assert.equal(sec.data.passwordSet, false);
       assert.equal(sec.data.session.authenticated, false);
       assert.equal(sec.data.offlineLock.blocked, true);
       assert.deepEqual((await s.call('GET', '/api/health')).data, { ok: true, name: 'harness', version: (await import('../server/version.mjs')).VERSION, state: 'needs_setup' });
@@ -112,6 +113,7 @@ describe('password setup and sessions', () => {
       const cookie = setCookie.split(';')[0];
       await waitFor(async () => (await s.call('GET', '/api/security')).data.state === 'unlocked', { timeout: 10000 });
       assert.equal((await s.call('GET', '/api/chats', undefined, { headers: { cookie } })).status, 200);
+      assert.equal((await s.call('GET', '/api/security')).data.passwordSet, true);
       const again = await s.call('POST', '/api/security/setup', { password: PW });
       assert.equal(again.status, 409);
       // no session → 401 with the lock-screen hint; the cookie authorises GETs, SSE and files
@@ -329,6 +331,7 @@ describe('upgrades, modes and key-store damage', () => {
       assert.equal(JSON.parse(fss.readFileSync(path.join(s.dataDir, 'launch.json'), 'utf8')).encryption, 'off');
       assert.ok(grepDir(s.dataDir, 'MODE-MARKER').length >= 1, 'plain now');
       assert.ok(fss.existsSync(path.join(s.dataDir, 'api-token')), 'off mode uses the per-install secret');
+      assert.equal((await s.call('GET', '/api/security')).data.passwordSet, true, 'off mode with a password kept for confirmations');
       assert.equal((await s.call('POST', '/api/security/lock', {})).data.error.code, 'not_encrypted');
       // the password still guards lowering actions in off mode
       assert.equal((await s.call('POST', '/api/network/allow', {})).data.error.code, 'confirmation_required');

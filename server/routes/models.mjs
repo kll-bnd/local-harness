@@ -1,5 +1,5 @@
 // Provider management, Ollama process control, model management (list/pull/delete/load/unload), embeddings.
-import { HttpError, badRequest, notFound } from '../lib/errors.mjs';
+import { HttpError, badRequest, notFound, streamErrorDetails } from '../lib/errors.mjs';
 import { openSse, readJson } from '../http/http.mjs';
 import { newId } from '../lib/ids.mjs';
 import { OfflineLockError } from '../security/egress.mjs';
@@ -239,7 +239,7 @@ export function registerModelRoutes(r, app) {
     } catch (e) {
       const aborted = ac.signal.aborted;
       app.bus.publish('model.pull', { pullId, providerId: provider.id, model, status: aborted ? 'aborted' : 'error', error: e.message });
-      sse.send('error', { pullId, code: aborted ? 'aborted' : e.code || 'pull_failed', message: e.message });
+      sse.send('error', { pullId, code: aborted ? 'aborted' : e.code || 'pull_failed', message: e.message, ...streamErrorDetails(e) });
     } finally {
       app.pulls.delete(pull);
       endDownload();
