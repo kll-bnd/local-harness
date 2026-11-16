@@ -132,6 +132,25 @@ const mkData = (name) => fs.mkdtempSync(path.join(base, `e2e-${name}-`));
   await new Promise((res) => cli.once('exit', res));
 }
 
+// ------------------------------------------- B2. same, but the probe is skipped: the backend's data-dir lock decides
+{
+  const S = 'attach-via-lock';
+  const dataDir = mkData('attach-lock');
+  const port = await freePort();
+  const cli = spawn(process.execPath, [path.join(root, 'server', 'index.mjs'), '--port', String(port), '--data-dir', dataDir], {
+    env: { ...process.env, HARNESS_NO_OLLAMA_AUTOSTART: '1', HARNESS_LOG_LEVEL: 'warn' }, stdio: 'ignore',
+  });
+  for (let i = 0; i < 100 && !(await health(port)); i++) await sleep(100);
+  const r = await launch({ dataDir, port: await freePort(), env: { HARNESS_E2E_SKIP_PROBE: '1' } });
+  report(S, 'driver produced a result', !!r.result && !r.result.error, r.result?.error);
+  report(S, 'HARNESS_ALREADY_RUNNING from startServer → attaches to err.url', r.result?.info?.attachedUrl === `http://127.0.0.1:${port}` && r.result?.info?.attachedVia === 'lock' && r.result?.info?.inProcessServer === false, r.result?.info);
+  report(S, 'window_loads_server_url', r.result?.checks?.window_loads_server_url?.ok, r.result?.checks?.window_loads_server_url);
+  report(S, 'exit code 0', r.code === 0, { code: r.code, signal: r.signal });
+  report(S, 'the CLI server keeps running after the app quits', await health(port));
+  cli.kill('SIGTERM');
+  await new Promise((res) => cli.once('exit', res));
+}
+
 // ------------------------------------------------------------------------------ C. server cannot start
 {
   const S = 'startup-error';

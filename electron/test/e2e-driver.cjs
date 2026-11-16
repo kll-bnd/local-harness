@@ -35,6 +35,7 @@ module.exports = function drive(ctx) {
 
     out.info.appUrl = appUrl;
     out.info.attachedUrl = ctx.attachedUrl;
+    out.info.attachedVia = ctx.attachedVia;
     out.info.inProcessServer = !!ctx.server;
     out.info.version = app.getVersion();
     out.info.electron = process.versions.electron;

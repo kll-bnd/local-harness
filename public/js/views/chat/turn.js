@@ -120,7 +120,7 @@ export function imageJobStatus(st, ctx, { cancellable = true } = {}) {
   const phases = st.phases || [];
   const unloads = !!st.unload || phases.includes('unloading') || phases.includes('unloaded');
   const steps = [];
-  if (unloads) steps.push({ id: 'unload', label: st.unload?.models?.length ? `Unload ${modelShort(st.unload.models[0], 26)}` : 'Unload chat model', done: phases.includes('unloaded') || ['generating', 'saving', 'done'].includes(st.phase), active: st.phase === 'unloading' });
+  if (unloads) steps.push({ id: 'unload', label: st.unload?.models?.length ? `Unload ${modelShort(st.unload.models[0], 34)}` : 'Unload chat model', done: phases.includes('unloaded') || ['generating', 'saving', 'done'].includes(st.phase), active: st.phase === 'unloading' });
   steps.push({ id: 'gen', label: st.steps ? `Generate · step ${st.step}/${st.steps}` : 'Generate', done: ['saving', 'done'].includes(st.phase), active: st.phase === 'generating' || st.phase === 'starting' || st.phase === 'queued' || st.phase === 'unloaded' });
   steps.push({ id: 'save', label: 'Save', done: st.phase === 'done', active: st.phase === 'saving' });
   const reloadNote = unloads ? h('div.job-note', icon('info', { size: 13 }), 'The chat model reloads automatically for the next reply.') : null;

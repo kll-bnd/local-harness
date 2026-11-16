@@ -128,9 +128,18 @@ else
   [ -n "$OLLAMA" ] && ok "Ollama installed: $OLLAMA"
 fi
 if [ -n "$OLLAMA" ]; then
-  note "Tip: let Harness start Ollama itself (it does so automatically) — it then turns on memory-saving"
-  note "settings (flash attention, 8-bit context cache) that let a bigger context window fit."
-  note "If the Ollama menu-bar app is already running, Harness uses that one as it is."
+  note "Let Harness start Ollama (it does so by itself when it launches). Only then does it apply its memory"
+  note "protections: flash attention, a q8_0 context cache, one model at a time, a capped prompt cache, no cloud."
+  note "An Ollama started any other way (the menu-bar app, brew services) is used as it is, without them."
+  if pgrep -x Ollama >/dev/null 2>&1; then
+    warn "The Ollama menu-bar app is running. Quit it (menu bar → Quit Ollama) and turn off its \"launch at login\"."
+  fi
+  if [ -n "$BREW" ] && "$BREW" services list 2>/dev/null | awk '$1 == "ollama" {print $2}' | grep -qx started; then
+    warn "Ollama runs as a Homebrew service."
+    if ask "Stop the service (brew services stop ollama) so Harness can start Ollama with its protections?" y; then
+      "$BREW" services stop ollama || true
+    fi
+  fi
 fi
 
 # ------------------------------------------------------------------------------------------------
@@ -138,27 +147,19 @@ step "5. A chat model sized for this Mac"
 if [ -z "$OLLAMA" ]; then
   warn "Skipped: needs Ollama."
 else
-  REC_FILE="$(mktemp "${TMPDIR:-/tmp}/harness-setup.XXXXXX")"
-  MODEL="$(node scripts/doctor.mjs --recommended-model 2>"$REC_FILE" || true)"
-  REC_INFO="$(cat "$REC_FILE" 2>/dev/null || true)"; rm -f "$REC_FILE"
-  if [ -z "$MODEL" ]; then
-    warn "Could not work out a recommendation (see: npm run doctor). You can pick a model later in the app."
+  say "  Harness asks its own backend which file fits this Mac's memory, downloads it through Harness"
+  say "  (which starts Ollama itself, with its protections, and stops it again afterwards) and — on an 8 GB"
+  say "  Mac — makes a text-only copy that needs ~1 GB less memory. You can also do this later in the app"
+  say "  (Models screen) or with:  npm run get-model"
+  GET_MODEL_ARGS=""
+  [ "$ASSUME_YES" = 1 ] && GET_MODEL_ARGS="--yes"
+  if [ "$ASSUME_YES" = 1 ] || [ -t 0 ]; then
+    # shellcheck disable=SC2086
+    if ! node scripts/get-model.mjs $GET_MODEL_ARGS; then
+      warn "The model step did not finish — run it again later with: npm run get-model"
+    fi
   else
-    say "  Harness recommends: ${B}$MODEL${N}"
-    [ -n "$REC_INFO" ] && note "$REC_INFO"
-    STARTED_PID=""
-    if ! curl -fsS -m 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
-      note "Starting Ollama temporarily to check the installed models (stopped again at the end of this step)."
-      "$OLLAMA" serve >"${TMPDIR:-/tmp}/harness-setup-ollama.log" 2>&1 &
-      STARTED_PID=$!
-      for _ in $(seq 1 30); do curl -fsS -m 1 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && break; sleep 1; done
-    fi
-    if "$OLLAMA" list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Fxq "$MODEL"; then
-      ok "$MODEL is already downloaded"
-    elif ask "Download it now with Ollama (several GB; you can also do this later in the app)?" y; then
-      if "$OLLAMA" pull "$MODEL"; then ok "Downloaded $MODEL"; else bad "Download failed — try again later, or use Models → Download in Harness."; fi
-    fi
-    if [ -n "$STARTED_PID" ]; then kill "$STARTED_PID" 2>/dev/null || true; wait "$STARTED_PID" 2>/dev/null || true; fi
+    note "Skipped (not interactive). Run: npm run get-model"
   fi
 fi
 

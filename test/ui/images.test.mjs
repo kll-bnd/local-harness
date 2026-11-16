@@ -17,6 +17,10 @@ async function recordStatuses(page) {
 
 test('chat image at 8 GB: unload → generate → reload is shown, image renders inline with a lightbox', async () => {
   const stack = await startStack({ ram: 8, stepMs: 250 });
+  // As on the user's Mac: Nemotron runs as a text-only copy, which the backend then picks as the default.
+  const copy = (await stack.api('POST', '/api/models/text-only', { model: 'hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL' })).data;
+  assert.match(copy.model, /-text:/);
+  assert.equal((await stack.api('GET', '/api/models')).data.defaultModel.model, copy.model);
   const app = await openApp(stack);
   try {
     const { page } = app;
@@ -27,10 +31,10 @@ test('chat image at 8 GB: unload → generate → reload is shown, image renders
     await app.shot('10-image-generating');
     await waitIdle(page, 30000);
     const seen = [...await page.evaluate(() => [...window.__seen])].join('\n');
-    assert.match(seen, /Unload .*nemotron/i, 'unload step shown');
+    assert.match(seen, /Unload .*Nemotron.*text-only/i, 'unload step names the chat model');
     assert.match(seen, /Generate/, 'generate step shown');
     const turn = lastTurn(page);
-    assert.match(await turn.locator('.turn-status').textContent(), /Unloaded nemotron-3\.5-bolt:e4b to free memory/);
+    assert.match(await turn.locator('.turn-status').textContent(), /Unloaded Nemotron.*text-only to free memory/i);
     assert.match(await turn.locator('.turn-status').textContent(), /Reloaded the chat model/);
     const img = turn.locator('.tool-card .gen-img img');
     assert.match(await img.getAttribute('src'), /^\/api\/images\/img_[\w]+\/file$/);

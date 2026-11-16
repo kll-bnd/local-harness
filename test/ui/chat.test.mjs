@@ -7,20 +7,30 @@ import { startStack, openApp, closeBrowser, send, waitIdle, lastTurn, waitFor } 
 
 after(closeBrowser);
 
-test('first load: new-chat intro shows the model and why the window is this size (8 GB)', async () => {
+test('first load (8 GB): the intro shows the model that fits and offers to finish setting up Nemotron as a text-only copy', async () => {
   const stack = await startStack({ ram: 8 });
   const app = await openApp(stack);
   try {
     const { page } = app;
+    // The backend picks the installed model that actually fits this machine; the intro shows it and why.
+    const auto = (await stack.api('GET', '/api/models')).data.defaultModel;
+    assert.ok(auto?.model, 'a default was chosen');
     await page.waitForSelector('.intro-model');
-    await page.waitForFunction(() => /2K context on this 8 GB Mac/.test(document.querySelector('.intro-plan')?.textContent || ''));
-    // The default quant does not fit in 8 GB: the intro offers the installed variant that does.
-    await page.waitForSelector('.intro-advice .callout.warn');
-    assert.match(await page.locator('.intro-advice').textContent(), /too large/);
+    await page.waitForFunction(() => /\dK context on this 8 GB Mac/.test(document.querySelector('.intro-plan')?.textContent || ''));
+    assert.doesNotMatch(await page.locator('.intro').textContent(), /too large/);
     assert.match(await page.locator('.side-foot .machine').textContent(), /Ollama.*8 GB RAM/s);
-    assert.match(await page.locator('.main-titlebar .status-pill').textContent(), /nemotron/i);
     assert.equal(await page.locator('meta[http-equiv="Content-Security-Policy"]').count(), 1);
+    // Nemotron's file is downloaded but not set up for 8 GB yet: one action finishes it.
+    const advice = page.locator('.intro-advice .callout.accent');
+    await advice.waitFor();
+    assert.match(await advice.textContent(), /Nemotron.*not set up for this Mac.*can't read images/s);
     await app.shot('01-first-load');
+    await advice.locator('button', { hasText: 'Make text-only copy' }).click();
+    const def = await waitFor(async () => { const d = (await stack.api('GET', '/api/models')).data.defaultModel; return /-text:/.test(d?.model || '') && d; });
+    assert.match(def.model, /nemotron.*-text:ud-q3_k_xl/);
+    await page.waitForFunction(() => /Nemotron.*text-only/i.test(document.querySelector('.intro-model')?.textContent || ''));
+    await page.waitForFunction(() => /16K context on this 8 GB Mac/.test(document.querySelector('.intro-plan')?.textContent || ''));
+    assert.equal(await page.locator('.intro-advice .callout').count(), 0, 'nothing left to suggest');
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });
@@ -249,6 +259,56 @@ test('security: remote images, scripts and javascript: links in model output are
     assert.deepEqual(await page.evaluate(() => window.__desktopCalls.find((c) => c[0] === 'openExternal')), ['openExternal', 'https://example.com/x']);
     await page.waitForTimeout(300);
     assert.deepEqual(requests.filter((u) => u.includes('evil.example')), []);
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
+test('race: a chat refetch requested before an edit, answered after it started, cannot move the new reply into the old turn', async () => {
+  const stack = await startStack({ delayMs: 20 });
+  const app = await openApp(stack);
+  try {
+    const { page } = app;
+    await send(page, 'first question');
+    await page.waitForTimeout(300);
+    // From now on, hold every chat-detail refetch: fetch it from the server right away (so its content is
+    // the state *before* the edit) but deliver it only when we say so.
+    let holding = true;
+    const held = [];
+    await page.route(/\/api\/chats\/chat_[^/?]+$/, async (route) => {
+      if (route.request().method() !== 'GET' || !holding) return route.continue();
+      const response = await route.fetch();
+      held.push(() => route.fulfill({ response }).catch(() => {}));
+    });
+    await send(page, 'second question');
+    await waitFor(() => held.length >= 1);
+    // Edit the second question; the reply streams slowly.
+    const user = lastTurn(page).locator('.msg-user');
+    await user.hover();
+    await user.locator('button[aria-label="Edit and resend"]').click();
+    await user.locator('.msg-edit-input').fill('second question, edited. long answer 120');
+    await user.locator('button', { hasText: 'Save & send' }).click();
+    await page.waitForFunction(() => /You said: second question, edited/.test(document.querySelector('.transcript')?.textContent || ''));
+    // Now deliver the stale refetches mid-stream.
+    holding = false;
+    for (const f of held.splice(0)) await f();
+    await page.waitForTimeout(400);
+    const check = async (label) => {
+      const turns = await page.evaluate(() => [...document.querySelectorAll('.turn')].map((t) => ({
+        user: t.querySelector('.msg-user .user-text')?.textContent.trim(),
+        steps: t.querySelectorAll('.msg-assistant .step:not([hidden])').length,
+        reply: t.querySelector('.msg-assistant .prose')?.textContent.trim().slice(0, 40),
+      })));
+      assert.equal(turns.length, 2, `${label}: two turns, got ${JSON.stringify(turns)}`);
+      assert.equal(turns[0].user, 'first question', label);
+      assert.equal(turns[0].steps, 1, `${label}: first turn has one reply`);
+      assert.match(turns[1].user, /second question, edited/, `${label}: the edited question is the last turn`);
+      assert.equal(turns[1].steps, 1, `${label}: the new reply is the only reply in its turn`);
+      assert.match(turns[1].reply, /^You said: second question, edited/, label);
+    };
+    await check('while streaming');
+    await waitIdle(page, 30000);
+    await check('after done');
+    assert.equal(await lastTurn(page).locator('.msg-user .branch-pos').textContent(), '2/2');
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });

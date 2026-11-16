@@ -278,12 +278,14 @@ const SRC = {
   psExpires: ['server/providers/ollama.mjs', 'm.expires_at', 'OllamaProvider.ps (expires_at)'],
   measure: ['server/context/measurements.mjs', 'async measure(provider, model', 'MeasurementStore.measure'],
   measureReported: ['server/context/measurements.mjs', 'entry.contextLength', 'MeasurementStore.measure (reported context)'],
+  // Retired assumption (see RETIRED_ANCHORS): Harness used to record /api/ps size as the whole footprint.
   measureTotal: ['server/context/measurements.mjs', 'totalBytes: entry.sizeBytes', 'MeasurementStore.measure (/api/ps size = total footprint)'],
+  measureRss: ['server/context/measurements.mjs', "source = 'rss'", 'MeasurementStore.measure (runner RSS; else model file + ps size)'],
   llmLoadedCtx: ['server/chat/llm.mjs', 'e?.contextLength', 'LLM.resolveFor (loaded context after restart)'],
   fit: ['server/context/sizing.mjs', 'export function fitMeasurements', 'fitMeasurements'],
   fitClamp: ['server/context/sizing.mjs', 'perToken * 0.25', 'fitMeasurements (slope clamp ¼–4×)'],
   cpuSplit: ['server/context/sizing.mjs', 'export function isCpuSplit', 'isCpuSplit'],
-  kvType: ['server/providers/registry.mjs', 'OLLAMA_KV_CACHE_TYPE', 'ProviderRegistry.kvCacheType'],
+  kvType: ['server/providers/registry.mjs', "source: 'assumed'", 'kvCacheTypeInfoFor (external Ollama: unknown, f16 assumed)'],
   buildOptions: ['server/chat/engine.mjs', 'o.num_ctx = numCtx', 'buildOptions (num_ctx)'],
   unload: ['server/providers/ollama.mjs', 'async unload(model)', 'OllamaProvider.unload'],
   unloadEmbed: ['server/providers/ollama.mjs', "e.code === 'not_chat_model'", 'OllamaProvider.unload (embedding fallback)'],
@@ -386,6 +388,12 @@ const SRC = {
 
 const fileCache = new Map();
 const unresolvedAnchors = new Set();
+/**
+ * Anchors for assumptions Harness has deliberately dropped. They are expected NOT to resolve (harnessAssumes()
+ * then returns false and the checks take their "Harness no longer assumes this" branch), so env.harness_sources
+ * does not count them as stale.
+ */
+const RETIRED_ANCHORS = new Set(['measureTotal']);
 function resolveAnchor(key) {
   const a = SRC[key];
   if (!a) return { file: '?', line: null, label: key };
@@ -395,7 +403,7 @@ function resolveAnchor(key) {
     try { lines = fs.readFileSync(path.join(ROOT, file), 'utf8').split('\n'); } catch { lines = null; }
     fileCache.set(file, lines);
   }
-  if (!lines) { unresolvedAnchors.add(key); return { file, line: null, label }; }
+  if (!lines) { if (!RETIRED_ANCHORS.has(key)) unresolvedAnchors.add(key); return { file, line: null, label }; }
   const parts = Array.isArray(anchor) ? anchor : [anchor];
   let from = 0;
   let found = -1;
@@ -405,7 +413,7 @@ function resolveAnchor(key) {
     if (found < 0) break;
     from = found + 1;
   }
-  if (found < 0) unresolvedAnchors.add(key);
+  if (found < 0 && !RETIRED_ANCHORS.has(key)) unresolvedAnchors.add(key);
   return { file, line: found >= 0 ? found + 1 : null, label };
 }
 /** True while the Harness code still contains the anchored line, i.e. still makes that assumption. */
@@ -441,14 +449,14 @@ def('ollama.chat.calibration_ratio', 'raw', "prompt_eval_count / Harness's raw t
 def('ollama.chat.done_reason_length', 'raw', 'Hitting num_predict ends with done_reason "length"', ['ollamaDone', 'finalLength']);
 def('ollama.chat.over_context', 'raw', 'A prompt longer than num_ctx is truncated (HTTP 200, prompt_eval_count ≤ num_ctx) or rejected with an error that classifies as context_overflow', ['classifyOverflow', 'observe']);
 def('ollama.chat.abort', 'raw', 'Closing the connection mid-stream ends it cleanly and Ollama stops generating (Harness stop() only aborts the fetch)', ['engineStop']);
-def('ollama.ps.shape', 'raw', 'GET /api/ps lists the loaded model with name/model, size (the resident footprint, weights included), size_vram, expires_at, digest', ['ollamaPs', 'measureTotal']);
+def('ollama.ps.shape', 'raw', 'GET /api/ps lists the loaded model with name/model, size, size_vram, expires_at, digest (size is not taken as the footprint: Harness measures the runner process, else adds the model file)', ['ollamaPs', 'measureRss']);
 def('ollama.ps.context_length', 'raw', '/api/ps reports context_length = the num_ctx Harness sent (optional field; used after a restart and to detect server-side capping)', ['psContext', 'measureReported', 'llmLoadedCtx']);
 def('ollama.ps.size_vram', 'raw', 'size_vram ≤ size; on Apple Silicon the whole model is on the GPU (size_vram == size)', ['cpuSplit']);
 def('ollama.ps.expires_at', 'raw', 'expires_at is an ISO timestamp ≈ now + keep_alive', ['psExpires']);
 def('ollama.load.generate_empty', 'raw', 'POST /api/generate {model, keep_alive, options:{num_ctx}} without a prompt loads the model (used by /api/models/load and eager reload after images)', ['load']);
 def('ollama.ps.size_grows_with_num_ctx', 'raw', '/api/ps size grows with num_ctx (measured memory = fixed + per-token × num_ctx)', ['measure', 'fit']);
-def('ollama.ps.measurement_fit', 'raw', "Real /api/ps samples pass fitMeasurements' sanity limits and give a slope within ¼–4× of the architecture estimate", ['measureTotal', 'fit', 'fitClamp', 'kvModel']);
-def('ollama.ps.kv_cache_type', 'raw', "The measured per-token cost matches the KV cache precision Harness assumes (f16 unless OLLAMA_KV_CACHE_TYPE is visible to Harness)", ['kvType', 'kvModel']);
+def('ollama.ps.measurement_fit', 'raw', "Real /api/ps samples pass fitMeasurements' sanity limits and give a slope within ¼–4× of the architecture estimate", ['measureRss', 'fit', 'fitClamp', 'kvModel']);
+def('ollama.ps.kv_cache_type', 'raw', "The measured per-token cost matches the KV cache precision Harness assumes (q8_0 for an Ollama Harness started; for any other Ollama the type is unknown and f16 is assumed)", ['kvType', 'kvModel']);
 for (const [label] of keepAliveForms()) def(`ollama.keep_alive.${label}`, 'raw', `keep_alive ${label.replace(/^(number|string)_/, '$1 ')} (allowed by the settings validator) is accepted as Harness sends it and means what Harness intends`, ['ollamaKeepAlive', 'normalizeKeepAlive', 'settingsKeepAlive']);
 def('ollama.unload.chat', 'raw', 'POST /api/generate {model, keep_alive:0} → done_reason "unload", and /api/ps stops listing the model within the time the image service waits before generating', ['unload', 'imageUnload', 'waitUnloaded']);
 def('ollama.think.on', 'raw', 'think:true on a thinking model streams message.thinking separately from message.content', ['ollamaThinking', 'resolveThink']);
@@ -885,12 +893,12 @@ async function envGroup(run, B) {
     const cli = bin ? await sh('ollama', ['--version'], 4000) : null;
     if (bin) info.push(`ollama binary: ${bin}${cli ? ` — ${cli.replace(/\n/g, '; ')}` : ''}`);
     if (B.ollama) info.push(`server version (API): ${B.ollama.version || '?'}`);
-    const kvSeen = own.OLLAMA_KV_CACHE_TYPE || null;
     const kvServer = launchd.OLLAMA_KV_CACHE_TYPE || null;
-    info.push(`Harness assumes KV cache ${H.ProviderRegistry.prototype.kvCacheType.call({ ollamaProcess: null }, H.DEFAULT_SETTINGS)} for an Ollama it did not start (reads only its own OLLAMA_KV_CACHE_TYPE)`);
+    const kvAssumed = H.ProviderRegistry.prototype.kvCacheType.call({ ollamaProcess: null }, H.DEFAULT_SETTINGS);
+    info.push(`Harness treats the KV cache type of an Ollama it did not start as unknown and assumes ${kvAssumed} (it reads no OLLAMA_KV_CACHE_TYPE from any environment); an Ollama Harness starts itself uses q8_0`);
     run.env.ollamaEnv = { process: own, launchd, binary: bin, cliVersion: cli };
-    if (kvServer && kvServer !== kvSeen) {
-      return WARN(`Ollama.app is configured with OLLAMA_KV_CACHE_TYPE=${kvServer} via launchctl, which Harness cannot see — its KV estimate assumes ${kvSeen || 'f16'} until measurements correct it`, { info, fix: 'Read the KV type from launchctl on macOS in ProviderRegistry.kvCacheType, or rely on measurements (ollama.ps.kv_cache_type below shows what the server really uses).' });
+    if (kvServer && kvServer !== kvAssumed) {
+      return WARN(`Ollama.app is configured with OLLAMA_KV_CACHE_TYPE=${kvServer} via launchctl; Harness assumes ${kvAssumed} for an Ollama it did not start, so its context estimate is conservative until measurements correct it`, { info, fix: 'Quit Ollama.app and let Harness start Ollama (it then applies q8_0 itself), or set context.kvCacheType to match. ollama.ps.kv_cache_type below shows what the server really uses.' });
     }
     return PASS('', { info, observed: run.env.ollamaEnv });
   });
@@ -1491,7 +1499,7 @@ async function ollamaGroup(run, B) {
     const best = Object.entries(est).sort((a, b) => Math.abs(Math.log(O.measuredPerToken / a[1])) - Math.abs(Math.log(O.measuredPerToken / b[1])))[0][0];
     const lines = [`measured ${fmtBytes(O.measuredPerToken)}/token; estimates: ${Object.entries(est).map(([t, v]) => `${t} ${fmtBytes(v)}`).join(', ')} → closest: ${best}; Harness assumes ${assumed}`, 'Note: the slope also contains compute-graph growth, so this is a hint, not proof.'];
     const off = O.measuredPerToken / est[assumed];
-    if (best !== assumed && (off < 0.67 || off > 1.5)) return WARN(`measured per-token cost looks like KV cache ${best}, Harness assumes ${assumed}`, { info: lines, fix: 'Harness only sees OLLAMA_KV_CACHE_TYPE in its own environment; for an Ollama it did not start (Ollama.app) it should rely on measurements or ask the user.' });
+    if (best !== assumed && (off < 0.67 || off > 1.5)) return WARN(`measured per-token cost looks like KV cache ${best}, Harness assumes ${assumed}`, { info: lines, fix: 'For an Ollama it did not start (Ollama.app, brew services), Harness treats the KV type as unknown and assumes f16; let Harness start Ollama (q8_0), or set context.kvCacheType to the real type. Measurements correct the plan either way.' });
     return PASS(`consistent with ${assumed}`, { info: lines });
   });
 

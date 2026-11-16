@@ -2,8 +2,9 @@
 // contents for a chat (title, live status, actions).
 import { h, mount, add } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
-import { fmtTokens, fmtBytes, modelLabel } from '../../lib/format.js';
-import { store, findModel, modelInfo, loadRecommended, chatModels } from '../../state.js';
+import { fmtTokens, fmtBytes, modelLabel, modelShort } from '../../lib/format.js';
+import { makeTextOnlyCopy } from '../model-flows.js';
+import { store, findModel, modelInfo, loadRecommended, chatModels, patchSettings, loadModels } from '../../state.js';
 import { chatModel, peekChatModel, sendMessage, stopGeneration, generateImageInChat, describeLive, mergeChatSummary } from '../../chat/session.js';
 import { ConversationView } from './conversation.js';
 import { Composer } from './composer.js';
@@ -12,6 +13,38 @@ import * as api from '../../api.js';
 import { runAction } from '../../actions.js';
 import { showError } from '../../errors.js';
 import { toast } from '../../ui/overlays.js';
+
+/**
+ * What the new-chat screen should suggest, if anything:
+ *  - the chosen model is too big for this machine → the installed setup that fits, or Models;
+ *  - on a small Mac, a recommended file is downloaded but not yet set up as its text-only copy → finish it.
+ */
+function introAdvice(ref, plan, rec, sys) {
+  const lowRam = sys?.machine?.ramTier === 'low';
+  const variants = (rec?.models || []).flatMap((m) => m.variants.map((v) => ({ ...v, rec: m })));
+  // The model this machine should actually run for a variant: its text-only copy where that is recommended.
+  const runnable = (v) => (v.textOnly?.recommended ? (v.textOnly.installed ? v.textOnly.model : null) : (findModel({ model: v.model }) ? v.model : null));
+  const tooBig = plan.warnings?.some((w) => ['model_exceeds_budget', 'model_too_big', 'memory_pressure'].includes(w.code));
+  if (tooBig) {
+    const better = variants.find((v) => v.estimate?.fits && runnable(v) && runnable(v) !== ref.model);
+    return h('div.callout.warn', icon('warning'), h('div.grow',
+      h('div', h('b', `${modelShort(ref.model, 40)} is too large for this Mac's memory.`)),
+      h('div.small', better ? `${modelShort(runnable(better), 44)} is installed and fits with a ${fmtTokens(better.estimate.numCtx)} window.` : plan.explanation)),
+    better ? h('button.btn.btn-small', { type: 'button', on: { click: async () => {
+      try { await patchSettings({ defaultModel: { providerId: 'ollama', model: runnable(better) } }); await loadModels(); toast({ kind: 'success', message: `Default model: ${modelShort(runnable(better), 40)}` }); } catch (e) { showError(e, 'change the default model'); }
+    } } }, 'Use it by default') : h('button.btn.btn-small', { type: 'button', on: { click: () => runAction('open-setup') } }, 'Set up a smaller model'));
+  }
+  if (lowRam) {
+    const unfinished = variants.find((v) => v.textOnly?.recommended && !v.textOnly.installed && findModel({ model: v.model }) && v.estimate?.fits);
+    if (unfinished && unfinished.textOnly.model !== ref.model) {
+      return h('div.callout.accent', icon('chip'), h('div.grow',
+        h('div', h('b', `${unfinished.rec.name} is downloaded but not set up for this Mac yet.`)),
+        h('div.small', `Make a text-only copy: a few seconds, nothing to download, about 1 GB less memory (${fmtBytes(unfinished.textOnly.approxSizeBytes)}) — but it can't read images.`)),
+      h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: async (e) => { e.currentTarget.disabled = true; await makeTextOnlyCopy(unfinished.model, { setDefault: true }); } } }, 'Make text-only copy'));
+    }
+  }
+  return null;
+}
 
 export class ChatView {
   constructor(shell) {
@@ -31,7 +64,7 @@ export class ChatView {
     });
     this.el = h('div.view.chat-view', this.body, this.composer.el, this.dropOverlay);
     this.bindDrop();
-    this.offs = [store.watch(['models', 'defaultModel', 'system', 'pendingChat'], () => { if (!this.model) this.renderIntro(); })];
+    this.offs = [store.watch(['models', 'defaultModel', 'pendingChat', 'recommended'], () => { if (!this.model) this.renderIntro(); })];
   }
 
   destroy() { this.offs.forEach((o) => o()); this.unbindModel(); this.composer.destroy(); }
@@ -161,18 +194,11 @@ export class ChatView {
       modelInfo(ref).then(async (r) => {
         const plan = r?.contextPlan;
         if (!plan) return;
-        if (r.info?.displayName) nameEl.textContent = r.info.displayName;
         planLine.textContent = `${fmtTokens(plan.numCtx)} context${ram ? ` on this ${Math.round(ram / 1024 ** 3)} GB ${sys.machine.appleSilicon || sys.machine.platform === 'darwin' ? 'Mac' : 'machine'}` : ''}`;
-        if (plan.warnings?.some((w) => w.code === 'model_exceeds_budget')) {
-          const rec = store.get('recommended') || await loadRecommended().catch(() => null);
-          const better = rec?.models?.flatMap((m) => m.variants).find((v) => v.installed && v.estimate?.fits && v.model !== ref.model && v.estimate.numCtx > plan.numCtx);
-          mount(advice, h('div.callout.warn', icon('warning'), h('div.grow',
-            h('div', h('b', `${modelLabel(info?.name || ref.model)} is too large for this Mac's memory.`)),
-            h('div.small', better ? `${modelLabel(better.model)} is installed and fits with a ${fmtTokens(better.estimate.numCtx)} window.` : plan.explanation)),
-          better ? h('button.btn.btn-small', { type: 'button', on: { click: async () => {
-            try { const { patchSettings } = await import('../../state.js'); await patchSettings({ defaultModel: { providerId: better.providerId || 'ollama', model: better.model } }); toast({ kind: 'success', message: `Default model: ${modelLabel(better.model)}` }); } catch (e) { showError(e, 'change the default model'); }
-          } } }, 'Use it by default') : h('button.btn.btn-small', { type: 'button', on: { click: () => runAction('open-models') } }, 'Models')));
-        } else mount(advice);
+        const rec = store.get('recommended') || await loadRecommended().catch(() => null);
+        if (this.model) return;
+        nameEl.textContent = modelLabel(ref.model); // catalog names are known now
+        mount(advice, introAdvice(ref, plan, rec, sys));
       }).catch(() => {});
     }
     const running = (sys?.imageProviders || []).filter((p) => p.status === 'running');

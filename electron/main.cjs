@@ -19,6 +19,7 @@ const menus = require('./lib/menu.cjs');
 const windowState = require('./lib/window-state.cjs');
 const { createActivityGuard, backendBusy, ACTIVITY_EVENTS } = require('./lib/activity.cjs');
 const { findRunningHarness, portRange } = require('./lib/instance.cjs');
+const { startOrAttach } = require('./lib/backend.cjs');
 const { teeConsoleToFile } = require('./lib/logfile.cjs');
 
 const isMac = process.platform === 'darwin';
@@ -67,6 +68,7 @@ for (const w of configWarnings) console.warn(`[desktop] ${w}`);
 
 let server = null; // { url, port, close, app } when the backend runs in this process
 let attachedUrl = null; // URL of an already-running Harness for the same data dir (npm start / Harness.command)
+let attachedVia = null; // 'probe' | 'lock'
 let appUrl = null;
 let appOrigin = null;
 let win = null;
@@ -303,16 +305,26 @@ function registerGlobalShortcut() {
 
 // ------------------------------------------------------------------------------------------- start-up
 async function startBackend() {
-  const existing = await findRunningHarness({ dataDir, ports: portRange(desktop.port || 4747), timeoutMs: 800 });
-  if (existing) {
-    // Never run two servers on one data dir: use the one that is already running (it keeps running when Harness quits).
-    attachedUrl = existing.url;
-    console.log(`[desktop] using the Harness server already running at ${existing.url} (pid ${existing.pid})`);
-    return existing.url;
+  // Never run two servers on one data dir: if one is already running (npm start / Harness.command), use it — it
+  // keeps running when Harness quits. The probe covers the normal case; the backend's own data-dir lock
+  // (HARNESS_ALREADY_RUNNING) covers a launcher that started between the probe and startServer().
+  const r = await startOrAttach({
+    dataDir,
+    port: desktop.port,
+    ports: portRange(desktop.port || 4747),
+    findRunning: findRunningHarness,
+    startServer: async (opts) => (await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href)).startServer(opts),
+    // Test hook: skip the probe so the e2e test exercises the lock path.
+    probeFirst: !(E2E_SCRIPT && process.env.HARNESS_E2E_SKIP_PROBE === '1'),
+  });
+  if (r.attached) {
+    attachedUrl = r.url;
+    attachedVia = r.via;
+    console.log(`[desktop] using the Harness server already running at ${r.url} (pid ${r.pid ?? '?'}, found via ${r.via})`);
+  } else {
+    server = r.server;
   }
-  const { startServer } = await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href);
-  server = await startServer({ port: desktop.port, dataDir, openBrowser: false });
-  return server.url;
+  return r.url;
 }
 
 async function reportStartupError(err) {
@@ -374,7 +386,7 @@ async function onReady() {
 
   if (E2E_SCRIPT) {
     require(path.resolve(E2E_SCRIPT))({
-      app, hooks, dataDir, paths, desktop, appUrl, attachedUrl,
+      app, hooks, dataDir, paths, desktop, appUrl, attachedUrl, attachedVia,
       get server() { return server; }, get window() { return win; }, get activity() { return activity; },
       get registeredShortcut() { return registeredShortcut; }, Menu,
     });

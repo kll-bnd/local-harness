@@ -146,7 +146,12 @@ export function modelShort(id, max = 30) {
   if (full.length <= max) return full;
   const n0 = name.replace(/^NVIDIA\s+/, '');
   const room = max - (tag ? tag.length + 3 : 0);
-  if (room < 8) return middleTruncate(full, max);
+  if (room < 8) {
+    // Tag too long to keep (e.g. "UD-Q3_K_XL text-only"): keep the family name and the text-only marker.
+    const marker = /text-only/.test(tag) ? ' · text-only' : '';
+    const r2 = max - marker.length;
+    return `${n0.length > r2 ? `${n0.slice(0, r2 - 1).trimEnd()}…` : n0}${marker}`;
+  }
   const n = n0.length > room ? `${n0.slice(0, room - 1).trimEnd()}…` : n0;
   return tag ? `${n} · ${tag}` : n;
 }

@@ -4,11 +4,12 @@
 Draw Things / AUTOMATIC1111 / Forge, ComfyUI, OpenAI-style image servers) and reports, check by check, which
 assumptions the Harness code makes about their APIs hold. Zero npm dependencies, Node ≥ 20 (22 recommended).
 
-> **Status: not yet validated against real servers.** The backend was written on Linux against fakes
-> (`test/fake-*.mjs`), and so was this checker: it has only been run against those fakes and against deliberately
-> deviant copies of them (`test/live-check.test.mjs`). The first runs on a real Mac or the macOS CI job are the
-> real test, of the backend and of the checker. A check that FAILs there can be wrong itself: read its
-> `actual` excerpt before changing `server/`.
+> **Status.** Run against a **real Ollama 0.40.13 on macOS** (GitHub's Apple Silicon runner, "Apple M1 (Virtual)",
+> 7 GB RAM, macOS 26): 47 of the 53 Ollama/environment checks passed, 3 were skipped for lack of an embedding model,
+> and the 1 failure was a genuine Harness bug, since fixed. It has **not** been run against llama.cpp, LM Studio,
+> MLX, Draw Things, AUTOMATIC1111 or ComfyUI: those checks have only met the fakes (`test/fake-*.mjs`) and
+> deliberately deviant copies of them (`test/live-check.test.mjs`). A check that FAILs against one of those can be
+> wrong itself: read its `actual` excerpt before changing `server/`.
 
 ## Running it
 
@@ -102,4 +103,6 @@ at a time (string tool arguments, `prompt_eval_count` missing on a cached repeat
 in OpenAI streams…), and asserts that exactly those checks flip (and that a slow unload is reported but passes,
 because Harness waits for `/api/ps`). When `server/` changes an assumption,
 update the matching check. When a source anchor no longer matches, `env.harness_sources` WARNs and names the entry
-to fix in the `SRC` table.
+to fix in the `SRC` table. An assumption Harness has deliberately dropped keeps its anchor in `SRC` and is listed in
+`RETIRED_ANCHORS` (today: `measureTotal`, "/api/ps size is the whole footprint" — Harness now measures the runner
+process): it is expected not to resolve, so the checks take their "no longer assumed" branch without a warning.

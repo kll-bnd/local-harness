@@ -13,7 +13,7 @@
 import * as api from '../api.js';
 import { Emitter } from '../lib/store.js';
 import { store, refreshChatsSoon, bus } from '../state.js';
-import { modelShort } from '../lib/format.js';
+import { modelShort, fmtTokens } from '../lib/format.js';
 import { toast } from '../ui/overlays.js';
 import { showError, explainError } from '../errors.js';
 import { runAction } from '../actions.js';
@@ -38,7 +38,15 @@ export class ChatModel extends Emitter {
     this.noticed = new Set();
     this.timing = new Map(); // messageId → { reasoningStart, reasoningEnd, start }
     this.trail = new Map(); // assistant step id → [{ icon, text }] — what the machine did during that turn
+    // Ordering guard for refetches: a response is applied only if it answers the newest request AND nothing
+    // changed locally since it was sent (a stream started, a branch switched…). Otherwise it describes an
+    // older tree and would, e.g., drop a just-created edit and move its reply into the previous turn.
+    this.epoch = 0;
+    this.loadSeq = 0;
   }
+
+  /** Local state just became newer than anything the server sent before now. */
+  touch() { this.epoch++; }
 
   get title() { return this.chat?.title || 'New chat'; }
   get generating() { return !!this.live || !!this.chat?.generating; }
@@ -47,8 +55,15 @@ export class ChatModel extends Emitter {
 
   load({ force = false } = {}) {
     if (this.loading && !force) return this.loading;
-    this.loading = api.chats.get(this.id).then((d) => { this.applyDetail(d); return this; }).finally(() => { this.loading = null; });
-    return this.loading;
+    const seq = ++this.loadSeq;
+    const epoch = this.epoch;
+    const p = api.chats.get(this.id).then((d) => {
+      if (seq !== this.loadSeq || epoch !== this.epoch) { this.staleDropped = (this.staleDropped || 0) + 1; return this; }
+      this.applyDetail(d);
+      return this;
+    }).finally(() => { if (this.loading === p) this.loading = null; });
+    this.loading = p;
+    return p;
   }
 
   applyDetail(d) {
@@ -73,16 +88,40 @@ export class ChatModel extends Emitter {
     if (parentId && this.byId.has(parentId)) this.byId.get(parentId).childIds = ids;
   }
 
-  /** Insert or replace a message and put it on the active path after its parent. */
+  /** Root → id via parent links, or null when an ancestor is unknown. */
+  _pathTo(id) {
+    const out = [];
+    const seen = new Set();
+    let cur = this.byId.get(id);
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      out.unshift(cur.id);
+      if (!cur.parentId) return out;
+      cur = this.byId.get(cur.parentId);
+    }
+    return null;
+  }
+
+  /**
+   * Insert or replace a message and make it the end of the active path. The path is derived from the
+   * message's real ancestry, never by appending: a message whose parent is not on the current path starts
+   * (or continues) its own branch instead of landing inside whatever turn happens to be last.
+   */
   upsert(m, { onPath = true } = {}) {
     const prev = this.byId.get(m.id);
     const merged = prev ? { ...prev, ...m } : { childIds: [], siblingIds: [m.id], ...m };
     this.byId.set(m.id, merged);
     if (!prev) this._relink(m.parentId);
+    this.touch();
     if (onPath && !this.path.includes(m.id)) {
       const pi = m.parentId ? this.path.indexOf(m.parentId) : -1;
-      if (m.parentId && pi < 0) this.path.push(m.id);
-      else this.path = [...this.path.slice(0, pi + 1), m.id];
+      if (!m.parentId) this.path = [m.id];
+      else if (pi >= 0) this.path = [...this.path.slice(0, pi + 1), m.id];
+      else {
+        const p = this._pathTo(m.id);
+        if (p) this.path = p;
+        else this.orphans = true; // parent unknown here: leave the path alone; the post-turn refetch fixes it
+      }
       return true;
     }
     return !prev;
@@ -166,13 +205,23 @@ export function describeLive(model) {
   }
   const since = (t) => Math.max(0, Math.round((Date.now() - (t || l.startedAt)) / 1000));
   const mac = /darwin/.test(store.get('system')?.machine?.platform || '') ? 'this Mac' : 'this machine';
-  if (l.modelStatus?.phase === 'waiting') {
-    const s = since(l.modelStatus.at);
-    return { label: `${(l.modelStatus.message || 'Waiting for image generation to finish').replace(/…$/, '')}… ${s} s`, phase: 'waiting', hint: s >= 5 ? `On ${mac} the chat model and image generation take turns, so they never compete for memory.` : null };
+  const st = l.modelStatus;
+  const name = (ref) => modelShort(ref || l.modelInfo?.model, 32);
+  if (st?.phase === 'waiting') {
+    const s = since(st.at);
+    const what = st.reason === 'model_in_use' ? 'Waiting for the model to finish another task' : 'Waiting for image generation to finish';
+    return { label: `${what}… ${s} s`, phase: 'waiting', hint: s >= 5 ? `On ${mac} the chat model and image generation take turns, so they never compete for memory.` : null };
   }
-  if (l.modelStatus?.phase === 'loading') {
-    const s = since(l.modelStatus.at);
-    return { label: `${l.modelStatus.message?.replace(/…$/, '') || 'Reloading the chat model'}… ${s} s`, phase: 'loading', hint: s >= 5 ? `Loading a model into memory takes 20–60 s on ${mac}. This is normal.` : null };
+  if (st?.phase === 'loading') {
+    const s = Math.max(since(st.at), Math.round((st.elapsedMs || 0) / 1000));
+    const label = st.reason === 'reload_after_image' || st.models ? 'Reloading the chat model after the image'
+      : st.reason === 'context_change' ? `Reloading ${name(st.model)}${st.numCtx ? ` with a ${fmtTokens(st.numCtx)} window` : ''}`
+        : `Loading ${name(st.model)}`;
+    return { label: `${label}… ${s} s`, phase: 'loading', hint: s >= 5 ? `Loading a model into memory takes 20–60 s on ${mac} before the first word appears. This is normal.` : null };
+  }
+  if (st?.phase === 'evaluating') {
+    const s = Math.max(since(st.at), Math.round((st.elapsedMs || 0) / 1000));
+    return { label: `Reading the conversation${st.promptTokens ? ` (~${fmtTokens(st.promptTokens)} tokens)` : ''}… ${s} s`, phase: 'prompt', hint: s >= 8 ? `Long conversations take a while to read on ${mac}; the reply starts as soon as it's done.` : null };
   }
   const m = model.byId.get(l.assistantId);
   if (l.kind === 'image') return { label: 'Preparing image…', phase: 'image' };
@@ -181,6 +230,8 @@ export function describeLive(model) {
   // No output yet: the model is either loading or reading the prompt. Say which, and for how long.
   const s = since(l.stepStartedAt);
   const ref = l.modelInfo;
+  // Fallback for servers that don't send model_status: infer from what /api/system says is loaded.
+  if (l.seenModelStatus) return { label: s >= 2 ? `Waiting for the model… ${s} s` : 'Waiting for the model…', phase: 'waiting' };
   const loaded = !ref || (store.get('system')?.loadedModels || []).some((x) => x.model === ref.model);
   if (!loaded) return { label: `Loading ${modelShort(ref.model, 28)}… ${s} s`, phase: 'loading', hint: s >= 5 ? `The first reply after loading takes 20–60 s on ${mac}. This is normal.` : null };
   if (s >= 2) return { label: `Reading the conversation… ${s} s`, phase: 'prompt', hint: s >= 8 ? `Long conversations take a while to read on ${mac}; the reply starts as soon as it's done.` : null };
@@ -256,12 +307,28 @@ function handleEvent(model, ev) {
       break;
     }
     case 'model_status': {
-      if (ev.phase === 'loading') model.reloadStarted = Date.now();
+      // Honest progress before the first token (docs §4): waiting → loading (reason, elapsedMs) →
+      // evaluating (elapsedMs, promptTokens) → ready; `loaded` reports the real load time afterwards.
+      const prev = model.live?.modelStatus;
+      if (ev.phase === 'loading' && prev?.phase !== 'loading') model.loadStarted = { at: Date.now(), reason: ev.reason || (ev.models ? 'reload_after_image' : null) };
       if (ev.phase === 'ready') {
-        const secs = model.reloadStarted ? (Date.now() - model.reloadStarted) / 1000 : null;
-        addTrail(model, { key: 'reload', icon: 'regenerate', text: `Reloaded the chat model after the image${secs != null && secs >= 0.1 ? ` (${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s)` : ''}` });
+        const ls = model.loadStarted;
+        if (ls?.reason === 'reload_after_image') {
+          const secs = (Date.now() - ls.at) / 1000;
+          addTrail(model, { key: 'reload', icon: 'regenerate', text: `Reloaded the chat model after the image${secs >= 0.1 ? ` (${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s)` : ''}` });
+        }
+        model.loadStarted = null;
       }
-      setLive(model, { modelStatus: ev.phase === 'loading' || ev.phase === 'waiting' ? { ...ev, at: model.live?.modelStatus?.phase === ev.phase ? model.live.modelStatus.at : Date.now() } : null, ...(ev.phase === 'ready' ? { stepStartedAt: Date.now() } : {}) });
+      if (ev.phase === 'loaded' && ev.loadMs >= 1000 && !model.trail.get(model.live?.assistantId)?.some((t) => t.key === 'reload')) {
+        addTrail(model, { key: 'loaded', icon: 'cube', text: `Loaded ${modelShort(ev.model || model.live?.modelInfo?.model, 40)} into memory in ${Math.round(ev.loadMs / 1000)} s` });
+      }
+      if (ev.phase === 'loaded') { changed(model, model.live?.assistantId); break; }
+      const keep = ['waiting', 'loading', 'evaluating'].includes(ev.phase);
+      setLive(model, {
+        modelStatus: keep ? { ...ev, at: prev?.phase === ev.phase ? prev.at : Date.now() - (ev.elapsedMs || 0) } : null,
+        seenModelStatus: true,
+        ...(ev.phase === 'ready' ? { stepStartedAt: Date.now() } : {}),
+      });
       changed(model, model.live?.assistantId);
       break;
     }
@@ -331,7 +398,7 @@ function handleEvent(model, ev) {
         if (ev.message) st.message = ev.message;
         if (ev.phase === 'unloading') {
           st.unload = { models: ev.models, reason: ev.reason, message: ev.message };
-          addTrail(model, { key: `unload:${st.jobId}`, icon: 'eject', text: `Unloaded ${(ev.models || []).join(', ') || 'the chat model'} to free memory for the image` });
+          addTrail(model, { key: `unload:${st.jobId}`, icon: 'eject', text: `Unloaded ${(ev.models || []).map((x) => modelShort(x, 40)).join(', ') || 'the chat model'} to free memory for the image` });
         }
         if (ev.phase === 'starting') { st.params = ev.params; st.family = ev.family; st.warnings = ev.warnings || []; }
       }
@@ -412,6 +479,7 @@ async function run(model, kind, starter) {
     return false;
   }
   const controller = new AbortController();
+  model.touch();
   model.live = { kind, controller, startedAt: Date.now(), phase: 'starting' };
   model.lastError = null;
   model.doneReason = null;
@@ -505,7 +573,9 @@ export async function stopGeneration(model) {
 export async function switchBranch(model, messageId) {
   if (model.generating) { showError({ code: 'chat_busy' }); return; }
   try {
+    model.touch();
     const r = await api.chats.branch(model.id, messageId);
+    model.touch();
     model.path = r.path;
     if (model.chat) model.chat = { ...model.chat, activeLeafId: r.activeLeafId, summary: r.summary };
     model.emit('reset');
