@@ -13,10 +13,13 @@
 //   * A Harness this process did NOT start (found through <dataDir>/harness.lock, which any program running as the
 //     user can write) gets the password only after it PROVED it holds this folder's data key: the password is first
 //     checked locally against <dataDir>/vault.json (no request, no throttle counter), then the instance must answer
-//     a fresh random nonce with HMAC(subkey of the data key, nonce, "port:<the port we connected to>") — POST
-//     /api/security/prove; the port binding defeats a program that relays the nonce to the real Harness. A locked instance
+//     a fresh random nonce with HMAC(subkey of the data key, nonce, <the address and port we connected to>) — POST
+//     /api/security/prove; the binding defeats a program that relays the nonce to the real Harness. A locked instance
 //     cannot prove anything and never gets the password. The data key never leaves this process and is wiped
 //     right after the comparison.
+//   * Only http://127.0.0.1:<port> is ever contacted. The lock file's `url` (and the backend's HARNESS_ALREADY_RUNNING
+//     error, which carries it) is never used; a lock written on another computer is never contacted; redirects are
+//     never followed (a 3xx answer is an error).
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -24,7 +27,7 @@ import { createRequire } from 'node:module';
 import { openDataKeyWithPassword, instanceProof, proofBinding, validVault } from './instance-proof.mjs';
 
 const require = createRequire(import.meta.url);
-const { findRunningHarness, findAppHarness } = require('../../electron/lib/instance.cjs');
+const { findRunningHarness, findAppHarness, lockElsewhere, loopbackUrl } = require('../../electron/lib/instance.cjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -99,12 +102,36 @@ export function passwordSource({ fromStdin = false, stdin = process.stdin, out =
 }
 
 // ------------------------------------------------------------------------------------------------- HTTP
+/**
+ * `base` when it is exactly http://127.0.0.1:<port 1–65535> (no user, path, query or other host), else null. The only
+ * kind of address this client talks to.
+ */
+export function loopbackBase(base) {
+  const m = typeof base === 'string' ? /^http:\/\/127\.0\.0\.1:([0-9]{1,5})$/.exec(base) : null;
+  return m ? loopbackUrl(m[1]) : null;
+}
+
+/** A redirect is never followed: the password, a token or a proof must not travel on to wherever it points. */
+export function redirectError(base, status) {
+  return new HarnessError('redirect_refused', `The program at ${base} answered with a redirect (HTTP ${status}). This tool does not follow redirects; nothing was sent on.`);
+}
+
+/** fetch for the tools: never follows a redirect (3xx → HarnessError redirect_refused). */
+export async function safeFetch(url, init = {}) {
+  const res = await fetch(url, { ...init, redirect: 'manual' });
+  if (res.status >= 300 && res.status < 400) {
+    res.body?.cancel?.().catch?.(() => {});
+    throw redirectError(new URL(url).origin, res.status);
+  }
+  return res;
+}
+
 async function call(base, method, p, { body, headers = {}, token, cookie, timeoutMs = 120000 } = {}) {
   const h = { ...headers };
   if (body !== undefined) h['content-type'] = 'application/json';
   if (token) h.authorization = `Bearer ${token}`;
   if (cookie) h.cookie = cookie;
-  const res = await fetch(base + p, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+  const res = await safeFetch(base + p, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
   const ct = res.headers.get('content-type') || '';
   const data = ct.includes('json') ? await res.json().catch(() => null) : null;
   return { status: res.status, ok: res.ok, data, res };
@@ -153,7 +180,8 @@ export class HarnessClient {
    *   password then goes to our own process. Anything else must prove it holds the data key first.
    */
   constructor({ base, dataDir, password = passwordSource(), log = (m) => process.stderr.write(`${m}\n`), maxAttempts = 3, inProcess = false }) {
-    this.base = base;
+    if (!loopbackBase(base)) throw new HarnessError('instance_address', `Not a local Harness address: ${String(base).slice(0, 200)}. This tool only talks to http://127.0.0.1:<port>.`);
+    this.base = loopbackBase(base);
     this.inProcess = inProcess === true;
     this.dataDir = dataDir;
     this.pw = password;
@@ -229,14 +257,14 @@ export class HarnessClient {
     let r;
     try {
       r = await call(this.base, 'POST', '/api/security/prove', { body: { nonce: nonce.toString('base64url') }, timeoutMs: 15000 });
-    } catch {
-      throw unverifiedInstanceError(this.base, 'it did not answer the proof request');
+    } catch (e) {
+      throw unverifiedInstanceError(this.base, e?.code === 'redirect_refused' ? 'it answered the proof request with a redirect' : 'it did not answer the proof request');
     }
     if (r.status === 423) throw unverifiedInstanceError(this.base, 'it says it is locked');
     if (!r.ok) throw unverifiedInstanceError(this.base, `it answered the proof request with HTTP ${r.status}`);
     let expected;
     try {
-      expected = instanceProof(key, nonce, proofBinding({ port: Number(new URL(this.base).port) }));
+      expected = instanceProof(key, nonce, bindingFor(this.base));
     } catch {
       throw unverifiedInstanceError(this.base, 'its address has no port to bind the proof to');
     }
@@ -383,6 +411,31 @@ export class HarnessClient {
 }
 
 /**
+ * The proof binding for the literal address and port this client connects to (always 127.0.0.1 here — see
+ * loopbackBase): a program on the same port at another loopback address (127.0.0.2, ::1) that relays the nonce gets
+ * a proof bound to where the genuine Harness received it, which does not match.
+ */
+export function bindingFor(base) {
+  const u = new URL(loopbackBase(base));
+  return proofBinding({ address: u.hostname, port: Number(u.port) });
+}
+
+/** The lock was written on another computer: nothing there is contacted. */
+export function elsewhereError(other) {
+  const e = new HarnessError('HARNESS_ELSEWHERE', `This Harness data folder is in use by Harness on another computer (${other.hostname}). This tool does not connect to it. Quit Harness there and run this again. (If Harness is not running there, the file harness.lock in the data folder is left over from it: delete that file.)`);
+  e.hostname = other.hostname;
+  e.pid = other.pid ?? null;
+  return e;
+}
+
+/** Another process holds the lock but no Harness answers at the 127.0.0.1 port it names (still starting, or not Harness). */
+export function busyError(pid) {
+  const e = new HarnessError('HARNESS_BUSY', `Another program (pid ${pid ?? '?'}) holds this Harness data folder, but no Harness answers at the local address its lock names. Wait until it has started, or quit it, then run this again.`);
+  e.pid = pid ?? null;
+  return e;
+}
+
+/**
  * The native app holds the data folder. Its backend has no local address (no listening socket, by design), so a
  * command-line tool can neither use it nor start a second backend on the same folder.
  */
@@ -403,8 +456,11 @@ export function appHarness(dataDir) {
  * Throws an error with code HARNESS_IN_APP when the native app holds the folder.
  * @returns {Promise<{ base: string, srv: object|null, running: object|null, close(): Promise<void> }>}
  */
-export async function reachHarness({ dataDir, port = 4747, start = true, startOptions = {}, log = () => {} }) {
+export async function reachHarness({ dataDir, port = 4747, start = true, startOptions = {}, log = () => {}, raceWaitMs = 5000 }) {
+  const far = lockElsewhere({ dataDir });
+  if (far) throw elsewhereError(far);
   // `running` / no `srv`: an instance found through the lock file — NOT authenticated (HarnessClient proves it).
+  // Its URL is always http://127.0.0.1:<the lock's port> (instance.cjs), never the lock's `url`.
   const running = await findRunningHarness({ dataDir, timeoutMs: 1500 });
   if (running) return { base: running.url, srv: null, running, close: async () => {} };
   const app = findAppHarness({ dataDir });
@@ -416,9 +472,20 @@ export async function reachHarness({ dataDir, port = 4747, start = true, startOp
     log(`Started Harness for this step at ${srv.url} (stopped again at the end).`);
     return { base: srv.url, srv, running: null, close: async () => { await srv.close().catch(() => {}); } };
   } catch (e) {
-    if (e?.code === 'HARNESS_ALREADY_RUNNING' && e.url) return { base: e.url, srv: null, running: { url: e.url, pid: e.pid ?? null }, close: async () => {} };
-    if (e?.code === 'HARNESS_ALREADY_RUNNING' && e.transport === 'bridge') throw inAppError(e.pid);
-    throw e;
+    if (e?.code !== 'HARNESS_ALREADY_RUNNING') throw e;
+    // Another process holds the folder (it started after the check above, or its lock names another computer). The
+    // error's `url` comes from the lock file and is never used: look again the same way as above.
+    const other = lockElsewhere({ dataDir }) || (e.otherComputer ? { hostname: 'name unknown', pid: null } : null);
+    if (other) throw elsewhereError(other);
+    if (e.transport === 'bridge') throw inAppError(e.pid);
+    for (const until = Date.now() + raceWaitMs; ;) {
+      const found = await findRunningHarness({ dataDir, timeoutMs: 1000 });
+      if (found) return { base: found.url, srv: null, running: found, close: async () => {} };
+      const inApp = findAppHarness({ dataDir });
+      if (inApp) throw inAppError(inApp.pid);
+      if (Date.now() >= until) throw busyError(e.pid);
+      await sleep(250);
+    }
   }
 }
 

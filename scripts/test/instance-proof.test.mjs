@@ -7,8 +7,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { HarnessClient, passwordSource, reachHarness } from '../lib/harness-client.mjs';
-import { openDataKeyWithPassword, instanceProof } from '../lib/instance-proof.mjs';
+import { HarnessClient, passwordSource, reachHarness, bindingFor } from '../lib/harness-client.mjs';
+import { openDataKeyWithPassword, instanceProof, proofBinding } from '../lib/instance-proof.mjs';
 import { startFakeSecurity, writeTestVault } from './fake-security.mjs';
 import { Readable } from 'node:stream';
 import http from 'node:http';
@@ -40,10 +40,16 @@ test('the helpers: the password opens the key locally; the proof depends on key 
   assert.ok(k && k.equals(dek));
   assert.equal(await openDataKeyWithPassword(vault, 'not it at all'), null);
   const n = Buffer.alloc(32, 7);
-  assert.ok(instanceProof(dek, n, 'port:4747').equals(instanceProof(k, n, 'port:4747')));
-  assert.ok(!instanceProof(dek, n, 'port:4747').equals(instanceProof(dek, Buffer.alloc(32, 8), 'port:4747')));
-  assert.ok(!instanceProof(dek, n, 'port:4747').equals(instanceProof(Buffer.alloc(32, 1), n, 'port:4747')));
-  assert.ok(!instanceProof(dek, n, 'port:4747').equals(instanceProof(dek, n, 'port:4748')), 'bound to the port');
+  const at = (a, p) => proofBinding({ address: a, port: p });
+  assert.ok(instanceProof(dek, n, at('127.0.0.1', 4747)).equals(instanceProof(k, n, at('127.0.0.1', 4747))));
+  assert.ok(!instanceProof(dek, n, at('127.0.0.1', 4747)).equals(instanceProof(dek, Buffer.alloc(32, 8), at('127.0.0.1', 4747))));
+  assert.ok(!instanceProof(dek, n, at('127.0.0.1', 4747)).equals(instanceProof(Buffer.alloc(32, 1), n, at('127.0.0.1', 4747))));
+  assert.ok(!instanceProof(dek, n, at('127.0.0.1', 4747)).equals(instanceProof(dek, n, at('127.0.0.1', 4748))), 'bound to the port');
+  assert.ok(!instanceProof(dek, n, at('127.0.0.1', 4747)).equals(instanceProof(dek, n, at('127.0.0.2', 4747))), 'bound to the address');
+  assert.ok(!instanceProof(dek, n, at('127.0.0.1', 4747)).equals(instanceProof(dek, n, at('::1', 4747))), 'bound to the address (IPv6)');
+  assert.equal(bindingFor('http://127.0.0.1:4747'), 'addr:127.0.0.1:4747', 'the client binds to the literal address and port it connects to');
+  assert.throws(() => proofBinding({ address: 'localhost', port: 4747 }), /IP literal/);
+  assert.throws(() => instanceProof(dek, n, 'port:4747'), /binding/, 'the old port-only binding is gone');
 });
 
 test('a genuine unlocked instance found through the lock: proof verified first, then the password', async () => {

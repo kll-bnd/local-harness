@@ -24,7 +24,7 @@
 //                                            on stdin, so combine with --yes)
 import readline from 'node:readline/promises';
 import { createRequire } from 'node:module';
-import { HarnessClient, passwordSource, reachHarness, describeOfflineLock } from './lib/harness-client.mjs';
+import { HarnessClient, passwordSource, reachHarness, describeOfflineLock, safeFetch } from './lib/harness-client.mjs';
 
 const require = createRequire(import.meta.url);
 const { resolveDataDir } = require('../electron/lib/paths.cjs');
@@ -60,6 +60,7 @@ try {
     console.error(`${e.message}\nIn the app: Models → the model Harness recommends → "Download and set up" (it asks your password to allow internet access for the download).`);
     process.exit(1);
   }
+  if (e?.code === 'HARNESS_ELSEWHERE' || e?.code === 'HARNESS_BUSY') { console.error(e.message); process.exit(1); }
   console.error(`Harness could not start: ${e.message}\nRun: npm run doctor`);
   process.exit(1);
 }
@@ -215,7 +216,7 @@ running keeps it open until it ends), and this tool blocks it again as soon as t
 
 // ---------------------------------------------------------------------------------------------- pull
 async function pull(model) {
-  const res = await fetch(`${h.base}/api/models/pull`, { method: 'POST', headers: { 'content-type': 'application/json', ...client.authHeaders() }, body: JSON.stringify({ model, providerId: 'ollama' }) });
+  const res = await safeFetch(`${h.base}/api/models/pull`, { method: 'POST', headers: { 'content-type': 'application/json', ...client.authHeaders() }, body: JSON.stringify({ model, providerId: 'ollama' }) });
   if (!res.ok || !(res.headers.get('content-type') || '').includes('text/event-stream')) {
     const j = await res.json().catch(() => null);
     const code = j?.error?.code;

@@ -65,11 +65,13 @@ Never two writers. A second launch of the app itself just focuses its window (El
 lock). **The window only ever shows the backend this app started**, so when another process already holds the
 data folder the app does not load it, sends it nothing, and quits:
 
-1. It reads the backend's lock file `<data>/harness.lock`. A lock with `"transport": "bridge"` and a live pid is
-   **the native app's backend** (no address).
-2. Otherwise it asks the port the lock names `GET /api/health` (no session, no user data; nothing else is
-   probed, since a Harness on a nearby port may serve another folder). An answer as Harness is **a listener-mode
-   Harness** (`npm start`, `Harness.command`, the CLI).
+1. It reads the backend's lock file `<data>/harness.lock`. A lock whose `hostname` is not this Mac's was written
+   by **Harness on another computer** (a data folder on a shared volume): nothing it names is contacted. A lock with
+   `"transport": "bridge"` and a live pid is **the native app's backend** (no address).
+2. Otherwise it asks `GET /api/health` at `http://127.0.0.1:<the lock's port>` (no session, no user data; the
+   lock's `url` is never used, and a port that is not an integer 1–65535 is not asked; nothing else is probed, since
+   a Harness on a nearby port may serve another folder). An answer as Harness is **a listener-mode Harness**
+   (`npm start`, `Harness.command`, the CLI).
 3. If neither, it calls `startServer()`. When another launcher won the race, the backend's own lock rejects with
    `err.code === 'HARNESS_ALREADY_RUNNING'` (`err.pid`, `err.url`, `err.transport`) and the app treats it the same way.
 
@@ -80,12 +82,15 @@ with code 0 (the texts are in `lib/backend.cjs`, `alreadyOpenMessage()`):
 |---|---|
 | listener-mode Harness | Another Harness is using your data folder (process 4242, at http://127.0.0.1:8765). Use that one — or quit it and open this app again. |
 | the native app's backend | Harness is open in the Harness app (process 4242), which is using your data folder. Use that one — or quit it (⌘Q) and open this app again. |
+| Harness on another computer | Harness on another computer (other-mac) is using this data folder. Quit Harness there, then open this app again. (If Harness is not running there, the file harness.lock in the data folder is left over from it: delete that file.) |
 
-(`process <pid>` reads "another process" when the lock has no pid; ", at <url>" is left out while the other
-Harness has not published its address yet.) Nothing proves that whatever wrote the lock and answers `/api/health`
+(`process <pid>` reads "another process" when the lock has no pid; ", at <url>" is shown only as
+`http://127.0.0.1:<port>` rebuilt from a valid port, and left out otherwise.) Nothing proves that whatever wrote the lock and answers `/api/health`
 is the genuine Harness (any program running as the user can do both), so the app neither shows it (where the
 owner would type the password) nor sends it the `api-token`, a launch code or a cookie.
-`Harness.command` (`scripts/launch.mjs`) is different: it opens the system browser at a running instance.
+`Harness.command` (`scripts/launch.mjs`) is different: it opens the system browser at a running instance, at
+`http://127.0.0.1:<the lock's port>` only (a launch URL only when it is on that origin; no redirect is followed;
+a lock from another computer is reported, not contacted).
 
 ## Contract with the web UI
 
@@ -193,7 +198,9 @@ View with ⌥⌘J (⌥⌘I is the Inspector). File and Help also have "Show Data
   when its `dataDir` names this folder. Nothing there authenticates the instance: any program running as the user
   can write `harness.lock` and answer `/api/health`. The command-line tools therefore send the password to a
   Harness they did not start only after it proves it holds the data key (`POST /api/security/prove`, checked
-  against a key unwrapped locally from `vault.json`), and never to a locked one. The Electron shell cannot prove
+  against a key unwrapped locally from `vault.json` and bound to the address and port the tool connected to,
+  `addr:127.0.0.1:<port>`), and never to a locked one. They only ever contact `http://127.0.0.1:<port>` (never the
+  lock's `url`), not a lock from another computer, and follow no redirect. The Electron shell cannot prove
   an instance in password mode before the owner types the password, so it never loads or contacts one beyond that
   health check: it shows *Harness is already open* and quits (see *One data directory*). `Harness.command`
   (`scripts/launch.mjs`) still opens the system browser at whatever URL the lock names (and in keychain/off mode
@@ -268,7 +275,8 @@ Config: the `build` key in `package.json`. Highlights:
 
 **0.2: verified on Linux only** (Electron 44 under Xvfb, against the finished 0.2 backend). Unit tests for the 15-action menu
 contract, Lock Harness ⌃⌘L, instance detection by lock file + health, start-or-refuse (each holder, the race,
-the dialog texts, and a stand-in named by the lock receiving only `GET /api/health`); `npm run test:e2e` adds
+the dialog texts, a stand-in named by the lock receiving only `GET /api/health`, a lock from another computer
+never contacted, no address shown unless it is `http://127.0.0.1:<valid port>`); `npm run test:e2e` adds
 checks that run once the backend serves `/api/security`: setup with a throw-away password and a recovery key
 in the documented shape, the window's own session (`/api/auth/status` from the page), the session cookie
 being memory-only, data routes refused without a session, the `lock` menu action reaching the page, and an
@@ -297,7 +305,8 @@ window-state clamping, App Nap guard, instance detection and the start-or-refuse
 contract in a VM, packaging guards) and the full `npm run test:e2e` (also: IPC argument validation, remote
 requests cancelled, permissions denied, `ui.theme` → `nativeTheme`, the App Nap blocker held exactly during a
 fake-model generation; another holder of the data folder — a recording stand-in named by the lock, a real
-server found only through the backend's `HARNESS_ALREADY_RUNNING`, a native-app lock — giving the dialog text,
+server found only through the backend's `HARNESS_ALREADY_RUNNING`, a native-app lock, a lock from another computer
+(its stand-in receives nothing) — giving the dialog text,
 no window, exit code 0, the other server left running, and the stand-in receiving only `GET /api/health` with no
 `api-token`, launch code or cookie), from source and
 against the packaged Linux build; `bash -n` + `shellcheck` on `setup-macos.sh` and `Harness.command`, and

@@ -209,6 +209,8 @@ case "$STATE" in
     exit 1 ;;
   unknown|not_running:unknown)
     warn "Could not ask Harness about its state (see: npm run doctor)." ;;
+  elsewhere)
+    warn "This data folder is in use by Harness on another computer. Quit it there (npm run doctor names it)." ;;
   *)
     ok "A Harness password is set." ;;
 esac
@@ -228,6 +230,8 @@ else
   case "$STATE" in
     needs_setup|not_running:needs_setup|app:needs_setup)
       note "Skipped: choose your Harness password first (step 5), then run: npm run get-model" ;;
+    elsewhere)
+      note "Skipped: this data folder is in use by Harness on another computer (see: npm run doctor)." ;;
     app:*)
       note "Harness is open in the Harness app, which has no local address this script could use (by design)."
       note "Download the model in the app instead: Models → the recommended model → \"Download and set up\"."

@@ -31,7 +31,7 @@ process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1'; // the temporary backend below mu
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { resolveDataDir } = require('../electron/lib/paths.cjs');
-const { findRunningHarness, findAppHarness } = require('../electron/lib/instance.cjs');
+const { findRunningHarness, findAppHarness, lockElsewhere } = require('../electron/lib/instance.cjs');
 const { HarnessClient, passwordSource, readLaunchJson, describeOfflineLock } = await import('./lib/harness-client.mjs');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 
@@ -53,7 +53,9 @@ const isMac = process.platform === 'darwin';
 
 async function getJson(url, timeoutMs = 2500, { method = 'GET', headers = {}, body } = {}) {
   try {
-    const res = await fetch(url, { method, headers: body !== undefined ? { 'content-type': 'application/json', ...headers } : headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) });
+    // Never follow a redirect (requests may carry the session): a 3xx is a failed request.
+    const res = await fetch(url, { method, redirect: 'manual', headers: body !== undefined ? { 'content-type': 'application/json', ...headers } : headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) });
+    if (res.status >= 300 && res.status < 400) return { ok: false, status: res.status, error: 'redirect (not followed)' };
     if (!res.ok) return { ok: false, status: res.status, data: await res.json().catch(() => null) };
     return { ok: true, data: await res.json().catch(() => null) };
   } catch (e) {
@@ -144,7 +146,9 @@ const dataDir = resolveDataDir();
 const launch = readLaunchJson(dataDir);
 
 if (onlyState) {
-  // One word for scripts: needs_setup | locked | migrating | unlocked (running) or not_running:<what the disk says>.
+  // One word for scripts: needs_setup | locked | migrating | unlocked (running) or not_running:<what the disk says>,
+  // app:set | app:needs_setup (the native app), elsewhere (the lock names another computer: nothing is contacted).
+  if (lockElsewhere({ dataDir })) { console.log('elsewhere'); process.exit(0); }
   const running = await findRunningHarness({ dataDir, timeoutMs: 1500 }).catch(() => null);
   if (running) { console.log(running.state || 'unlocked'); process.exit(0); }
   if (findAppHarness({ dataDir })) {
@@ -202,10 +206,12 @@ try {
 add(writable ? 'ok' : 'fail', `Data folder: ${dataDir}`, writable ? '' : 'Not writable.', `Check permissions: ls -ld "${dataDir}"`);
 
 // ----------------------------------------------------------------------------- security and the blocker
-const running = writable ? await findRunningHarness({ dataDir, timeoutMs: 1500 }) : null;
+// A lock written on another computer: nothing it names is contacted, and no backend is started on the folder here.
+const elsewhere = writable ? lockElsewhere({ dataDir }) : null;
+const running = writable && !elsewhere ? await findRunningHarness({ dataDir, timeoutMs: 1500 }) : null;
 // The native app's backend has no local address: nothing can be asked of it, and no second backend may open the folder.
 const inApp = !running && writable ? findAppHarness({ dataDir }) : null;
-const probe = running || inApp ? null : (writable ? await probeDataDir() : null);
+const probe = running || inApp || elsewhere ? null : (writable ? await probeDataDir() : null);
 const runningSec = running ? (await getJson(`${running.url}/api/security`, 5000)).data : null;
 const secNow = runningSec || probe?.sec || null;
 const modeNames = { password: 'password (you type it to open Harness)', keychain: 'Keychain (opens without asking — weaker)', off: 'OFF — your data is stored unencrypted' };
@@ -220,6 +226,10 @@ if (running) {
       'Harness kept what it had recorded with your password (launch.json and vault.json can only make it MORE protective). If you did not edit these files, a program running as you did.',
       'Dismiss the notice in Settings → Privacy & security once you know why.');
   }
+} else if (elsewhere) {
+  add('warn', `This data folder is in use by Harness on another computer (${elsewhere.hostname})`,
+    'Its lock file names that computer, so nothing here connects to it and no Harness can open the folder on this Mac meanwhile.',
+    `Quit Harness on ${elsewhere.hostname}. If it is not running there, the lock is left over: delete "${path.join(dataDir, 'harness.lock')}".`);
 } else if (inApp) {
   add('info', `Harness is open in the Harness app (pid ${inApp.pid})`,
     'The app has no local address (by design), so this tool cannot ask it whether it is locked, run its internet self-test or see the loaded model.\n      In the app: Settings → Privacy & security shows the protection and the blocker, with the button "Check that nothing can get out".');

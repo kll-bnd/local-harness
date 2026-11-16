@@ -25,8 +25,11 @@ export async function writeTestVault(dataDir, password) {
  * @param {object} o
  * @param {'key'|'wrong'|'none'|'locked'} [o.prove='none']  how POST /api/security/prove answers: with the right proof
  *   (needs `dataKey`), a wrong one, 404 (no such route — an impostor or an old backend), or 423
+ * @param {string} [o.host='127.0.0.1']  the address to listen on (a relay test puts the genuine one elsewhere)
+ * @param {number} [o.port=0]
+ * @param {Record<string, string>} [o.redirect]  "METHOD /path" → a Location to answer 307 with (after recording)
  */
-export async function startFakeSecurity({ state = 'locked', mode = 'password', password = 'correct horse', honourTokenRequest = true, error = null, prove = 'none', dataKey = null } = {}) {
+export async function startFakeSecurity({ state = 'locked', mode = 'password', password = 'correct horse', honourTokenRequest = true, error = null, prove = 'none', dataKey = null, host = '127.0.0.1', port = 0, redirect = {} } = {}) {
   const f = {
     state, mode, password, failed: 0, sessions: new Set(), logouts: 0, unlockBodies: [], allowCalls: [], blockCalls: 0,
     received: [], // every request: { method, path, body } — to assert what an impostor got
@@ -51,13 +54,14 @@ export async function startFakeSecurity({ state = 'locked', mode = 'password', p
     const u = new URL(req.url, 'http://x');
     const p = `${req.method} ${u.pathname}`;
     f.received.push({ method: req.method, path: u.pathname, raw, headers: { ...req.headers } });
+    if (redirect[p]) { res.writeHead(307, { location: redirect[p] }); return res.end(); }
     if (p === 'POST /api/security/prove') {
       f.proveCalls.push(body);
       if (prove === 'none') return err(res, 404, 'not_found');
       if (prove === 'locked' || f.state === 'locked') return err(res, 423, 'locked');
       if (prove === 'wrong') return json(res, 200, { proof: crypto.randomBytes(32).toString('base64url') });
-      // Bound to the port the request arrived on, like the real route (a relay on another port cannot reuse it).
-      return json(res, 200, { proof: instanceProof(dataKey, Buffer.from(body.nonce, 'base64url'), proofBinding({ port: req.socket.localPort })).toString('base64url') });
+      // Bound to the address and port the request arrived on, like the real route (a relay elsewhere cannot reuse it).
+      return json(res, 200, { proof: instanceProof(dataKey, Buffer.from(body.nonce, 'base64url'), proofBinding({ address: req.socket.localAddress, port: req.socket.localPort })).toString('base64url') });
     }
     if (p === 'GET /api/health') return json(res, 200, { ok: true, name: 'harness', version: '0.2.0', state: f.state });
     if (p === 'GET /api/security') { if (f.migration) { f.migration.done++; if (f.migration.done >= f.migration.total) { f.migration = null; f.state = 'unlocked'; } } return json(res, 200, security(req)); }
@@ -95,8 +99,9 @@ export async function startFakeSecurity({ state = 'locked', mode = 'password', p
     if (p === 'GET /api/data') return json(res, 200, { secret: 'only with a session' });
     return err(res, 404, 'not_found');
   });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  f.url = `http://127.0.0.1:${server.address().port}`;
+  await new Promise((r, j) => { server.once('error', j); server.listen(port, host, r); });
+  f.url = `http://${host.includes(':') ? `[${host}]` : host}:${server.address().port}`;
+  f.port = server.address().port;
   f.close = () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); });
   return f;
 }
