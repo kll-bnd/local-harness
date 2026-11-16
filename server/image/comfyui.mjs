@@ -1,7 +1,7 @@
 // ComfyUI backend: queue an API-format workflow (built-in template or user-supplied with {{placeholders}}),
 // track progress over the /ws WebSocket when available, poll /history, fetch outputs from /view.
 import crypto from 'node:crypto';
-import { egressBlocked } from '../security/egress.mjs';
+import { egressBlocked, trackConnection, vetLocalhost } from '../security/egress.mjs';
 import { imageJson, imageRequest, sniffImageMime, formatNodeErrors } from './http.mjs';
 import { ProviderError } from '../lib/errors.mjs';
 import { sleep } from '../lib/util.mjs';
@@ -105,12 +105,16 @@ export class ComfyUIProvider {
     return j.subfolder ? `${j.subfolder}/${j.name}` : j.name;
   }
 
-  openProgressSocket(clientId, onProgress) {
+  async openProgressSocket(clientId, onProgress) {
     if (typeof WebSocket !== 'function') return null;
     try {
       const wsUrl = this.baseUrl.replace(/^http/, 'ws') + `/ws?clientId=${clientId}`;
       if (egressBlocked(wsUrl)) return null; // progress only; the job itself is refused with offline_lock
+      await vetLocalhost(new URL(wsUrl).hostname); // `localhost` must resolve to this Mac only
       const ws = new WebSocket(wsUrl);
+      // a remote ComfyUI's socket is closed as soon as internet access is blocked again
+      const untrack = trackConnection(wsUrl, () => ws.close());
+      ws.addEventListener?.('close', untrack);
       ws.onmessage = (ev) => {
         if (typeof ev.data !== 'string') return; // binary preview frames
         try {
@@ -143,7 +147,7 @@ export class ComfyUIProvider {
     const count = Math.max(1, p.count || 1);
     const clientId = crypto.randomUUID();
     let current = 0;
-    const ws = this.openProgressSocket(clientId, (pr) => onProgress?.({ ...pr, progress: Math.min(0.99, (current + pr.progress) / count), image: current + 1, images: count }));
+    const ws = await this.openProgressSocket(clientId, (pr) => onProgress?.({ ...pr, progress: Math.min(0.99, (current + pr.progress) / count), image: current + 1, images: count }));
     let promptId = null;
     const onAbort = () => { this.interrupt(promptId); };
     signal?.addEventListener('abort', onAbort, { once: true });

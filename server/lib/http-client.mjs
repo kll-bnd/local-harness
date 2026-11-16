@@ -10,7 +10,7 @@
 //          caller abort         → the signal's reason (DOMException name 'AbortError')
 import http from 'node:http';
 import https from 'node:https';
-import { assertEgress } from '../security/egress.mjs';
+import { assertEgress, isLocalhostName, loopbackOnlyLookup } from '../security/egress.mjs';
 
 const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 10000, maxSockets: 32 });
 const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 10000, maxSockets: 32 });
@@ -88,11 +88,13 @@ export function httpRequest(input, { method = 'GET', headers = {}, body, signal,
     let payload = body;
     if (typeof payload === 'string') payload = Buffer.from(payload);
     if (payload) h['content-length'] = payload.length;
+    // The name `localhost` is pinned: connect only if every address it resolves to is loopback.
+    const pin = !lookup && isLocalhostName(url.hostname) ? loopbackOnlyLookup : null;
     const req = mod.request(url, {
       method,
       headers: h,
       agent: agent !== undefined ? agent : lookup ? false : isHttps ? httpsAgent : httpAgent,
-      ...(lookup ? { lookup } : {}),
+      ...(lookup || pin ? { lookup: lookup || pin } : {}),
     });
     let settled = false;
     const onAbort = () => {

@@ -2,7 +2,7 @@
 // allow window (`offlineLockSuspendedUntil`). The in-code blocker (egress.mjs) is the feature; the OS sandbox around
 // an Ollama that Harness starts itself is a silent bonus reported as osEnforced/osScope.
 import { EventEmitter } from 'node:events';
-import { registerGuard, unregisterGuard } from './egress.mjs';
+import { registerGuard, unregisterGuard, closeBlockedConnections } from './egress.mjs';
 
 export const MAX_ALLOW_MINUTES = 120;
 const DOWNLOAD_GRACE_MS = 60 * 60 * 1000; // a download started inside the window may run on for up to an hour
@@ -94,5 +94,8 @@ export class NetworkGuard extends EventEmitter {
     this.timer.unref?.();
   }
 
-  _changed(reason) { this.emit('change', { reason, status: this.status() }); }
+  _changed(reason) {
+    if (this.blocked) closeBlockedConnections();
+    this.emit('change', { reason, status: this.status() });
+  }
 }
