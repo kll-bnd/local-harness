@@ -437,7 +437,7 @@ describe('Keychain items that are not ours', () => {
   test('a foreign item is never overwritten without the password, never deleted on a failed read, and only ours is deleted', async () => {
     const foreign = Buffer.alloc(32, 5);
     const kc = recorder(foreign);
-    let s = await stack({ keychain: kc, prepare: (dir) => fss.writeFileSync(path.join(dir, 'launch.json'), JSON.stringify({ version: 1, encryption: 'keychain' })) });
+    let s = await stack({ mode: 'keychain', keychain: kc, prepare: (dir) => fss.writeFileSync(path.join(dir, 'launch.json'), JSON.stringify({ version: 1, encryption: 'keychain' })) });
     const dataDir = s.dataDir;
     try {
       await s.setup();
