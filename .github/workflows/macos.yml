@@ -13,7 +13,7 @@ on:
         description: "Which jobs to run"
         type: choice
         default: all
-        options: [all, backend, live, ollama, nemotron]
+        options: [all, backend, desktop, live, ollama, nemotron]
       live_groups:
         description: "live-check groups to run"
         type: string
@@ -77,6 +77,46 @@ jobs:
           kill "$pid"
           wait "$pid" 2>/dev/null || true
           cat "$RUNNER_TEMP/server.log"
+
+  desktop:
+    name: Desktop app on macOS (Electron)
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'desktop' }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install developer dependencies
+        run: npm ci
+      - name: Desktop end-to-end, from source
+        run: npm run test:e2e
+      - name: Build Harness.app and the disk image
+        run: npm run dist
+      - name: Inspect the build
+        run: |
+          set -x
+          ls -la dist
+          du -sh dist/mac-arm64/Harness.app dist/*.dmg
+          file dist/mac-arm64/Harness.app/Contents/MacOS/Harness
+          codesign -dv --verbose=2 dist/mac-arm64/Harness.app 2>&1 | head -n 20
+          codesign --verify --deep --strict dist/mac-arm64/Harness.app && echo "signature verifies"
+          spctl --assess --type execute --verbose dist/mac-arm64/Harness.app || echo "spctl: not accepted (expected for an ad-hoc signature; a locally built app is not quarantined)"
+          plutil -p dist/mac-arm64/Harness.app/Contents/Info.plist | grep -E 'CFBundle(Name|Identifier|ShortVersionString|IconFile)|LSMinimumSystemVersion|LSApplicationCategoryType'
+      - name: Desktop end-to-end, packaged app
+        run: HARNESS_E2E_APP="$PWD/dist/mac-arm64/Harness.app/Contents/MacOS/Harness" npm run test:e2e
+      - name: UI tests in WebKit (Safari engine)
+        continue-on-error: true
+        run: |
+          npm install --no-save playwright > /dev/null 2>&1
+          npx playwright install webkit > /dev/null 2>&1
+          HARNESS_UI_BROWSER=webkit npm run test:ui 2>&1 | grep -E '^(not ok|# (tests|pass|fail))|^  +(error|message):' | head -n 80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Harness-mac-arm64
+          path: dist/*.dmg
+          retention-days: 7
 
   live:
     name: Live check against a real Ollama

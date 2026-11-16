@@ -20,7 +20,10 @@ import { startServer } from '../../server/index.mjs';
 import { deepMerge } from '../../server/lib/util.mjs';
 
 const require = createRequire(import.meta.url);
-const { chromium } = require('playwright');
+// HARNESS_UI_BROWSER=webkit runs the suite in the Safari engine (the browser fallback path on a Mac).
+const browserName = process.env.HARNESS_UI_BROWSER || 'chromium';
+const browserType = require('playwright')[browserName];
+if (!browserType) throw new Error(`Unknown HARNESS_UI_BROWSER "${browserName}" (use chromium, webkit or firefox)`);
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const GiB = 1024 ** 3;
 
@@ -95,7 +98,7 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
 
 let browserPromise = null;
 export function browser() {
-  browserPromise ||= chromium.launch();
+  browserPromise ||= browserType.launch();
   return browserPromise;
 }
 export async function closeBrowser() {
