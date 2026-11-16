@@ -323,3 +323,31 @@ describe('no image provider', () => {
     await waitFor(() => !h.app.engine.busy(chat));
   });
 });
+
+describe('A1111-compatible batches', () => {
+  const params = { prompt: 'three apples', negativePrompt: '', width: 64, height: 64, steps: 1, cfg: 1, seed: 7, count: 3 };
+
+  test('real A1111 puts a grid first: it is dropped, and batches run one image at a time', async () => {
+    const fake = await startFakeA1111({ port: 0, stepMs: 1 });
+    try {
+      const p = new A1111Provider({ id: 'a', name: 'A1111', kind: 'a1111', baseUrl: fake.url });
+      const r = await p.generate(params);
+      assert.equal(r.images.length, 3);
+      assert.deepEqual(r.seeds, [7, 8, 9]);
+      assert.deepEqual(r.images[0].buffer, makePng(64, 64, 7), 'first returned image is the first real image, not the grid');
+      assert.equal(fake.lastBody.batch_size, 1, 'never a parallel batch (peak memory)');
+      assert.equal(fake.lastBody.n_iter, 3);
+    } finally { await fake.close(); }
+  });
+
+  test('Draw Things naming (batch_count, no grid, no info index) yields exactly `count` images', async () => {
+    const fake = await startFakeA1111({ port: 0, stepMs: 1, drawThings: true });
+    try {
+      const p = new A1111Provider({ id: 'd', name: 'Draw Things', kind: 'a1111', baseUrl: fake.url });
+      const r = await p.generate(params);
+      assert.equal(r.images.length, 3);
+      assert.deepEqual(r.images[2].buffer, makePng(64, 64, 9));
+      assert.equal(fake.lastBody.batch_count, 3);
+    } finally { await fake.close(); }
+  });
+});

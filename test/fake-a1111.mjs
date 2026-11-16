@@ -41,7 +41,9 @@ export async function startFakeA1111({ port = 0, host = '127.0.0.1', stepMs = 5,
       if (!body.prompt) return sendJson(res, 422, { detail: [{ loc: ['body', 'prompt'], msg: 'field required' }] });
       if (p.endsWith('img2img') && !body.init_images?.length) return sendJson(res, 422, { detail: 'init_images required' });
       const steps = body.steps || 20;
-      const n = body.batch_size || 1;
+      // Real A1111: images = batch_size x n_iter, and with more than one image a grid is returned first.
+      // Real Draw Things: images = batch_size x batch_count, no grid.
+      const n = (body.batch_size || 1) * ((drawThings ? body.batch_count : body.n_iter) || 1);
       const seed = Number.isFinite(body.seed) && body.seed >= 0 ? body.seed : 1234;
       fake.state = { active: true, step: 0, steps, interrupted: false };
       for (let i = 1; i <= steps; i++) {
@@ -52,7 +54,12 @@ export async function startFakeA1111({ port = 0, host = '127.0.0.1', stepMs = 5,
       fake.state.active = false;
       const model = body.override_settings?.sd_model_checkpoint || body.model || fake.current.model;
       const imgs = Array.from({ length: n }, (_, i) => makePng(body.width || 512, body.height || 512, seed + i).toString('base64'));
-      return sendJson(res, 200, { images: imgs, parameters: body, info: JSON.stringify({ prompt: body.prompt, seed, all_seeds: imgs.map((_, i) => seed + i), sd_model_name: model, steps, cfg_scale: body.cfg_scale, width: body.width, height: body.height }) });
+      const grid = !drawThings && n > 1;
+      const info = { prompt: body.prompt, seed, all_seeds: imgs.map((_, i) => seed + i), sd_model_name: model, steps, cfg_scale: body.cfg_scale, width: body.width, height: body.height };
+      if (!drawThings) info.index_of_first_image = grid ? 1 : 0;
+      fake.lastBody = body;
+      if (grid) imgs.unshift(makePng(64, 64, 999999).toString('base64'));
+      return sendJson(res, 200, { images: imgs, parameters: body, info: JSON.stringify(info) });
     }
     sendJson(res, 404, { detail: 'Not Found' });
   });

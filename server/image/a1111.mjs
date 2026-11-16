@@ -57,9 +57,11 @@ export class A1111Provider {
       cfg_scale: p.cfg,
       guidance_scale: p.cfg, // Draw Things naming
       seed: p.seed,
-      batch_size: p.count,
-      batch_count: p.count, // Draw Things naming
-      n_iter: 1,
+      // One image per batch, `count` batches in sequence: running a batch in parallel multiplies peak
+      // memory, which an 8 GB Mac cannot afford. A1111/Forge call the batch count `n_iter`, Draw Things `batch_count`.
+      batch_size: 1,
+      n_iter: p.count,
+      batch_count: p.count,
     };
     if (p.sampler) { body.sampler_name = p.sampler; body.sampler = p.sampler; }
     if (p.model) {
@@ -99,14 +101,16 @@ export class A1111Provider {
         return { buffer, mime: sniffImageMime(buffer) };
       });
       if (!images.length) throw new ProviderError(`${this.name} returned no images`, { providerId: this.id });
-      let seeds = images.map((_, i) => p.seed + i);
-      try {
-        const info = typeof j.info === 'string' ? JSON.parse(j.info) : j.info;
-        if (Array.isArray(info?.all_seeds) && info.all_seeds.length) seeds = info.all_seeds.slice(0, images.length);
-        else if (Number.isFinite(info?.seed)) seeds = images.map((_, i) => info.seed + i);
-      } catch { /* keep requested seeds */ }
-      // A1111 can append a grid image when batch_size > 1; drop extras.
-      return { images: images.slice(0, Math.max(p.count, 1)), seeds };
+      const count = Math.max(p.count, 1);
+      let info = null;
+      try { info = typeof j.info === 'string' ? JSON.parse(j.info) : j.info; } catch { /* no usable info */ }
+      // With several images A1111 puts a contact-sheet grid FIRST and reports where the real images start.
+      const first = Number.isInteger(info?.index_of_first_image) ? info.index_of_first_image : Math.max(0, images.length - count);
+      const out = images.slice(first, first + count);
+      let seeds = out.map((_, i) => p.seed + i);
+      if (Array.isArray(info?.all_seeds) && info.all_seeds.length) seeds = info.all_seeds.slice(0, out.length);
+      else if (Number.isFinite(info?.seed)) seeds = out.map((_, i) => info.seed + i);
+      return { images: out, seeds };
     } finally {
       polling = false;
       signal?.removeEventListener('abort', onAbort);
