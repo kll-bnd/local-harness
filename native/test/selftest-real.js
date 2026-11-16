@@ -150,7 +150,11 @@
     const lock = net.body?.offlineLock || net.body;
     const viaHarness = await req('POST', '/api/models/pull', { model: 'all-minilm' }, { accept: 'text/event-stream' });
     const direct = await native('ollama', { path: '/api/pull', body: { model: 'all-minilm', stream: false }, timeout: 60 });
+    // The backend's own on-demand check (POST /api/network/test): code layer + the OS probe under the same profile.
+    const t = await req('POST', '/api/network/test', {});
+    const testResults = (t.body?.results || []).map((x) => `${x.layer}:${x.target}=${x.result}${x.detail ? ` (${String(x.detail).slice(0, 60)})` : ''}`);
     return {
+      networkTest: { status: t.status, blocked: t.body?.blocked, osEnforced: t.body?.osEnforced, results: testResults },
       ok: lock?.blocked === true && lock?.osEnforced === true && lock?.osScope === 'ollama' && viaHarness.status === 403 && !/"status":"success"/.test(direct.body || ''),
       blocked: lock?.blocked, osEnforced: lock?.osEnforced, osScope: lock?.osScope, pullThroughHarness: viaHarness.status, pullCode: viaHarness.body?.error?.code,
       directPullOnLoopback: `${direct.status} ${String(direct.body || direct.error).slice(0, 120)}`,
