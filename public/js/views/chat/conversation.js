@@ -1,6 +1,6 @@
 // The transcript: keyed turn reconciliation, lazy rendering of old turns, auto-scroll that respects the
 // user scrolling up, the compaction divider with an inline summary editor, and delegated message actions.
-import { h, copyText, delegate, mount, add } from '../../lib/dom.js';
+import { h, copyText, delegate, mount, add, focusWhenReady } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
 import { renderMarkdown } from '../../lib/markdown.js';
 import { fmtInt, plural, fmtRelative, modelLabel } from '../../lib/format.js';
@@ -191,7 +191,7 @@ export class ConversationView {
             h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: async () => {
               try { await api.chats.putSummary(this.model.id, ta.value); this.summaryEditing = false; await this.model.loadSummary(); this.model.refreshContext(); toast({ kind: 'success', message: 'Summary saved' }); } catch (e) { showError(e, 'save the summary'); }
             } } }, 'Save summary')));
-        requestAnimationFrame(() => ta.focus());
+        focusWhenReady(ta);
       } else {
         body = h('div.compaction-body',
           h('div.prose.summary-prose', renderMarkdown(s.content, { cacheKey: `s:${s.id}:${s.updatedAt}` })),

@@ -176,6 +176,20 @@ export function pickFiles({ accept = '', multiple = true } = {}) {
   });
 }
 
+/**
+ * Focus a freshly inserted field on the next frame and put the caret at the end — but only if nothing has
+ * happened to it meanwhile. A deferred caret move that lands in the middle of the user's first paste/typing
+ * (after select-all, before the text arrives) would otherwise append the new text to the old one.
+ */
+export function focusWhenReady(el, { caretAtEnd = true } = {}) {
+  const initial = el.value;
+  requestAnimationFrame(() => {
+    if (!el.isConnected || document.activeElement === el || el.value !== initial) return;
+    el.focus();
+    if (caretAtEnd && typeof el.setSelectionRange === 'function') { try { el.setSelectionRange(el.value.length, el.value.length); } catch { /* not a text field */ } }
+  });
+}
+
 /** Autosize a textarea to its content (bounded by CSS max-height). */
 export function autosize(ta) {
   ta.style.height = 'auto';

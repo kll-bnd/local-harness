@@ -1,7 +1,7 @@
 // Inspector (right panel) for the current chat: Context (meter, why this size, mode, compaction),
 // Memory (what was used, per-chat switches, pinned memories), Summary (view/edit/history) and Chat
 // (per-chat overrides: preset, system prompt, sampling, tools).
-import { h, debounce, mount, add } from '../lib/dom.js';
+import { h, debounce, mount, add, focusWhenReady } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtInt, fmtFull, fmtRelative, plural, truncate, modelLabel, modelShort } from '../lib/format.js';
 import { renderMarkdown } from '../lib/markdown.js';
@@ -236,7 +236,7 @@ export class Inspector {
 
   summaryEditor(m, s) {
     const ta = h('textarea.textarea.mono', { value: s.content, rows: 16, attrs: { 'aria-label': 'Summary' } });
-    requestAnimationFrame(() => ta.focus());
+    focusWhenReady(ta);
     return h('div.stack', ta, h('div.row', h('span.spacer'),
       h('button.btn.btn-small', { type: 'button', on: { click: () => { this.summaryEditing = false; this.renderNow(); } } }, 'Cancel'),
       h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: async () => {

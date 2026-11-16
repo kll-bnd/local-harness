@@ -312,3 +312,30 @@ test('race: a chat refetch requested before an edit, answered after it started, 
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });
+
+test('editing: text entered right after opening the editor replaces the old text (no deferred caret move)', async () => {
+  const stack = await startStack();
+  const app = await openApp(stack);
+  try {
+    const { page } = app;
+    await send(page, 'original question');
+    const user = lastTurn(page).locator('.msg-user');
+    await user.hover();
+    // Open the editor, select everything at once, let the next frame run, then "paste" — the order in which a
+    // fast user (or Playwright's fill) acts. A caret moved to the end on that frame would append instead.
+    const value = await page.evaluate(async () => {
+      document.querySelector('.turn:last-child .msg-user button[aria-label="Edit and resend"]').click();
+      const ta = document.querySelector('.msg-edit-input');
+      ta.focus();
+      ta.select();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      document.execCommand('insertText', false, 'replacement question');
+      return ta.value;
+    });
+    assert.equal(value, 'replacement question');
+    await user.locator('button', { hasText: 'Save & send' }).click();
+    await waitIdle(page);
+    await page.waitForFunction(() => /^You said: replacement question$/.test(document.querySelector('.turn:last-child .msg-assistant .prose')?.textContent.trim() || ''));
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});

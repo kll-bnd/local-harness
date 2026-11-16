@@ -1,7 +1,7 @@
 // One conversational turn: the user message and the assistant/tool chain that answers it, rendered as a
 // single block. TurnView reconciles keyed sub-views (one StepView per assistant step, one ToolCard per tool
 // call) so streaming only touches what changed, and finished markdown is rendered once (and cached).
-import { h, copyText, mount, add } from '../../lib/dom.js';
+import { h, copyText, mount, add, focusWhenReady } from '../../lib/dom.js';
 import { icon } from '../../lib/icons.js';
 import { StreamingMarkdown, renderMarkdown, renderUserMarkdown } from '../../lib/markdown.js';
 import { fmtTime, fmtFull, fmtInt, fmt1, fmtMs, fmtBytes, modelLabel, modelShort, plural, truncate } from '../../lib/format.js';
@@ -461,7 +461,7 @@ function editor(text, { label, submitLabel, hint, onCancel, onSubmit }) {
     h('span.faint.small.grow', hint),
     h('button.btn.btn-small', { type: 'button', on: { click: onCancel } }, 'Cancel'),
     h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: submit } }, submitLabel)));
-  requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });
+  focusWhenReady(ta);
   return el;
 }
 

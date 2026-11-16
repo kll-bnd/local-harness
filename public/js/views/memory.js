@@ -1,6 +1,6 @@
 // Memory: browse / search / filter, add, edit inline, pin, delete (with undo), review unverified memories,
 // the global switches, and a "what would be recalled?" tester.
-import { h, debounce, mount } from '../lib/dom.js';
+import { h, debounce, mount, focusWhenReady } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtRelative, plural, fmtFull, truncate } from '../lib/format.js';
 import { store, bus, patchSettings } from '../state.js';
@@ -96,7 +96,7 @@ export class MemoryView {
       if (ok) { this.adding = false; this.load(); }
     };
     ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey || !e.shiftKey)) { e.preventDefault(); save(); } if (e.key === 'Escape') { this.adding = false; this.render(); } });
-    requestAnimationFrame(() => ta.focus());
+    focusWhenReady(ta);
     return h('section.mem-add.card', ta, h('div.row', cat, h('label.row.small', pin, 'Pin (always include)'), h('span.spacer'),
       h('button.btn.btn-small', { type: 'button', on: { click: () => { this.adding = false; this.render(); } } }, 'Cancel'),
       h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: save } }, 'Save')));
@@ -140,7 +140,7 @@ export class MemoryView {
         }
       };
       ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); } if (e.key === 'Escape') { this.editing = null; this.render(); } });
-      requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });
+      focusWhenReady(ta);
       return h('div.mem-row.editing', { dataset: { memoryId: m.id } }, h('div.grow.stack', ta, h('div.row', cat, h('span.spacer'), h('button.btn.btn-small', { type: 'button', on: { click: () => { this.editing = null; this.render(); } } }, 'Cancel'), h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: save } }, 'Save'))));
     }
     return h(`div.mem-row${review ? '.review' : ''}`, { dataset: { memoryId: m.id } },
