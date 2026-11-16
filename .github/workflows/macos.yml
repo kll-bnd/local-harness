@@ -4,8 +4,8 @@ name: macOS verification
 # it runs on GitHub's Apple Silicon runners (M1-class, 7 GB RAM - close to an 8 GB MacBook)
 # and exercises the app against a real Ollama.
 #
-# Probe steps append to a report file that the last step prints, so the facts sit together at
-# the end of the job log.
+# The probe scripts print one compact line per fact as the last step of each job, so the facts
+# sit together at the end of the job log.
 on:
   workflow_dispatch:
     inputs:
@@ -71,21 +71,25 @@ jobs:
           cat "$RUNNER_TEMP/server.log"
 
   ollama:
-    name: Real Ollama API shapes
+    name: Real Ollama API behaviour
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'ollama' }}
     runs-on: macos-latest
     timeout-minutes: 30
     env:
       CHAT: qwen3:0.6b
       PLAIN: gemma3:270m
+      OLLAMA_LOG: ${{ runner.temp }}/ollama.log
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Install and start Ollama, pull tiny models
         run: |
           set -euo pipefail
           brew install ollama > /dev/null
           OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 \
-            nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+            nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
           for _ in $(seq 1 100); do
             curl -fsS "$O/api/version" > /dev/null 2>&1 && break
             sleep 0.3
@@ -93,159 +97,30 @@ jobs:
           ollama pull "$CHAT" > /dev/null 2>&1
           ollama pull "$PLAIN" > /dev/null 2>&1
       - name: Probes
-        run: |
-          set +e
-          exec > "$RUNNER_TEMP/report.txt" 2>&1
-          post() { curl -sS -m 300 "$O$1" -d "$2"; }
-          code() { curl -sS -m 300 -o "$RUNNER_TEMP/body.json" -w '%{http_code}' "$O$1" -d "$2"; }
-          INFO='with_entries(select(.key | test("architecture|context_length|block_count|head_count|key_length|value_length|embedding_length|sliding_window|parameter_count|file_type")))'
-
-          echo "## version $(curl -sS "$O/api/version")"
-          echo "## tags"
-          curl -sS "$O/api/tags" | jq -c '.models[] | {name, model, size, digest: .digest[0:12], details}'
-          for m in "$CHAT" "$PLAIN"; do
-            echo "## show $m"
-            post /api/show "{\"model\":\"$m\"}" | jq -c "{capabilities, details, parameters, model_info: (.model_info | $INFO)}"
-          done
-          echo "## show unknown -> HTTP $(code /api/show '{"model":"no-such-model:1"}') $(cat "$RUNNER_TEMP/body.json")"
-
-          echo "## chat stream think:true (first 4 lines, then last)"
-          post /api/chat "{\"model\":\"$CHAT\",\"think\":true,\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+2? Answer in one word.\"}],\"options\":{\"num_ctx\":2048,\"num_predict\":200}}" > "$RUNNER_TEMP/chat.ndjson"
-          head -n 4 "$RUNNER_TEMP/chat.ndjson"
-          echo "lines: $(wc -l < "$RUNNER_TEMP/chat.ndjson"); with thinking: $(grep -c '"thinking"' "$RUNNER_TEMP/chat.ndjson"); with content text: $(grep -c '"content":"[^"]' "$RUNNER_TEMP/chat.ndjson")"
-          tail -n 1 "$RUNNER_TEMP/chat.ndjson"
-          echo "## same prompt again, think:false, non-stream (is prompt_eval_count the full prompt with a warm cache?)"
-          post /api/chat "{\"model\":\"$CHAT\",\"think\":false,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+2? Answer in one word.\"}],\"options\":{\"num_ctx\":2048,\"num_predict\":50}}" | jq -c .
-          post /api/chat "{\"model\":\"$CHAT\",\"think\":false,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+2? Answer in one word.\"}],\"options\":{\"num_ctx\":2048,\"num_predict\":50}}" | jq -c 'del(.message)'
-          echo "## think:true on a model without thinking -> HTTP $(code /api/chat "{\"model\":\"$PLAIN\",\"think\":true,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"options\":{\"num_predict\":5}}") $(cat "$RUNNER_TEMP/body.json")"
-
-          echo "## keep_alive forms"
-          for ka in '"5m"' '300' '-1' '"-1"' '"30"' '"0"' '0'; do
-            echo "keep_alive=$ka -> HTTP $(code /api/chat "{\"model\":\"$CHAT\",\"stream\":false,\"keep_alive\":$ka,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"options\":{\"num_ctx\":2048,\"num_predict\":3}}") $(jq -c '{error, done_reason}' "$RUNNER_TEMP/body.json")"
-          done
-
-          echo "## ps vs num_ctx"
-          for ctx in 2048 8192 32768; do
-            post /api/chat "{\"model\":\"$CHAT\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"options\":{\"num_ctx\":$ctx,\"num_predict\":3}}" > /dev/null
-            echo "num_ctx=$ctx ps: $(curl -sS "$O/api/ps" | jq -c '.models[] | {name, size, size_vram, context_length, expires_at}') rss_kb: $(ps -axo rss=,comm= | awk '/ollama|llama/ {s+=$1} END {print s}')"
-          done
-          echo "## unload via /api/generate keep_alive 0"
-          start=$(date +%s)
-          post /api/generate "{\"model\":\"$CHAT\",\"keep_alive\":0}"
-          echo
-          for i in $(seq 1 150); do
-            if [ "$(curl -sS "$O/api/ps" | jq '.models | length')" = "0" ]; then echo "ps empty after ~$(( $(date +%s) - start ))s ($i polls of 0.2s)"; break; fi
-            sleep 0.2
-          done
-
-          TOOLS='[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
-          Q='{"role":"user","content":"What is the weather in Paris? Use the tool."}'
-          OPTS='"options":{"num_ctx":4096,"num_predict":200,"temperature":0}'
-          echo "## tool call non-stream"
-          post /api/chat "{\"model\":\"$CHAT\",\"think\":false,\"stream\":false,\"tools\":$TOOLS,\"messages\":[$Q],$OPTS}" | tee "$RUNNER_TEMP/tool.json" | jq -c .
-          echo "## tool call stream: lines carrying tool_calls, then last line"
-          post /api/chat "{\"model\":\"$CHAT\",\"think\":false,\"tools\":$TOOLS,\"messages\":[$Q],$OPTS}" > "$RUNNER_TEMP/toolstream.ndjson"
-          grep tool_calls "$RUNNER_TEMP/toolstream.ndjson" | head -n 3
-          tail -n 1 "$RUNNER_TEMP/toolstream.ndjson"
-          CALLS=$(jq -c '.message.tool_calls // []' "$RUNNER_TEMP/tool.json")
-          echo "## tool result round trip -> HTTP $(code /api/chat "{\"model\":\"$CHAT\",\"think\":false,\"stream\":false,\"tools\":$TOOLS,\"messages\":[$Q,{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":$CALLS},{\"role\":\"tool\",\"tool_name\":\"get_weather\",\"content\":\"18 C, sunny\"}],$OPTS}") $(jq -c '{message, error, done_reason}' "$RUNNER_TEMP/body.json")"
-          echo "## tools on a model without tool support -> HTTP $(code /api/chat "{\"model\":\"$PLAIN\",\"stream\":false,\"tools\":$TOOLS,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"options\":{\"num_predict\":5}}") $(cat "$RUNNER_TEMP/body.json")"
-          echo "## structured output (format = JSON schema)"
-          post /api/chat "{\"model\":\"$CHAT\",\"think\":false,\"stream\":false,\"format\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}},\"required\":[\"title\"]},\"messages\":[{\"role\":\"user\",\"content\":\"Give a short title for a chat about cooking pasta.\"}],\"options\":{\"num_ctx\":2048,\"num_predict\":60,\"temperature\":0}}" | jq -c '.message'
-          echo "## ollama server log: cache and memory lines"
-          grep -E 'cache|n_ctx |kv|KV|memory|offload' "$RUNNER_TEMP/ollama.log" | grep -v 'load_tensors' | sort | uniq -c | sort -rn | head -n 25
-      - name: Report
-        if: always()
-        run: cat "$RUNNER_TEMP/report.txt"
+        run: node scripts/ci/mac-probe.mjs api
 
   nemotron:
-    name: Nemotron 3.5 Bolt E4B on a 7 GB Mac
+    name: Nemotron 3.5 Bolt E4B on a Mac runner
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'nemotron' }}
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
-      TAG: ${{ inputs.nemotron_tag }}
+      TAG: ${{ inputs.nemotron_tag || 'UD-Q3_K_XL' }}
+      OLLAMA_LOG: ${{ runner.temp }}/ollama.log
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Install and start Ollama
         run: |
           set -euo pipefail
           brew install ollama > /dev/null
           OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 \
-            nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+            nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
           for _ in $(seq 1 100); do
             curl -fsS "$O/api/version" > /dev/null 2>&1 && break
             sleep 0.3
           done
-      - name: Which tags resolve on hf.co?
-        run: |
-          set +e
-          exec > "$RUNNER_TEMP/report.txt" 2>&1
-          echo "## machine: $(sysctl -n machdep.cpu.brand_string), RAM $(sysctl -n hw.memsize), $(sw_vers -productVersion), disk free $(df -h / | awk 'NR==2 {print $4}')"
-          echo "## hf.co registry manifests for $HF_REPO"
-          for tag in UD-Q3_K_XL Q3_K_XL UD-Q4_K_XL Q4_K_XL Q4_K_M Q3_K_M UD-IQ3_XXS UD-Q2_K_XL UD-IQ2_M latest; do
-            echo "$tag: $(curl -sS -m 30 -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' "https://hf.co/v2/$HF_REPO/manifests/$tag" | jq -c '{layers: [.layers[]? | {t: (.mediaType | sub("application/vnd.ollama.image.";"")), size}], error: (.errors // .error)}' 2>&1 | head -c 600)"
-          done
-      - name: Pull the model
-        run: |
-          set +e
-          exec >> "$RUNNER_TEMP/report.txt" 2>&1
-          M="hf.co/$HF_REPO:$TAG"
-          echo "## pull $M"
-          start=$(date +%s)
-          ollama pull "$M" > "$RUNNER_TEMP/pull.log" 2>&1
-          echo "exit $? after $(( $(date +%s) - start ))s; last line: $(tr '\r' '\n' < "$RUNNER_TEMP/pull.log" | tail -n 1 | cut -c1-200)"
-          curl -sS "$O/api/tags" | jq -c '.models[] | {name, model, size, digest: .digest[0:12], details}'
-          echo "disk free $(df -h / | awk 'NR==2 {print $4}')"
-      - name: Metadata, memory at several context sizes, tools, thinking, vision
-        run: |
-          set +e
-          exec >> "$RUNNER_TEMP/report.txt" 2>&1
-          M="hf.co/$HF_REPO:$TAG"
-          post() { curl -sS -m 900 "$O$1" -d "$2"; }
-          code() { curl -sS -m 900 -o "$RUNNER_TEMP/body.json" -w '%{http_code}' "$O$1" -d "$2"; }
-          mem() { echo "ps: $(curl -sS "$O/api/ps" | jq -c '.models[] | {size, size_vram, context_length}') | rss_kb ollama+runner: $(ps -axo rss=,comm= | awk '/ollama|llama/ {s+=$1} END {print s}') | $(sysctl -n vm.swapusage) | free pages $(vm_stat | awk '/Pages free/ {print $3}')"; }
-
-          echo "## show"
-          post /api/show "{\"model\":\"$M\"}" | jq -c '{capabilities, details, parameters, template: (.template // "" | .[0:200]), model_info: (.model_info | with_entries(select((.value | type) != "array")))}'
-
-          echo "## memory vs num_ctx (each: one short chat, then ps and process RSS)"
-          for ctx in 2048 4096 8192 16384; do
-            r=$(post /api/chat "{\"model\":\"$M\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in five words.\"}],\"options\":{\"num_ctx\":$ctx,\"num_predict\":16}}")
-            echo "num_ctx=$ctx -> $(echo "$r" | jq -c '{content: .message.content, thinking: (.message.thinking // null | if . then .[0:80] else null end), error, done_reason, load_s: ((.load_duration // 0) / 1e9), prompt_eval_count, prompt_tps: (if (.prompt_eval_duration // 0) > 0 then (.prompt_eval_count / (.prompt_eval_duration / 1e9)) else null end), eval_count, eval_tps: (if (.eval_duration // 0) > 0 then (.eval_count / (.eval_duration / 1e9)) else null end)}')"
-            mem
-          done
-
-          echo "## a longer prompt at num_ctx 8192 (prompt processing speed, token count)"
-          LONG=$(python3 -c "print(' '.join(['The quick brown fox jumps over the lazy dog.'] * 300))")
-          post /api/chat "{\"model\":\"$M\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"$LONG Reply with OK.\"}],\"options\":{\"num_ctx\":8192,\"num_predict\":8}}" | jq -c '{content: .message.content, error, prompt_eval_count, prompt_s: ((.prompt_eval_duration // 0) / 1e9), eval_count, eval_s: ((.eval_duration // 0) / 1e9)}'
-          echo "chars in prompt: ${#LONG}"
-          mem
-          echo "## switch to a different conversation and back (does the prompt cache grow RSS?)"
-          post /api/chat "{\"model\":\"$M\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Name three colours.\"}],\"options\":{\"num_ctx\":8192,\"num_predict\":16}}" | jq -c '{content: .message.content, prompt_eval_count}'
-          mem
-          post /api/chat "{\"model\":\"$M\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"$LONG Reply with OK.\"}],\"options\":{\"num_ctx\":8192,\"num_predict\":8}}" | jq -c '{content: .message.content, prompt_eval_count, prompt_s: ((.prompt_eval_duration // 0) / 1e9)}'
-          mem
-
-          TOOLS='[{"type":"function","function":{"name":"generate_image","description":"Generate an image from a text prompt","parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}},{"type":"function","function":{"name":"get_current_time","description":"Get the current date and time","parameters":{"type":"object","properties":{}}}}]'
-          OPTS='"options":{"num_ctx":4096,"num_predict":300,"temperature":0}'
-          echo "## tool call: 'Draw me a red fox in the snow.' -> HTTP $(code /api/chat "{\"model\":\"$M\",\"stream\":false,\"tools\":$TOOLS,\"messages\":[{\"role\":\"user\",\"content\":\"Draw me a red fox in the snow.\"}],$OPTS}") $(jq -c '{message, error, done_reason}' "$RUNNER_TEMP/body.json")"
-          CALLS=$(jq -c '.message.tool_calls // []' "$RUNNER_TEMP/body.json")
-          echo "## tool result round trip -> HTTP $(code /api/chat "{\"model\":\"$M\",\"stream\":false,\"tools\":$TOOLS,\"messages\":[{\"role\":\"user\",\"content\":\"Draw me a red fox in the snow.\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":$CALLS},{\"role\":\"tool\",\"tool_name\":\"generate_image\",\"content\":\"Image generated and shown to the user.\"}],$OPTS}") $(jq -c '{message, error, done_reason}' "$RUNNER_TEMP/body.json")"
-          echo "## tool call stream: lines carrying tool_calls"
-          post /api/chat "{\"model\":\"$M\",\"tools\":$TOOLS,\"messages\":[{\"role\":\"user\",\"content\":\"What time is it?\"}],$OPTS}" | grep tool_calls | head -n 2
-          echo "## think:true -> HTTP $(code /api/chat "{\"model\":\"$M\",\"think\":true,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 3?\"}],$OPTS}") $(jq -c '{thinking: (.message.thinking // null | if . then .[0:200] else null end), content: .message.content, error}' "$RUNNER_TEMP/body.json")"
-          echo "## think:false -> HTTP $(code /api/chat "{\"model\":\"$M\",\"think\":false,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 3?\"}],$OPTS}") $(jq -c '{thinking: (.message.thinking // null), content: .message.content, error}' "$RUNNER_TEMP/body.json")"
-          echo "## no think param: raw content (inline reasoning tags?)"
-          post /api/chat "{\"model\":\"$M\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 3?\"}],$OPTS}" | jq -c '{thinking: (.message.thinking // null | if . then .[0:200] else null end), content: .message.content}'
-          echo "## structured output"
-          post /api/chat "{\"model\":\"$M\",\"stream\":false,\"format\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}},\"required\":[\"title\"]},\"messages\":[{\"role\":\"user\",\"content\":\"Give a short title for a chat about cooking pasta.\"}],\"options\":{\"num_ctx\":2048,\"num_predict\":60,\"temperature\":0}}" | jq -c '.message'
-          echo "## image input (8x8 red PNG)"
-          PNG=$(python3 -c "import zlib,struct,base64;w=h=8;raw=b''.join(b'\x00'+b'\xff\x00\x00'*w for _ in range(h));c=lambda t,d:struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff);print(base64.b64encode(b'\x89PNG\r\n\x1a\n'+c(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+c(b'IDAT',zlib.compress(raw))+c(b'IEND',b'')).decode())")
-          echo "HTTP $(code /api/chat "{\"model\":\"$M\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"What colour is this image? One word.\",\"images\":[\"$PNG\"]}],\"options\":{\"num_ctx\":4096,\"num_predict\":20}}") $(jq -c '{content: .message.content, error, prompt_eval_count}' "$RUNNER_TEMP/body.json")"
-          mem
-          echo "## ollama server log: memory, cache, context and error lines"
-          grep -E 'cache|n_ctx|kv_|KV|memory|offload|mmproj|clip|draft|error|warn|swa' "$RUNNER_TEMP/ollama.log" | grep -v 'load_tensors:.*Mapped' | sed -E 's/^time=[^ ]+ //' | cut -c1-220 | sort | uniq -c | sort -rn | head -n 60
-      - name: Report
-        if: always()
-        run: cat "$RUNNER_TEMP/report.txt"
+      - name: Probes
+        run: node scripts/ci/mac-probe.mjs nemotron
