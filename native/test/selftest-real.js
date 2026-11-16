@@ -209,6 +209,28 @@
     return { ok: r.status === 200 && unlocked && found && again.status === 200 && (again.types.done || 0) === 1, status: r.status, appSawUnlocked: unlocked, chatStillThere: found, stream: again };
   }, 300000);
 
+  await check('attachmentUploadAndImageShown', async () => {
+    // A real PNG (4×3 px) uploaded as a File (the app's fetch shim sends its bytes), then shown from harness://.
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAQAAAADCAIAAAA7ljmRAAAAEElEQVR4nGM4EaABRww4OQAsNg8BoqhHXQAAAABJRU5ErkJggg=='), (c) => c.charCodeAt(0));
+    const file = new File([png], 'pixel.png', { type: 'image/png' });
+    const up = await fetch(`/api/attachments?name=pixel.png&chatId=${encodeURIComponent(chatId)}`, { method: 'POST', headers: { 'content-type': 'image/png' }, body: file });
+    const a = (await up.json()).attachment;
+    const shown = await new Promise((resolve) => { const i = new Image(); i.onload = () => resolve({ w: i.naturalWidth, h: i.naturalHeight }); i.onerror = () => resolve(null); i.src = `/api/attachments/${encodeURIComponent(a?.id)}/content`; document.body.append(i); });
+    return { ok: up.status === 201 && a?.size === png.length && shown?.w === 4 && shown?.h === 3, status: up.status, size: a?.size, shown };
+  });
+
+  await check('chatExportSavedThroughBridge', async () => {
+    const wait = native('awaitDownload');
+    const a = document.createElement('a');
+    a.href = `/api/chats/${encodeURIComponent(chatId)}/export?format=markdown`;
+    a.download = 'chat.md';
+    document.body.append(a);
+    a.click();
+    a.remove();
+    const d = await wait;
+    return { ok: !d.error && /\.md$/.test(d.name || '') && d.size > 50, download: { name: d.name, size: d.size, error: d.error } };
+  });
+
   await check('sleepAndScreenLockLock', async () => {
     await native('sleep');
     const a = await waitFor(async () => (await native('state')).locked === true, 15000);
