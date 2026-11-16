@@ -3,7 +3,7 @@
 import { OllamaProvider } from './ollama.mjs';
 import { OpenAICompatProvider } from './openai.mjs';
 import { normalizeOllamaShow, normalizeOpenAIModel } from './model-info.mjs';
-import { RECOMMENDED_MODELS, EMBEDDING_NAME_RE } from './catalog.mjs';
+import { RECOMMENDED_MODELS, EMBEDDING_NAME_RE, smallerVariantFor } from './catalog.mjs';
 import { computeContextPlan } from '../context/sizing.mjs';
 import { defaultOllamaUrl } from '../store/settings.mjs';
 import { HttpError, ProviderError } from '../lib/errors.mjs';
@@ -194,13 +194,38 @@ export class ProviderRegistry {
     this._modelsCache = null;
   }
 
+  /**
+   * What a loaded model (an Ollama /api/ps entry) really occupies. /api/ps `size` excludes the weights on current
+   * Ollama, so: the latest real measurement at this context, else model file + ps size (ps size ≥ file means it
+   * already includes the weights, e.g. CPU mode). Returns { residentBytes, residentBasis }.
+   */
+  async residentFor(provider, psEntry) {
+    const tag = await this.findModel(psEntry.model, provider.id).catch(() => null);
+    const file = tag?.sizeBytes || 0;
+    const e = this.measurements?.get(provider.id, psEntry.model);
+    const ok = (e?.samples || []).filter((x) => !x.pressure?.signal && (!psEntry.contextLength || x.numCtx === psEntry.contextLength));
+    const latest = ok[ok.length - 1];
+    if (latest && (!file || !e.sizeBytes || e.sizeBytes === file)) return { residentBytes: latest.totalBytes, residentBasis: 'measured' };
+    const ps = Number(psEntry.sizeBytes) || 0;
+    if (!file) return { residentBytes: ps || null, residentBasis: 'ps' };
+    return { residentBytes: ps >= file ? ps : file + ps, residentBasis: 'file+ps' };
+  }
+
   /** Which KV cache precision the Ollama server is (probably) using. */
   kvCacheType(settings) {
+    return this.kvCacheTypeInfo(settings).type;
+  }
+
+  /**
+   * KV precision and where it comes from: the user's setting, the environment Harness gave the Ollama it started,
+   * or — for an Ollama Harness did not start, whose environment it cannot see — f16 assumed (the largest, so RAM
+   * estimates err on the safe side).
+   */
+  kvCacheTypeInfo(settings) {
     const t = settings.context?.kvCacheType;
-    if (t && t !== 'auto') return t;
-    if (this.ollamaProcess?.managed) return settings.ollama?.flashAttention !== false ? (settings.ollama?.kvCacheType || 'f16') : 'f16';
-    const envT = process.env.OLLAMA_KV_CACHE_TYPE;
-    return envT && ['q8_0', 'q4_0', 'f16'].includes(envT) ? envT : 'f16';
+    if (t && t !== 'auto') return { type: t, source: 'setting' };
+    if (this.ollamaProcess?.managed) return { type: settings.ollama?.flashAttention !== false ? (settings.ollama?.kvCacheType || 'f16') : 'f16', source: 'managed' };
+    return { type: 'f16', source: 'assumed' };
   }
 
   /**
@@ -210,7 +235,8 @@ export class ProviderRegistry {
   async contextPlan(provider, model, s, { info, otherModelsBytes = 0, modeOverride } = {}) {
     info ||= await this.modelInfo(provider, model);
     const mode = modeOverride ?? s.context?.mode ?? 'auto';
-    const kvCacheType = this.kvCacheType(s);
+    const kvInfo = this.kvCacheTypeInfo(s);
+    const kvCacheType = kvInfo.type;
     // Real /api/ps measurements of this exact model build (digest + size) at this KV precision.
     const measurements = provider.kind === 'ollama' && this.measurements && s.context?.useMeasurements !== false
       ? this.measurements.samplesFor(provider.id, model, { digest: info.digest, sizeBytes: info.sizeBytes, kvCacheType })
@@ -232,6 +258,8 @@ export class ProviderRegistry {
       kvCacheType,
       otherModelsBytes,
       measurements,
+      kvCacheTypeSource: provider.kind === 'ollama' ? kvInfo.source : null,
+      smaller: smallerVariantFor(model, { totalMem: this.system?.totalMem, sizeBytes: info.sizeBytes }),
     });
     plan.providerId = provider.id;
     plan.model = model;

@@ -42,11 +42,23 @@ export function overheadBytes(modelBytes) {
   return Math.round(256 * MiB + 0.03 * (modelBytes || 0));
 }
 
-function sumOrScalar(v, layers) {
-  if (Array.isArray(v)) return { total: v.reduce((a, b) => a + (Number(b) || 0), 0), avg: v.reduce((a, b) => a + (Number(b) || 0), 0) / (v.length || 1) };
-  const n = Number(v) || 0;
+/**
+ * Per-layer metadata may be a scalar or an array. A non-verbose /api/show can blank or truncate long arrays, so an
+ * array only counts when it has one positive number per layer; otherwise its positive entries' average (or the
+ * fallback) is used — a missing/empty array never turns the estimate into 0 bytes.
+ */
+function sumOrScalar(v, layers, fallback = 0) {
+  if (Array.isArray(v)) {
+    const nums = v.map(Number).filter((x) => Number.isFinite(x) && x > 0);
+    if (nums.length && nums.length >= layers) { const t = nums.slice(0, layers).reduce((a, b) => a + b, 0); return { total: t, avg: t / layers }; }
+    const avg = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : Number(fallback) || 0;
+    return { total: avg * layers, avg };
+  }
+  const n = Number(v) || Number(fallback) || 0;
   return { total: n * layers, avg: n };
 }
+
+const firstNum = (v) => (Array.isArray(v) ? v.map(Number).find((x) => Number.isFinite(x) && x > 0) : Number(v)) || 0;
 
 /**
  * KV-cache cost model from architecture metadata.
@@ -55,17 +67,17 @@ function sumOrScalar(v, layers) {
 export function kvCacheModel(arch = {}, profile = {}, kvCacheType = 'f16') {
   const bpe = KV_BYTES[kvCacheType] ?? 2;
   const layers = Number(arch.blockCount) || 0;
-  const headCount = Number(Array.isArray(arch.headCount) ? arch.headCount[0] : arch.headCount) || 0;
+  const headCount = firstNum(arch.headCount);
   const emb = Number(arch.embeddingLength) || 0;
-  if (!layers || (!headCount && !arch.keyLength)) {
+  if (!layers || (!headCount && !firstNum(arch.keyLength))) {
     // Heuristic fallback: ~16 KiB/token per billion params at f16 (Llama-3-8B ≈ 128 KiB/token).
     const paramsB = arch.parameterCount ? arch.parameterCount / 1e9 : 7;
     const perToken = Math.round(16384 * paramsB * (bpe / 2));
     return { perToken, fixedFor: () => 0, fullLayers: null, swaLayers: 0, window: null, source: 'heuristic' };
   }
-  const headDimK = Number(arch.keyLength) || (headCount ? emb / headCount : 0);
-  const headDimV = Number(arch.valueLength) || headDimK;
-  const kvHeads = sumOrScalar(arch.headCountKv ?? headCount, layers);
+  const headDimK = firstNum(arch.keyLength) || (headCount ? emb / headCount : 0);
+  const headDimV = firstNum(arch.valueLength) || headDimK;
+  const kvHeads = sumOrScalar(arch.headCountKv ?? headCount, layers, headCount);
   let effectiveLayers = layers;
   if (arch.sharedKvLayers && arch.sharedKvLayers < layers) effectiveLayers = layers - Number(arch.sharedKvLayers);
 
@@ -73,11 +85,11 @@ export function kvCacheModel(arch = {}, profile = {}, kvCacheType = 'f16') {
   let window = Number(arch.slidingWindow) || null;
   let globalEvery = null;
   let globalLayers = null;
-  if (Array.isArray(arch.slidingWindowPattern)) {
-    // true = sliding layer
+  if (Array.isArray(arch.slidingWindowPattern) && arch.slidingWindowPattern.length >= effectiveLayers) {
+    // true = sliding layer (an empty / truncated array is ignored: the profile's layout is used instead)
     const pat = arch.slidingWindowPattern.slice(0, effectiveLayers);
     globalLayers = pat.filter((x) => !x).length;
-  } else if (Number(arch.slidingWindowPattern) > 1) {
+  } else if (!Array.isArray(arch.slidingWindowPattern) && Number(arch.slidingWindowPattern) > 1) {
     globalEvery = Number(arch.slidingWindowPattern);
   } else if (profile?.swa) {
     globalEvery = profile.swa.globalEvery;
@@ -111,9 +123,31 @@ const median = (arr) => {
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 };
 
-/** True when a sample shows part of the model resident outside the GPU (Ollama `size_vram < size`). */
+/**
+ * True when a sample shows part of the model running on the CPU: Ollama's /api/ps `size_vram < size`
+ * (`cpuBytes` = size − size_vram), compared with the resident total.
+ */
 export function isCpuSplit(sample) {
+  if (Number.isFinite(sample?.cpuBytes)) return sample.cpuBytes > Math.max(64 * MiB, 0.03 * (sample.totalBytes || 0));
   return Number.isFinite(sample?.vramBytes) && sample.vramBytes >= 0 && sample.vramBytes < sample.totalBytes * 0.97;
+}
+
+/** Samples whose load made macOS swap/compress (RSS then under-reports: never used as a size). */
+export const isPressured = (smp) => !!smp?.pressure?.signal;
+
+/**
+ * The smallest context at which loading pushed the machine into swap, unless a later clean sample at that context
+ * or more shows it fits now (other apps closed). Returns { numCtx, sample } or null.
+ */
+export function pressureLimit(samples) {
+  let worst = null;
+  for (const smp of samples || []) {
+    if (!isPressured(smp)) continue;
+    const cleared = samples.some((o) => !isPressured(o) && o.loaded && o.numCtx >= smp.numCtx && String(o.at || '') > String(smp.at || ''));
+    if (cleared) continue;
+    if (!worst || smp.numCtx < worst.numCtx) worst = { numCtx: smp.numCtx, sample: smp };
+  }
+  return worst;
 }
 
 /**
@@ -131,6 +165,7 @@ export function fitMeasurements(samples, { estModelOnly, perToken, modelBytes = 
   const ok = [];
   let rejected = 0;
   for (const smp of samples) {
+    if (isPressured(smp)) { rejected++; continue; } // RSS under-reports while macOS swaps: not a size
     const n = Number(smp.numCtx);
     const M = Number(smp.totalBytes);
     if (!Number.isFinite(n) || !Number.isFinite(M) || n < 256 || M <= 0) { rejected++; continue; }
@@ -198,6 +233,8 @@ export function computeContextPlan(p) {
     system = {}, memoryFraction = null, kvCacheType = 'f16',
     otherModelsBytes = 0,
     measurements = null,
+    kvCacheTypeSource = null, // 'setting' | 'managed' | 'assumed' (Ollama not started by Harness: f16 assumed)
+    smaller = null, // next smaller recommended file { model, approxSizeBytes, textOnly } (for "too big" advice)
   } = p;
   const totalMem = system.totalMem;
   const budget = memoryBudget({ totalMem, platform: system.platform, arch: system.arch, memoryFraction });
@@ -278,6 +315,32 @@ export function computeContextPlan(p) {
       limitedBy = 'memory';
     }
   }
+  let autoNote = '';
+  // Loading at some context made macOS swap / compress: come down (auto), or warn (explicit).
+  const pLimit = measurements?.length ? pressureLimit(measurements) : null;
+  if (pLimit) {
+    const what = describePressure(pLimit.sample.pressure);
+    if (effMode === 'auto') {
+      if (pLimit.numCtx <= MIN_CTX) {
+        numCtx = MIN_CTX;
+        limitedBy = 'memory_pressure';
+        warnings.push({
+          code: 'model_too_big',
+          message: `This model file (${formatBytes(modelBytes)}) is too big for this ${machine}: even the minimum ${formatTokensK(MIN_CTX)} context made macOS swap (${what}).${smaller ? ` Use a smaller file: ${smaller.model} (${formatBytes(smaller.approxSizeBytes)}${smaller.textOnly ? ' as a text-only copy' : ''}).` : ' Use a smaller model.'}`,
+          ...(smaller ? { smallerModel: smaller.model } : {}),
+        });
+      } else {
+        const cap = Math.max(MIN_CTX, roundCtx(pLimit.numCtx / 2));
+        if (numCtx > cap) {
+          numCtx = cap;
+          limitedBy = 'memory_pressure';
+          autoNote = `Loading this model at ${formatTokensK(pLimit.numCtx)} made macOS swap (${what}); auto mode reduced the window to ${formatTokensK(numCtx)}. `;
+        }
+      }
+    } else if (numCtx >= pLimit.numCtx) {
+      warnings.push({ code: 'memory_pressure', message: `Loading this model at ${formatTokensK(pLimit.numCtx)} made macOS swap (${what}). Your context setting was kept: lower it or switch to auto.` });
+    }
+  }
   const total = estimate(numCtx);
   const fits = total <= budget.budgetBytes;
   if (!modelFits) {
@@ -287,7 +350,6 @@ export function computeContextPlan(p) {
   }
 
   // Bad outcomes seen in the latest real measurement.
-  let autoNote = '';
   if (corr?.latest) {
     const L = corr.latest;
     const over = L.totalBytes + otherModelsBytes > budget.budgetBytes;
@@ -296,7 +358,7 @@ export function computeContextPlan(p) {
     const fitK = formatTokensK(Math.max(MIN_CTX, roundCtx(Math.min(fitMax, modelMax))));
     if (effMode === 'auto' && (over || split) && !atOrAbove) {
       const what = [over ? `over the safe budget of ${formatBytes(budget.budgetBytes)}` : null, split ? `${formatBytes(L.totalBytes - L.vramBytes)} of it on the CPU` : null].filter(Boolean).join(', ');
-      autoNote = `Measured ${formatBytes(L.totalBytes)} at ${formatTokensK(L.numCtx)} (${what}); auto mode reduced the window to ${formatTokensK(numCtx)} using that measurement. `;
+      autoNote += `Measured ${formatBytes(L.totalBytes)} at ${formatTokensK(L.numCtx)} (${what}); auto mode reduced the window to ${formatTokensK(numCtx)} using that measurement. `;
     } else if (atOrAbove) {
       const explicit = effMode !== 'auto';
       if (over) {
@@ -310,13 +372,14 @@ export function computeContextPlan(p) {
     }
   }
 
+  const totalNow = total;
   const maxTotal = estimate(modelMax);
   const alternatives = {
     max: { numCtx: modelMax, estimatedTotalBytes: maxTotal, fits: maxTotal <= budget.budgetBytes, overBudgetBytes: Math.max(0, maxTotal - budget.budgetBytes) },
     fitMax: Math.min(fitMax, modelMax),
   };
 
-  const est = `${corr ? 'measured-corrected' : 'est.'} ${formatBytes(total)} of ${formatBytes(totalMem)} RAM (safe budget ${formatBytes(budget.budgetBytes)})`;
+  const est = `${corr ? 'measured-corrected' : 'est.'} ${formatBytes(totalNow)} of ${formatBytes(totalMem)} RAM (safe budget ${formatBytes(budget.budgetBytes)})`;
   const modelSize = corr ? corr.fixedBytes : modelBytes;
   let explanation;
   if (!modelFits && effMode === 'auto') {
@@ -325,14 +388,25 @@ export function computeContextPlan(p) {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — limited by RAM${corr?.gpuCapBytes && gpuFitMax !== null && gpuFitMax <= fitMax ? ' (what fits on the GPU)' : ''}; ${est}. Max mode (${formatTokensK(modelMax)}) would need ~${formatBytes(maxTotal)}${alternatives.max.fits ? '' : ' and would likely swap'}.`;
   } else if (limitedBy === 'user') {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context (manual); ${est}.`;
+  } else if (limitedBy === 'memory_pressure') {
+    explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — limited by what this ${machine} handled without swapping; ${est}.`;
   } else if (limitedBy === 'low_ram_cap') {
-    explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — capped for responsiveness on this ${machine} (RAM would allow ~${formatTokensK(roundCtx(Math.min(fitMax, modelMax)))}; raise context.lowRamCap or use max mode for more); ${est}.`;
+    explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — capped for responsiveness on this ${machine} (RAM alone would allow ~${formatTokensK(roundCtx(Math.min(fitMax, modelMax)))}; raise context.lowRamCap or use max mode for more); ${est}.`;
   } else if (limitedBy === 'setting') {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context (capped by the auto-mode limit setting); ${est}.`;
   } else {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context (model max); ${est}.${!fits && effMode === 'max' ? ' Over budget: may swap.' : ''}`;
   }
   explanation = autoNote + explanation;
+  // Models like Nemotron (gemma4: 4 global KV layers) need little RAM per token: say that the file decides.
+  const kvMaxBytes = kv.perToken * modelMax + kv.fixedFor(modelMax);
+  const contextCheap = modelBytes > 0 && kvMaxBytes < 0.25 * modelBytes;
+  if (contextCheap && limitedBy !== 'model' && limitedBy !== 'user') {
+    explanation += ` Context is cheap for this model (the full ${formatTokensK(modelMax)} needs only ~${formatBytes(kvMaxBytes)} of KV cache); the model file (${formatBytes(modelBytes)}) is what decides whether it fits.`;
+  }
+  if (kvCacheTypeSource === 'assumed') {
+    explanation += ' KV cache precision unknown (this Ollama was not started by Harness): assuming f16 to be safe — set context.kvCacheType if you know it.';
+  }
   if (corr) {
     explanation += ` Memory use is calibrated from ${corr.samples} measurement${corr.samples === 1 ? '' : 's'} of this model (last: ${formatBytes(corr.latest.totalBytes)} at ${formatTokensK(corr.latest.numCtx)}).`;
   }
@@ -340,9 +414,11 @@ export function computeContextPlan(p) {
   return {
     numCtx, mode: effMode, modelMax, modelMaxSource, advertisedMax, limitedBy, fits, fitMax: Math.min(fitMax, 10_000_000),
     memory: {
-      ...memBase, modelBytes, overheadBytes: overhead, kvBytesPerToken: kv.perToken, kvFixedBytes: kv.fixedFor(numCtx), kvCacheType, kvSource: kv.source,
+      ...memBase, modelBytes, overheadBytes: overhead, kvBytesPerToken: kv.perToken, kvFixedBytes: kv.fixedFor(numCtx), kvCacheType, kvCacheTypeSource, kvSource: kv.source,
+      kvMaxBytes, contextCheap,
+      pressure: pLimit ? { numCtx: pLimit.numCtx, ...pLimit.sample.pressure } : null,
       kvLayers: { full: kv.fullLayers, slidingWindow: kv.swaLayers, window: kv.window },
-      kvBytes: kv.perToken * numCtx + kv.fixedFor(numCtx), otherModelsBytes, estimatedTotalBytes: total,
+      kvBytes: kv.perToken * numCtx + kv.fixedFor(numCtx), otherModelsBytes, estimatedTotalBytes: totalNow,
       basis: corr ? 'measured' : 'estimate',
       measurement: fit ? {
         method: fit.method, samples: fit.samples, distinctContexts: fit.distinctContexts, rejected: fit.rejected,
@@ -353,6 +429,14 @@ export function computeContextPlan(p) {
     },
     alternatives, warnings, explanation,
   };
+}
+
+function describePressure(p = {}) {
+  const parts = [];
+  if (p.swapDeltaBytes > 0) parts.push(`+${formatBytes(p.swapDeltaBytes)} swap`);
+  if (p.compressedDeltaBytes > 0) parts.push(`+${formatBytes(p.compressedDeltaBytes)} compressed`);
+  if (!parts.length && p.level >= 2) parts.push(`memory pressure level ${p.level}`);
+  return parts.join(', ') || 'memory pressure';
 }
 
 /**

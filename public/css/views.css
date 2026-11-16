@@ -214,3 +214,15 @@ html.ready .boot-splash { display: none; }
   .rec-head { flex-direction: column; }
   .rec-tags { max-width: none; justify-content: flex-start; }
 }
+
+/* guided text-only setup (8 GB) */
+.flow { margin-top: 8px; padding: 10px 12px; border-radius: var(--r-md); background: var(--bg-subtle); box-shadow: inset 0 0 0 0.5px var(--rule); display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.flow-head { display: flex; gap: 6px; align-items: flex-start; color: var(--fg-2); line-height: 1.45; }
+.flow-head .icon { margin-top: 2px; color: var(--accent-text); flex: none; }
+.flow .progress { width: 100%; }
+.flow-steps { flex-direction: column; gap: 6px; }
+.flow-steps li + li::before { display: none; }
+.variant.guided { align-items: flex-start; }
+.model-id { max-width: 360px; }
+.models-table td.num, .models-table th { white-space: nowrap; }
+.models-table .caps { flex-wrap: wrap; max-width: 170px; }

@@ -19,7 +19,7 @@ export function registerSystemRoutes(r, app) {
     for (const p of app.registry.all()) {
       const st = await app.registry.status(p);
       if (!st.ok) continue;
-      for (const m of await p.ps().catch(() => [])) loaded.push({ providerId: p.id, ...m });
+      for (const m of await p.ps().catch(() => [])) loaded.push({ providerId: p.id, ...m, ...(await app.registry.residentFor(p, m).catch(() => ({}))) });
     }
     const sys = app.system;
     return {

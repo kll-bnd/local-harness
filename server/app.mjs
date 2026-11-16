@@ -12,6 +12,7 @@ import { AttachmentStore } from './store/attachments.mjs';
 import { Calibrator } from './context/tokens.mjs';
 import { MeasurementStore } from './context/measurements.mjs';
 import { LoadFailures } from './providers/load-failure.mjs';
+import { createMemoryProbe } from './system/memory-probe.mjs';
 import { ModelCopies } from './providers/text-only.mjs';
 import { ProviderRegistry } from './providers/registry.mjs';
 import { OllamaProcess } from './providers/ollama-process.mjs';
@@ -79,6 +80,8 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.presets = await new PresetStore(dataDir, bus).load();
   app.calibrator = await new Calibrator(dataDir).load();
   app.measurements = await new MeasurementStore(dataDir, bus).load();
+  // What the machine really experiences (runner RSS, swap/compressor growth) — macOS only; tests inject a fake.
+  app.memoryProbe = sysOverrides && 'memoryProbe' in sysOverrides ? sysOverrides.memoryProbe : createMemoryProbe({ platform: app.system.platform });
   app.ollamaProcess = new OllamaProcess({ getSettings: () => app.settings.get(), getProvider: () => app.registry.ollama() || { baseUrl: 'http://127.0.0.1:11434', status: async () => ({ ok: false }) }, bus, totalMem: app.system.totalMem });
   app.registry = new ProviderRegistry({ settings: app.settings, bus, system: app.system, autodetect, ollamaProcess: app.ollamaProcess });
   app.registry.measurements = app.measurements;

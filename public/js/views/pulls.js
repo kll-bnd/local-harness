@@ -33,8 +33,8 @@ export function activePulls() {
   return Object.values(store.get('pulls') || {}).filter((p) => !p.done);
 }
 
-export async function pullModel({ model, providerId }) {
-  if (local.has(model)) return;
+export async function pullModel({ model, providerId, quiet = false }) {
+  if (local.has(model)) return false;
   const controller = new AbortController();
   let key = `local:${model}:${Date.now()}`;
   local.set(model, { controller, key });
@@ -59,16 +59,19 @@ export async function pullModel({ model, providerId }) {
     if (r.aborted) {
       setPull(key, { status: 'aborted', done: true });
       toast({ message: `Download of ${modelLabel(model)} cancelled`, id: `pull-${model}` });
+      return false;
     } else if (failed) {
       toast({ kind: 'error', message: `Couldn't download ${modelLabel(model)}`, detail: failed.message, id: `pull-${model}` });
-    } else {
-      toast({ kind: 'success', message: `${modelLabel(model)} is ready`, id: `pull-${model}` });
-      dropModelInfo();
-      await Promise.allSettled([loadModels({ refresh: true }), loadRecommended(), loadSystem()]);
+      return false;
     }
+    if (!quiet) toast({ kind: 'success', message: `${modelLabel(model)} is ready`, id: `pull-${model}` });
+    dropModelInfo();
+    await Promise.allSettled([loadModels({ refresh: true }), loadRecommended(), loadSystem()]);
+    return true;
   } catch (e) {
     setPull(key, { status: 'error', error: e.message, done: true });
     showError(e, `download ${modelLabel(model)}`);
+    return false;
   } finally {
     local.delete(model);
     store.set('pulls', { ...(store.get('pulls') || {}) });

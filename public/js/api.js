@@ -154,6 +154,10 @@ export const models = {
   loaded: () => get('/api/models/loaded'),
   embeddings: () => get('/api/embeddings/status'),
   measurements: (r) => get(`/api/models/measurements${qs(ref(r))}`),
+  /** Text-only copies of multimodal models (same weights, no vision/audio projector; ~1 GB less RAM). */
+  textOnlyCopies: () => get('/api/models/text-only'),
+  createTextOnly: ({ model, providerId, name } = {}) => post('/api/models/text-only', { model, providerId, name }),
+  removeTextOnly: (r) => del(`/api/models/text-only${qs(ref(r))}`),
   resetMeasurements: (r) => del(`/api/models/measurements${qs(ref(r))}`),
 };
 

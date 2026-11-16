@@ -132,7 +132,12 @@ export class MemoryView {
       const ta = h('textarea.textarea', { value: m.content, rows: Math.max(2, Math.ceil(m.content.length / 80)), attrs: { 'aria-label': 'Memory' } });
       const cat = h('select.select.input-small', { attrs: { 'aria-label': 'Category' } }, CATS.map((c) => h('option', { value: c, selected: c === m.category }, CAT_LABEL[c])));
       const save = async () => {
-        try { await api.memories.update(m.id, { content: ta.value.trim(), category: cat.value }); this.editing = null; this.load(); } catch (e) { showError(e, 'save the memory'); }
+        const body = { content: ta.value.trim(), category: cat.value };
+        try { await api.memories.update(m.id, body); this.editing = null; this.load(); } catch (e) {
+          if (e.code === 'secret_detected' && await confirmDialog({ title: 'This looks like a password or API key', message: `${e.message}\n\nMemories are added to prompts in future chats and included in backups. Save it anyway?`, confirmLabel: 'Save anyway', danger: true })) {
+            try { await api.memories.update(m.id, { ...body, ...secretOverride(e) }); this.editing = null; this.load(); } catch (e2) { showError(e2, 'save the memory'); }
+          } else if (e.code !== 'secret_detected') showError(e, 'save the memory');
+        }
       };
       ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); } if (e.key === 'Escape') { this.editing = null; this.render(); } });
       requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });

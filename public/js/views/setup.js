@@ -3,8 +3,9 @@
 // budget, the image backend (pointer to Draw Things' API server) and embeddings.
 import { h, mount } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
-import { fmtBytes, fmtTokens, modelLabel } from '../lib/format.js';
-import { store, loadRecommended, chatModels, ollamaStatus, loadSystem, loadModels, patchSettings } from '../state.js';
+import { fmtBytes, fmtTokens, modelLabel, modelShort } from '../lib/format.js';
+import { store, loadRecommended, chatModels, ollamaStatus, loadSystem, loadModels, patchSettings, findModel } from '../state.js';
+import { textOnlyFlow } from './model-flows.js';
 import { runAction } from '../actions.js';
 import { navigate } from '../router.js';
 import { pullModel, pullFor, cancelPull } from './pulls.js';
@@ -49,7 +50,9 @@ export class SetupView {
     // 1. backend
     let backendBody;
     if (running) {
+      const prot = process?.protections;
       backendBody = h('div.stack', h('p', `Ollama ${provider.version || ''} is running at `, h('code', provider.baseUrl), process?.managed ? ' (started by Harness).' : '.'),
+        prot && prot.inEffect === false ? h('div.callout.warn.small', icon('warning'), h('div.grow', h('div', h('b', 'Memory protections are not in effect. ')), h('div', prot.message))) : null,
         others.length ? h('p.muted', `Also found: ${others.map((p) => p.name).join(', ')}.`) : null);
     } else if (process?.installed) {
       backendBody = h('div.stack', h('p', 'Ollama is installed but not running.'), h('div.row', h('button.btn.btn-primary', { type: 'button', on: { click: () => runAction('start-ollama') } }, icon('power', { size: 14 }), 'Start Ollama'), h('span.faint.small', process.binaryPath)),
@@ -122,29 +125,44 @@ export class SetupView {
 
 /** A recommended model with its variants and fit estimates; shared with the Models page. */
 export function recCard(r, machine) {
-  const suggested = r.variants.find((v) => v.model === r.suggestedVariant) || r.variants[0];
-  const pull = pullFor(suggested.model);
-  const installedVariant = r.variants.find((v) => v.installed);
   const def = store.get('defaultModel');
   const lowRam = machine?.ramTier === 'low';
   const variantRow = (v) => {
     const p = pullFor(v.model);
     const isDefault = def?.model === v.model;
-    return h(`div.variant${v.model === r.suggestedVariant ? '.suggested' : ''}`,
+    const t = v.textOnly;
+    const guided = !!(t && t.recommended);
+    const originalInstalled = !!findModel({ model: v.model });
+    const badges = [
+      v.model === r.suggestedVariant ? h('span.badge.accent', 'best fit') : null,
+      v.lowRam === 'comfortable' && v.model !== r.suggestedVariant ? h('span.badge', 'comfortable') : null,
+      v.lowRam === 'largest_realistic' || v.model === r.largestRealisticVariant ? h('span.badge.warn', 'largest realistic') : null,
+      !v.estimate.fits ? h('span.badge.warn', 'too large') : null,
+      originalInstalled ? h('span.badge', 'downloaded') : null,
+      t?.installed ? h('span.badge', 'text-only copy') : null,
+      isDefault ? h('span.badge.outline', 'default') : null,
+    ];
+    let action = null;
+    if (guided) action = null; // the flow below carries the actions
+    else if (p && !p.done) action = pullProgress(p);
+    else if (originalInstalled) action = !isDefault ? h('button.btn.btn-small', { type: 'button', on: { click: async () => { try { await patchSettings({ defaultModel: { providerId: v.providerId || 'ollama', model: v.model } }); await loadModels(); toast({ kind: 'success', message: `Default model: ${modelShort(v.model, 40)}` }); } catch (e) { showError(e, 'set the default model'); } } } }, 'Make default') : null;
+    else action = h(`button.btn.btn-small${v.model === r.suggestedVariant ? '.btn-primary' : ''}`, { type: 'button', on: { click: () => pullModel({ model: v.model }) } }, icon('download', { size: 13 }), 'Download');
+    return h(`div.variant${v.model === r.suggestedVariant ? '.suggested' : ''}${guided ? '.guided' : ''}`, { dataset: { variant: v.model } },
       h('div.grow',
-        h('div.row', h('b', v.label), v.model === r.suggestedVariant ? h('span.badge.accent', 'best fit') : null, !v.estimate.fits ? h('span.badge.warn', 'too large') : null, v.installed ? h('span.badge', 'installed') : null, isDefault ? h('span.badge.outline', 'default') : null),
+        h('div.row-wrap', h('b', v.label), ...badges),
         h('div.faint.small.mono.ellipsis', { title: v.model }, v.model),
-        h('div.small.muted', `${fmtBytes(v.approxSizeBytes)} · ${fmtTokens(v.estimate.numCtx)} context here`),
-        h('div.small.variant-expl', v.estimate.explanation)),
-      p && !p.done ? pullProgress(p)
-        : v.installed
-          ? (!isDefault ? h('button.btn.btn-small', { type: 'button', on: { click: async () => { try { await patchSettings({ defaultModel: { providerId: v.providerId || 'ollama', model: v.model } }); await loadModels(); toast({ kind: 'success', message: `Default model: ${modelLabel(v.model)}` }); } catch (e) { showError(e, 'set the default model'); } } } }, 'Make default') : null)
-          : h(`button.btn.btn-small${v.model === r.suggestedVariant ? '.btn-primary' : ''}`, { type: 'button', on: { click: () => pullModel({ model: v.model }) } }, icon('download', { size: 13 }), 'Download'));
+        h('div.small.muted', `${fmtBytes(v.approxSizeBytes)} download${t?.recommended ? ` · ${fmtBytes(t.approxSizeBytes)} as a text-only copy` : ''} · ${fmtTokens(v.estimate.numCtx)} context here`),
+        h('div.small.variant-expl', v.estimate.explanation),
+        guided && (v.estimate.fits || v.model === r.suggestedVariant || originalInstalled || t.installed) ? textOnlyFlow(v) : null,
+        guided && !(v.estimate.fits || v.model === r.suggestedVariant || originalInstalled || t.installed) ? h('div.faint.small', 'Not usable on this Mac, even as a text-only copy.') : null),
+      action);
   };
+  // On small machines lead with the honest note and the variants that actually fit.
+  const variants = lowRam ? [...r.variants].sort((a, b) => (a.model === r.suggestedVariant ? -1 : b.model === r.suggestedVariant ? 1 : 0) || (b.estimate.fits - a.estimate.fits)) : r.variants;
   return h('article.rec-card', { dataset: { rec: r.id } },
     h('div.rec-head', h('div.grow', h('h3.h3', r.name), h('p.small.muted', r.description)), h('div.row-wrap.rec-tags', (r.tags || []).map((t) => h(`span.badge${t === 'recommended' ? '.accent' : ''}`, t)))),
-    h('div.variants', r.variants.map(variantRow)),
-    lowRam && !installedVariant && !pull ? h('p.faint.small', 'On 8 GB the smaller quantization leaves room for a useful context window; the default quant would be squeezed to 2K.') : null);
+    r.lowRamNote ? h('div.callout.accent.small', icon('chip'), h('span', r.lowRamNote)) : null,
+    h('div.variants', variants.map(variantRow)));
 }
 
 export function pullProgress(p) {

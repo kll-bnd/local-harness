@@ -19,6 +19,19 @@ export function explainError(err, context = '') {
     }
     case 'no_model':
       return { title: 'No chat model is installed', detail: 'Download a model to start chatting — Harness suggests one that fits this Mac.', action: { label: 'Choose a model', run: () => runAction('open-setup') } };
+    case 'model_load_failed': {
+      const steps = err.details?.nextSteps || err.nextSteps || [];
+      const first = steps.find((s) => s.action !== 'retry');
+      return {
+        title: "The model couldn't start",
+        detail: msg,
+        action: first ? { label: first.action === 'create_text_only_copy' ? 'Make a text-only copy' : first.action === 'use_smaller_file' ? 'Use a smaller file' : 'Try again', run: () => import('./next-steps.js').then((m) => m.runNextStep(first)) } : { label: 'Models', run: () => runAction('open-models') },
+      };
+    }
+    case 'secret_detected':
+      return { title: 'That looks like a password or key', detail: msg };
+    case 'memory_protected':
+      return { title: 'That memory is protected', detail: msg };
     case 'model_not_found':
       return { title: "That model isn't installed", detail: msg, action: { label: 'Open Models', run: () => runAction('open-models') } };
     case 'provider_not_found':

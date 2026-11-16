@@ -24,7 +24,8 @@ export class ImageService {
   /** Should the chat model be unloaded before generating? */
   decideUnload({ mode, loaded, familyBytes }) {
     const totalMem = this.app.system.totalMem;
-    const loadedBytes = loaded.reduce((a, m) => a + (m.sizeBytes || 0), 0);
+    // Resident footprint (file + non-weights, or measured), never Ollama's ps `size` alone (it excludes the weights).
+    const loadedBytes = loaded.reduce((a, m) => a + (m.residentBytes ?? m.sizeBytes ?? 0), 0);
     const base = { loadedBytes, imageModelBytes: familyBytes, totalBytes: totalMem, mode };
     if (!loaded.length) return { unload: false, reason: 'nothing_loaded', ...base };
     if (mode === 'never') return { unload: false, reason: 'setting_never', ...base };
@@ -141,6 +142,7 @@ export class ImageService {
       const ollama = this.app.registry.ollama();
       let loaded = [];
       if (ollama && (await this.app.registry.status(ollama)).ok) loaded = await ollama.ps().catch(() => []);
+      loaded = await Promise.all(loaded.map(async (m) => ({ ...m, ...(await this.app.registry.residentFor(ollama, m).catch(() => ({}))) })));
       const decision = this.decideUnload({ mode: s.image.unloadChatModel, loaded, familyBytes: imageFamilyFor(familyName).approxBytes });
       job.memory = { ...decision, unloaded: [] };
       if (decision.unload) {

@@ -1,7 +1,7 @@
 // ComfyUI backend: queue an API-format workflow (built-in template or user-supplied with {{placeholders}}),
 // track progress over the /ws WebSocket when available, poll /history, fetch outputs from /view.
 import crypto from 'node:crypto';
-import { imageJson, imageRequest, sniffImageMime } from './http.mjs';
+import { imageJson, imageRequest, sniffImageMime, formatNodeErrors } from './http.mjs';
 import { ProviderError } from '../lib/errors.mjs';
 import { sleep } from '../lib/util.mjs';
 
@@ -155,7 +155,7 @@ export class ComfyUIProvider {
           count: 1, denoise: p.denoise ?? 0.6, model: model || '', sampler: p.sampler || p.comfy?.sampler || 'euler', scheduler: p.scheduler || p.comfy?.scheduler || 'normal', image,
         });
         const q = await imageJson(this, '/prompt', { method: 'POST', body: { prompt: workflow, client_id: clientId }, signal, timeoutMs: 30000 });
-        if (q.node_errors && Object.keys(q.node_errors).length) throw new ProviderError(`${this.name}: workflow error ${JSON.stringify(q.node_errors).slice(0, 300)}`, { status: 400, providerId: this.id });
+        if (q.node_errors && Object.keys(q.node_errors).length) throw Object.assign(new ProviderError(`${this.name}: workflow error: ${formatNodeErrors(q.node_errors)}`, { status: 400, code: 'workflow_invalid', providerId: this.id }), { nodeErrors: q.node_errors });
         promptId = q.prompt_id;
         if (!promptId) throw new ProviderError(`${this.name}: no prompt_id returned`, { providerId: this.id });
         let entry = null;

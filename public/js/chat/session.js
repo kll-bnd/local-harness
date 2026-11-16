@@ -158,6 +158,7 @@ export function describeLive(model) {
   for (const t of model.tool.values()) {
     if (t.status !== 'running') continue;
     if (t.phase === 'unloading') return { label: 'Unloading chat model to make room…', phase: 'unloading' };
+    if (t.phase === 'queued' && t.message) return { label: t.message.replace(/…?$/, '…'), phase: 'waiting' };
     if (t.phase === 'unloaded' || t.phase === 'starting' || t.phase === 'queued') return { label: 'Preparing image…', phase: 'image' };
     if (t.phase === 'generating') return { label: t.steps ? `Generating image · step ${t.step}/${t.steps}` : 'Generating image…', phase: 'image', progress: t.progress };
     if (t.phase === 'saving') return { label: 'Saving image…', phase: 'image', progress: 1 };
@@ -165,6 +166,10 @@ export function describeLive(model) {
   }
   const since = (t) => Math.max(0, Math.round((Date.now() - (t || l.startedAt)) / 1000));
   const mac = /darwin/.test(store.get('system')?.machine?.platform || '') ? 'this Mac' : 'this machine';
+  if (l.modelStatus?.phase === 'waiting') {
+    const s = since(l.modelStatus.at);
+    return { label: `${(l.modelStatus.message || 'Waiting for image generation to finish').replace(/…$/, '')}… ${s} s`, phase: 'waiting', hint: s >= 5 ? `On ${mac} the chat model and image generation take turns, so they never compete for memory.` : null };
+  }
   if (l.modelStatus?.phase === 'loading') {
     const s = since(l.modelStatus.at);
     return { label: `${l.modelStatus.message?.replace(/…$/, '') || 'Reloading the chat model'}… ${s} s`, phase: 'loading', hint: s >= 5 ? `Loading a model into memory takes 20–60 s on ${mac}. This is normal.` : null };
@@ -256,7 +261,7 @@ function handleEvent(model, ev) {
         const secs = model.reloadStarted ? (Date.now() - model.reloadStarted) / 1000 : null;
         addTrail(model, { key: 'reload', icon: 'regenerate', text: `Reloaded the chat model after the image${secs != null && secs >= 0.1 ? ` (${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s)` : ''}` });
       }
-      setLive(model, { modelStatus: ev.phase === 'loading' ? { ...ev, at: Date.now() } : null, ...(ev.phase === 'ready' ? { stepStartedAt: Date.now() } : {}) });
+      setLive(model, { modelStatus: ev.phase === 'loading' || ev.phase === 'waiting' ? { ...ev, at: model.live?.modelStatus?.phase === ev.phase ? model.live.modelStatus.at : Date.now() } : null, ...(ev.phase === 'ready' ? { stepStartedAt: Date.now() } : {}) });
       changed(model, model.live?.assistantId);
       break;
     }
@@ -351,7 +356,7 @@ function handleEvent(model, ev) {
     }
     case 'error': {
       const m = ev.messageId ? model.byId.get(ev.messageId) : model.byId.get(model.live?.assistantId);
-      if (m) { m.status = ev.code === 'aborted' ? 'aborted' : 'error'; m.error = ev.message; m.errorCode = ev.code; }
+      if (m) { m.status = ev.code === 'aborted' ? 'aborted' : 'error'; m.error = ev.message; m.errorCode = ev.code; if (ev.nextSteps) m.nextSteps = ev.nextSteps; }
       model.lastError = ev;
       changed(model, m?.id);
       break;

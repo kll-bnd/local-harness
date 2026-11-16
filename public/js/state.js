@@ -68,7 +68,11 @@ export async function loadArchived() {
 export async function loadRecommended() {
   const r = await api.models.recommended();
   // Teach the formatter the catalog's friendly names for every known variant.
-  registerModelNames(r.models.flatMap((m) => m.variants.map((v) => [v.model, { name: m.name, tag: (v.label || '').replace(/\s*\(.*\)$/, '').replace(/^Default quant$/i, '') }])));
+  const tagOf = (v) => (v.label || '').replace(/\s*\(.*\)$/, '').replace(/^Default quant$/i, '');
+  registerModelNames(r.models.flatMap((m) => m.variants.flatMap((v) => [
+    [v.model, { name: m.name, tag: tagOf(v) }],
+    ...(v.textOnly?.model ? [[v.textOnly.model, { name: m.name, tag: `${tagOf(v) ? `${tagOf(v)} ` : ''}text-only` }]] : []),
+  ])));
   store.set('recommended', r);
   return r;
 }

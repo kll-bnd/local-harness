@@ -9,6 +9,7 @@ import { openMenu, toast } from '../../ui/overlays.js';
 import { openLightbox } from '../../ui/lightbox.js';
 import { explainError } from '../../errors.js';
 import { describeLive } from '../../chat/session.js';
+import { nextStepButtons } from '../../next-steps.js';
 import * as api from '../../api.js';
 import { store } from '../../state.js';
 
@@ -377,7 +378,13 @@ export class TurnView {
 
     // notes: errors, aborted, cut off
     const notes = [];
-    if (last?.status === 'error') {
+    if (last?.status === 'error' && last.nextSteps?.length) {
+      // A failure the server can explain (e.g. the model could not start): calm, specific, with real fixes.
+      const x = explainError({ code: last.errorCode, message: last.error });
+      notes.push(h('div.callout.warn.msg-error.with-steps', icon('warning'), h('div.grow.stack',
+        h('div', h('b', x.title)), h('div.small', last.error),
+        h('div.row-wrap', nextStepButtons(last.nextSteps, { chat: model, messageId: last.id })))));
+    } else if (last?.status === 'error') {
       const x = explainError({ code: last.errorCode || 'provider_error', message: last.error });
       notes.push(h('div.callout.danger.msg-error', icon('error'), h('div.grow', h('div', h('b', x.title)), x.detail ? h('div.small', x.detail) : null),
         x.action ? h('button.btn.btn-small', { type: 'button', on: { click: x.action.run } }, x.action.label) : null,

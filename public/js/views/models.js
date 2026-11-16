@@ -1,13 +1,14 @@
 // Models: what is loaded right now (and unload), installed models with details, downloads with
 // progress/cancel, pull by name, the recommended list for this machine, and embedding models.
-import { h, mount, add } from '../lib/dom.js';
+import { h, mount, add, copyText } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
-import { fmtBytes, fmtTokens, modelLabel, fmtUntil, fmtWhen, plural } from '../lib/format.js';
+import { fmtBytes, fmtTokens, modelLabel, modelShort, fmtUntil, fmtWhen, plural } from '../lib/format.js';
 import { store, loadModels, loadSystem, loadRecommended, patchSettings, sameRef, dropModelInfo } from '../state.js';
 import * as api from '../api.js';
 import { pullModel, pullFor, activePulls, cancelPull } from './pulls.js';
 import { recCard, pullProgress } from './setup.js';
-import { openDialog, confirmDialog, toast } from '../ui/overlays.js';
+import { makeTextOnlyCopy } from './model-flows.js';
+import { openDialog, confirmDialog, toast, openMenu } from '../ui/overlays.js';
 import { showError } from '../errors.js';
 import { runAction } from '../actions.js';
 
@@ -23,6 +24,7 @@ export class ModelsView {
   }
 
   show() {
+    api.models.textOnlyCopies().then((r) => { this.copies = r.copies || []; this.render(); }).catch(() => {});
     this.render();
     loadModels({ refresh: true }).catch(() => {});
     loadSystem().catch(() => {});
@@ -67,16 +69,25 @@ export class ModelsView {
             const isDef = sameRef(def, m) || (def && !def.providerId && def.model === m.model);
             const caps = m.capabilities || [];
             const prov = providers.find((p) => p.id === m.providerId);
+            const isCopy = (this.copies || []).some((c) => c.model === m.model) || /-text:/.test(m.model);
+            const multimodal = (caps.includes('vision') || caps.includes('audio')) && m.providerId === 'ollama' && !isCopy;
             return h('tr', { dataset: { model: m.model } },
               h('td', h('div.row', m.loaded ? h('span.dot.ok', { title: 'Loaded' }) : h('span.dot', { title: 'Not loaded' }), h('div.grow', h('div.model-name', { title: m.model }, modelLabel(m.name)), m.model.length > 28 ? h('div.faint.small.mono.ellipsis.model-id', { title: m.model }, m.model) : null, h('div.faint.small', [m.parameterSize, m.quantization, m.family].filter(Boolean).join(' · '))),
+                isCopy ? h('span.badge', { title: 'Same weights without the image/audio part: about 1 GB less memory, cannot read images' }, 'text-only') : null,
                 isDef ? h('span.badge.accent', { title: explicitDefault ? 'Default model' : 'Chosen automatically' }, explicitDefault ? 'default' : 'default (auto)') : null)),
               h('td.hide-narrow.num', fmtBytes(m.sizeBytes)),
               h('td.num', m.contextLength ? fmtTokens(m.contextLength) : '—'),
               h('td.hide-narrow', h('div.row-wrap.caps', m.embedding || caps.includes('embedding') ? h('span.badge', 'embedding') : null, caps.includes('tools') ? h('span.badge', 'tools') : null, caps.includes('thinking') ? h('span.badge', 'thinking') : null, caps.includes('vision') ? h('span.badge', 'vision') : null)),
               h('td.actions', h('div.row',
                 h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => this.details(m) } }, 'Details'),
-                !m.embedding && !isDef ? h('button.btn.btn-small.btn-ghost.hide-narrow', { type: 'button', on: { click: () => this.makeDefault(m) } }, 'Make default') : null,
-                prov?.capabilities?.delete ? h('button.icon-btn.small', { type: 'button', title: 'Delete', 'aria-label': `Delete ${m.model}`, on: { click: () => this.remove(m) } }, icon('trash', { size: 14 })) : null)));
+                h('button.icon-btn.small', { type: 'button', title: 'More', 'aria-label': `More actions for ${m.model}`, 'aria-haspopup': 'menu', on: { click: (e) => openMenu(e.currentTarget, [
+                  !m.embedding && !isDef ? { label: 'Make default', icon: 'check', run: () => this.makeDefault(m) } : null,
+                  multimodal ? { label: 'Make a text-only copy', hint: '−1 GB RAM, no images', icon: 'file', run: () => makeTextOnlyCopy(m.model, { providerId: m.providerId, setDefault: false }) } : null,
+                  m.providerId === 'ollama' ? { label: m.loaded ? 'Unload from memory' : 'Load now', icon: m.loaded ? 'eject' : 'play', run: () => (m.loaded ? this.unload(m) : this.load(m)) } : null,
+                  { label: 'Copy model id', icon: 'copy', run: () => copyText(m.model) },
+                  prov?.capabilities?.delete ? { separator: true } : null,
+                  prov?.capabilities?.delete ? { label: 'Delete…', icon: 'trash', danger: true, run: () => this.remove(m) } : null,
+                ].filter(Boolean), { placement: 'bottom-end', label: 'Model actions' }) } }, icon('more', { size: 14 })))));
           })))))));
     }
 
@@ -114,6 +125,11 @@ export class ModelsView {
     try { await api.models.unload({ providerId: m.providerId, model: m.model }); toast({ kind: 'success', message: `Unloaded ${modelLabel(m.model)}`, id: 'unload' }); await loadSystem(); await loadModels(); } catch (e) { showError(e, 'unload the model'); }
     this.busy.delete(`unload:${m.model}`);
     this.render();
+  }
+
+  async load(m) {
+    const t = toast({ message: `Loading ${modelShort(m.model, 36)}…`, detail: 'This can take 20–60 s on a small Mac.', timeout: 0, id: 'load' });
+    try { const r = await api.models.load({ providerId: m.providerId, model: m.model }); t.dismiss(true); toast({ kind: 'success', message: `Loaded with a ${fmtTokens(r.numCtx)} window`, id: 'load' }); await loadSystem(); await loadModels(); } catch (e) { t.dismiss(true); showError(e, 'load the model'); }
   }
 
   async makeDefault(m) {

@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { startFakeOllama } from './fake-ollama.mjs';
+import { createFakeMemoryProbe } from './fake-memory-probe.mjs';
 import { startServer } from '../server/index.mjs';
 import { deepMerge } from '../server/lib/util.mjs';
 
@@ -83,8 +84,11 @@ export function client(baseUrl) {
  * Start fake Ollama + Harness. `settings` is merged into the initial settings.json.
  * @returns {Promise<{fake, srv, app, url, dataDir, c, restart, close}>}
  */
-export async function setup({ settings = {}, system, fakeOptions = {}, dataDir } = {}) {
+export async function setup({ settings = {}, system, fakeOptions = {}, dataDir, probe } = {}) {
   const fake = await startFakeOllama({ port: 0, ...fakeOptions });
+  // Always a fake memory probe (deterministic on any OS; never the developer's real Ollama processes).
+  const memoryProbe = probe === null ? null : probe || createFakeMemoryProbe(fake);
+  system = { ...(system || {}), memoryProbe };
   dataDir ||= await tmpDir();
   const base = {
     providers: { builtin: { ollama: { baseUrl: fake.url } } },
@@ -95,7 +99,7 @@ export async function setup({ settings = {}, system, fakeOptions = {}, dataDir }
   await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify(deepMerge(base, settings)));
   let srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'error', system });
   const ctx = {
-    fake, srv, app: srv.app, url: srv.url, dataDir, c: client(srv.url),
+    fake, probe: memoryProbe, srv, app: srv.app, url: srv.url, dataDir, c: client(srv.url),
     async restart() {
       await srv.close();
       srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'error', system });

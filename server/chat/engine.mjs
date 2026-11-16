@@ -61,30 +61,41 @@ export class ChatEngine {
   loadedCtxFor(providerId, model) { return this.loadedCtx.get(`${providerId}/${model}`) ?? null; }
 
   /**
-   * After a real request loaded the model: read its actual footprint from Ollama /api/ps, store it, and
-   * surface bad outcomes (over the safe budget / partly on CPU). The current turn keeps its num_ctx;
-   * the corrected plan applies from the next turn.
+   * After a real request: read what the model actually occupies (runner RSS on macOS, swap/compressor growth across
+   * a load), store it, and surface bad outcomes (over the safe budget / partly on CPU / the load made macOS swap).
+   * The current turn keeps its num_ctx; the corrected plan applies from the next turn.
    */
-  async measureLoaded(chat, t, emit) {
+  async measureLoaded(chat, t, emit, { baseline = null, loaded = false } = {}) {
     if (t.provider.kind !== 'ollama' || t.s.context?.useMeasurements === false) return null;
-    const sample = await this.app.measurements.measure(t.provider, t.model, { numCtx: t.plan.numCtx, kvCacheType: t.plan.memory.kvCacheType, digest: t.info.digest, sizeBytes: t.info.sizeBytes });
+    const sample = await this.app.measurements.measure(t.provider, t.model, {
+      numCtx: t.plan.numCtx, kvCacheType: t.plan.memory.kvCacheType, digest: t.info.digest, sizeBytes: t.info.sizeBytes,
+      modelBlob: t.info.blobs?.[0] || null, probe: this.app.memoryProbe, baseline, loaded,
+    });
     if (!sample) return null;
     const mem = t.plan.memory;
-    const over = sample.totalBytes + (mem.otherModelsBytes || 0) > mem.budgetBytes;
+    const pressured = !!sample.pressure?.signal;
+    const over = !pressured && sample.totalBytes + (mem.otherModelsBytes || 0) > mem.budgetBytes;
     const split = isCpuSplit(sample);
-    if (!over && !split) return sample;
+    if (!over && !split && !pressured) return sample;
     const already = new Set((t.plan.warnings || []).map((w) => w.code));
     const next = await this.app.registry.contextPlan(t.provider, t.model, t.s, { info: t.info, otherModelsBytes: mem.otherModelsBytes || 0 });
     const auto = t.plan.mode === 'auto';
     const tail = auto
       ? (next.numCtx < t.plan.numCtx ? ` From the next message the context window will be ${formatTokensK(next.numCtx)} (it is not changed mid-answer because that reloads the model).` : ' A smaller quantization is recommended.')
       : ` Your context setting (${formatTokensK(t.plan.numCtx)}) was kept; about ${formatTokensK(Math.max(2048, roundCtx(Math.min(next.alternatives?.fitMax ?? 0, next.modelMax))))} would fit.`;
+    if (pressured) {
+      const p = sample.pressure;
+      const what = [p.swapDeltaBytes > 0 ? `+${formatBytes(p.swapDeltaBytes)} swap` : null, p.compressedDeltaBytes > 0 ? `+${formatBytes(p.compressedDeltaBytes)} compressed` : null].filter(Boolean).join(', ') || 'memory pressure';
+      const tooBig = next.warnings?.find((w) => w.code === 'model_too_big');
+      if (tooBig && auto) emit('notice', { code: 'model_too_big', message: tooBig.message, numCtx: sample.numCtx, smallerModel: tooBig.smallerModel || null, pressure: p });
+      else emit('notice', { code: 'memory_pressure', message: `Loading ${t.model} at ${formatTokensK(sample.numCtx)} made macOS swap (${what}).${tail}`, numCtx: sample.numCtx, nextNumCtx: next.numCtx, pressure: p });
+    }
     if (over && !already.has('measured_exceeds_budget')) {
       emit('notice', { code: 'measured_exceeds_budget', message: `${t.model} measured ${formatBytes(sample.totalBytes)} at ${formatTokensK(sample.numCtx)} — over the safe memory budget of ${formatBytes(mem.budgetBytes)}.${tail}`, measuredBytes: sample.totalBytes, budgetBytes: mem.budgetBytes, numCtx: sample.numCtx, nextNumCtx: next.numCtx });
     }
     if (split && !already.has('cpu_offload')) {
-      const cpu = sample.totalBytes - sample.vramBytes;
-      emit('notice', { code: 'cpu_offload', message: `Ollama could only place ${formatBytes(sample.vramBytes)} of ${t.model} (${formatBytes(sample.totalBytes)}) on the GPU at ${formatTokensK(sample.numCtx)}; ${formatBytes(cpu)} runs on the CPU, which is much slower.${tail}`, totalBytes: sample.totalBytes, vramBytes: sample.vramBytes, numCtx: sample.numCtx, nextNumCtx: next.numCtx });
+      const cpu = sample.cpuBytes ?? (sample.totalBytes - sample.vramBytes);
+      emit('notice', { code: 'cpu_offload', message: `Ollama could not place all of ${t.model} on the GPU at ${formatTokensK(sample.numCtx)}: ${formatBytes(cpu)} runs on the CPU, which is much slower.${tail}`, totalBytes: sample.totalBytes, vramBytes: sample.vramBytes, cpuBytes: cpu, numCtx: sample.numCtx, nextNumCtx: next.numCtx });
     }
     return sample;
   }
@@ -342,6 +353,7 @@ export class ChatEngine {
       this.app.bus.publish('generation.finished', { chatId: chat.id, generationId });
     };
     let target = null;
+    let measureP = null;
     try {
       const t = prepared || (await this.target(chat, modelRef));
       target = t;
@@ -421,6 +433,14 @@ export class ChatEngine {
 
       const options = buildOptions(t.info, s, t.plan.numCtx, t.provider.kind);
       let think = resolveThink(s, t.info, t.provider);
+      // Will this request (re)load the model? Then take a memory-pressure snapshot first (bounded, ~10 ms on macOS)
+      // so swap/compressor growth caused by the load can be seen afterwards.
+      const loadExpected = t.provider.kind === 'ollama' && (this.loadedCtx.get(`${t.provider.id}/${t.model}`) !== t.plan.numCtx || this.app.modelState.unloadedForImage);
+      const probe = this.app.memoryProbe;
+      const baselineP = loadExpected && probe && s.context?.useMeasurements !== false
+        ? Promise.race([probe.pressure().catch(() => null), new Promise((r) => setTimeout(r, 300, null))])
+        : Promise.resolve(null);
+      const baseline = await baselineP;
       const maxIter = s.tools?.maxIterations ?? 6;
       let iteration = 0;
       let measured = false;
@@ -454,7 +474,8 @@ export class ChatEngine {
         if (t.provider.kind === 'ollama') this.loadedCtx.set(`${t.provider.id}/${t.model}`, t.plan.numCtx);
         if (iteration === 0 && r.usage && !measured) {
           measured = true;
-          await this.measureLoaded(chat, t, emit).catch((e) => log.debug('measure failed', e.message));
+          // Not awaited: the turn goes on; its result is awaited (briefly) before `done` so notices land in this stream.
+          measureP = this.measureLoaded(chat, t, emit, { baseline, loaded: loadExpected }).catch((e) => log.debug('measure failed', e.message));
         }
         if (r.doneReason === 'length') finalReason = 'length';
         if (r.toolCalls.length && offerTools) {
@@ -565,6 +586,11 @@ export class ChatEngine {
       if (finalReason !== 'stop') asst.finishReason = finalReason;
       if (lastUsage?.promptTokens && asst.context) asst.context.actual = { promptTokens: lastUsage.promptTokens, completionTokens: lastUsage.completionTokens, used: lastUsage.promptTokens + (lastUsage.completionTokens || 0) };
       this.app.chats.markDirty(chat);
+    }
+    if (measureP) {
+      let timer;
+      await Promise.race([measureP, new Promise((r) => { timer = setTimeout(r, 1500); timer.unref?.(); })]);
+      clearTimeout(timer);
     }
     emit('done', { generationId, reason: finalReason, message: publicMessage(asst), createdMessageIds: created, chat: chatSummary(chat), context: asst.context || null, stats: asst.stats });
     if (finalReason !== 'aborted') this.afterTurn(chat);

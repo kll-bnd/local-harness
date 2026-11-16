@@ -21,6 +21,21 @@ export function classifyOllamaError(status, message, providerId) {
 
 const ns = (v) => (Number.isFinite(v) ? Math.round(v / 1e6) : null);
 
+/** Network trouble talking to the registry (offline, DNS, TLS, proxy) — not "this model does not exist". */
+export const PULL_NETWORK_RE = /dial tcp|no such host|lookup .* on |connection refused|connection reset|i\/o timeout|network is unreachable|TLS handshake|tls: |x509|context deadline exceeded|EOF$|temporary failure in name resolution|proxyconnect/i;
+
+/**
+ * Pull stream errors. Real not-found answers are exactly `pull model manifest: file does not exist` (Ollama
+ * registry) or `file does not exist` (Hugging Face, at the end of the stream); an offline pull also mentions the
+ * manifest ("pull model manifest: Get …: dial tcp: lookup registry.ollama.ai: no such host").
+ */
+export function classifyPullError(message, model, providerId) {
+  const msg = String(message || '');
+  if (PULL_NETWORK_RE.test(msg)) return new ProviderError(`Could not download ${model}: Ollama cannot reach the model registry (offline or blocked network). ${msg.slice(0, 300)}`, { status: 503, code: 'registry_unreachable', providerId });
+  if (/file does not exist|manifest unknown|not found|specified tag is not available/i.test(msg)) return new ProviderError(`${model} was not found in the registry (${msg.slice(0, 200)}). Check the name and tag.`, { status: 404, code: 'model_not_found', providerId });
+  return new ProviderError(msg, { code: 'provider_error', providerId });
+}
+
 export function parseArgs(a) {
   if (a && typeof a === 'object') return a;
   if (typeof a === 'string') {
@@ -204,7 +219,7 @@ export class OllamaProvider {
   async *pull({ model, signal }) {
     const res = await this.request('/api/pull', { method: 'POST', body: { model, stream: true }, signal });
     for await (const obj of readNdjson(guardStream(res.body, this, '/api/pull', signal))) {
-      if (obj.error) throw new ProviderError(obj.error, { code: /not found|does not exist|manifest/i.test(obj.error) ? 'model_not_found' : 'provider_error', providerId: this.id });
+      if (obj.error) throw classifyPullError(obj.error, model, this.id);
       yield { status: obj.status || '', digest: obj.digest || null, total: obj.total ?? null, completed: obj.completed ?? null };
     }
   }
