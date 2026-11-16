@@ -58,18 +58,26 @@ reads a length above 1,048,581 treats the stream as corrupt and stops.
 
 ### Control messages (`CONTROL`)
 
-- `{ "op": "hello", "protocol": 1, "app": { "name": "Harness", "version": "0.2.0", "kind": "native" }, "dataKey": "<base64 of 32 random bytes>" }`
-  must be the first frame. `dataKey` is the key that encrypts the data directory, kept by the app in the
-  macOS Keychain; `null` means "no key from the app" (the backend then uses its own key source, or runs
-  unencrypted if encryption is switched off).
+- `{ "op": "hello", "protocol": 1, "app": { "name": "Harness", "version": "0.2.0", "kind": "native" }, "dataKey": null }`
+  must be the first frame. `dataKey` is `null` in the default **password** mode: the data stays locked
+  until the user types their Harness password into the lock screen that the UI shows (see "Locking"
+  below). Only when `launch.json` says `"encryption": "keychain"` does the app send the key it keeps in
+  the macOS Keychain here, as base64 of 32 random bytes, and the data opens without a prompt.
+- `{ "op": "lock" }`: lock now. The app sends it when the Mac goes to sleep, the screen is locked, the
+  user picks "Lock Harness", or the app has been idle for the configured time while hidden. The backend
+  aborts what is running, unloads models it started, closes the data and forgets the key.
 - `{ "op": "ping" }` → the backend answers with an event `{ "type": "pong" }`.
 - `{ "op": "shutdown" }` → the backend finishes or aborts what is running, saves, stops a managed Ollama
   and exits 0.
 
 ### Events (`EVENT`)
 
-- `{ "type": "ready", "protocol": 1, "version": "0.2.0", "encryption": { "enabled": true }, "offlineLock": true }`
-  once the data directory is open and requests will be answered. Requests sent before `ready` are queued.
+- `{ "type": "ready", "protocol": 1, "version": "0.2.0", "locked": true, "encryption": { "mode": "password" }, "offlineLock": true }`
+  once requests will be answered. Requests sent before `ready` are queued. `locked: true` means the UI can
+  load and will show its lock screen; everything except the lock routes answers with HTTP status 423
+  until the password has been accepted.
+- `{ "type": "locked" }` and `{ "type": "unlocked" }` whenever that state changes, so the app can enable
+  or disable menu items, clear a Dock badge and stop holding off App Nap.
 - `{ "type": "progress", "what": "encrypting", "done": 12, "total": 340 }` during a one-off migration at
   start-up, so the app can show something better than a frozen window.
 - `{ "type": "fatal", "code": "wrong_key" | "data_dir_locked" | "…", "message": "…", "url": null }` when the
@@ -97,16 +105,28 @@ plain-text file in the data directory, and every launcher (native app, Electron 
 `npm start`) reads it before starting the backend:
 
 ```json
-{ "version": 1, "offlineLock": true, "offlineLockSuspendedUntil": null, "encryption": "keychain" }
+{ "version": 1, "offlineLock": true, "offlineLockSuspendedUntil": null, "encryption": "password" }
 ```
 
 - `offlineLock`: start the backend inside the offline-lock sandbox.
 - `offlineLockSuspendedUntil`: ISO time until which the user has allowed the network (to download a
   model). While it is in the future the launcher starts the backend *without* the sandbox; the backend
   re-locks itself when the time passes and asks for a restart.
-- `encryption`: `"keychain"` (key from the macOS Keychain) or `"off"`.
+- `encryption`: `"password"` (the default: the user types a password to open Harness; the key is derived
+  from it and never stored), `"keychain"` (the key is kept in the macOS Keychain and Harness opens without
+  asking; a convenience the user can choose, weaker because other programs running as the user can ask
+  the Keychain for it), or `"off"`.
 
 A missing file means the defaults shown above.
+
+## Locking
+
+In password mode the backend starts locked. The UI is served as usual and shows a lock screen; it sends
+the password to the backend's unlock route over the bridge (it never leaves the two processes), and the
+backend derives the key, opens the data and sends the `unlocked` event. The password is asked again for
+actions that lower protection: allowing the network, exporting data or the recovery key, changing the
+password, switching encryption off. The native app has nothing to implement for this beyond the `lock`
+control message, the `locked`/`unlocked` events and a "Lock Harness" menu item.
 
 ## Offline lock (the OS sandbox)
 
