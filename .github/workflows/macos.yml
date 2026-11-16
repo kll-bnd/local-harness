@@ -57,8 +57,11 @@ jobs:
           sysctl -n machdep.cpu.brand_string
           echo "RAM bytes: $(sysctl -n hw.memsize)"
           node -v
-      - name: Backend test suite
-        run: npm test
+      - name: Backend and desktop unit tests
+        run: |
+          set -o pipefail
+          # The spec reporter repeats every failing test with its error at the end of the output.
+          node --test --test-concurrency=4 --test-reporter=spec "test/*.test.mjs" "electron/test/*.test.mjs" 2>&1 | tail -n 170
       - name: Server boots with no node_modules
         run: |
           set -euo pipefail
