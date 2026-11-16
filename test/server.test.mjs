@@ -267,6 +267,7 @@ describe('chats, streaming, reasoning, branching, tools', () => {
     assert.ok(byType(r.events, 'notice').some((n) => n.code === 'tools_unsupported'));
     assert.equal(text(r.events), 'You said: hello there');
     h.app.registry._infoCache.clear();
+    h.app.registry.toolsRejected.clear();
     await send(h.c, chat, 'hi gemma2', { model: { model: 'gemma2:2b' } });
     assert.equal(h.fake.chatRequests().at(-1).tools, undefined);
   });

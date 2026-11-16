@@ -20,12 +20,20 @@ export function runAction(id, ...args) {
   const a = actions.get(id);
   if (!a) { console.warn(`Unknown action ${id}`); return false; }
   if (a.when && !a.when()) return false;
-  // The same keystroke can reach us twice (page keydown + native menu accelerator); ignore the echo.
-  const now = performance.now();
-  if (lastRun.id === id && now - lastRun.at < 120 && !args.length) return true;
-  lastRun = { id, at: now };
   try { a.run(...args); } catch (e) { console.error(`Action ${id} failed`, e); }
   return true;
+}
+
+/**
+ * Run an action triggered by a keystroke ('key') or the native menu ('menu'). In Electron one key press can
+ * reach both (the page's keydown and the menu accelerator); the second delivery from the *other* source
+ * within 150 ms is the same keystroke and is ignored.
+ */
+export function runActionFrom(source, id, ...args) {
+  const now = performance.now();
+  if (lastRun.id === id && lastRun.source !== source && now - lastRun.at < 150) return true;
+  lastRun = { id, source, at: now };
+  return runAction(id, ...args);
 }
 
 // ------------------------------------------------------------------------------------------------ keys

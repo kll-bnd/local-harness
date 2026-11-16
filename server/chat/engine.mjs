@@ -297,7 +297,7 @@ export class ChatEngine {
     const s = t.s;
     if (s.tools?.enabled === false) return [];
     if (t.provider.kind === 'ollama' && !t.info.capabilities.includes('tools')) return [];
-    if (t.info._toolsRejected) return [];
+    if (this.app.registry.toolsRejected.has(`${t.provider.id}|${t.model}`)) return [];
     const imageAvailable = s.image?.enabled !== false && s.tools?.builtin?.generate_image !== false ? await this.app.imageProviders.available() : false;
     return enabledTools({ app: this.app, chat, settings: s, imageAvailable });
   }
@@ -418,7 +418,7 @@ export class ChatEngine {
         if (this.app.modelState.unloadedForImage) emit('model_status', { phase: 'loading', models: this.app.modelState.models, reason: 'reload_after_image', message: 'Reloading the chat model…' });
         const r = await this.streamOnce({ t, messages: asm.messages, tools: offerTools, options, think, signal: sig, asst, emit });
         think = r.think;
-        if (r.toolsRejected) { tools = []; toolDefs = []; t.info._toolsRejected = true; }
+        if (r.toolsRejected) { tools = []; toolDefs = []; this.app.registry.toolsRejected.add(`${t.provider.id}|${t.model}`); }
         totals.iterations++;
         lastUsage = r.usage;
         if (r.usage) {

@@ -5,7 +5,7 @@ import { icon } from './lib/icons.js';
 import { truncate } from './lib/format.js';
 import * as api from './api.js';
 import { store, bus, loadSettings, loadPresets, loadSystem, loadModels, loadChats, loadArchived, refreshSystemSoon, refreshModelsSoon, refreshChatsSoon, setUiPref, uiPrefs, chatModels, dropModelInfo } from './state.js';
-import { defineAction, runAction, chordOf, actionForChord, allActions } from './actions.js';
+import { defineAction, runAction, runActionFrom, chordOf, actionForChord, allActions } from './actions.js';
 import { Shell } from './shell.js';
 import { startRouter, navigate } from './router.js';
 import { toast } from './ui/overlays.js';
@@ -134,13 +134,13 @@ document.addEventListener('keydown', (e) => {
   const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
   if (plain && isTypingTarget(e.target)) return; // "/" etc. only outside text fields
   e.preventDefault();
-  runAction(a.id);
+  runActionFrom('key', a.id);
 });
 
 // ------------------------------------------------------------------------------------------------ desktop bridge
 if (desktop) {
   try {
-    desktop.onMenuAction?.((name, ...args) => runAction(name, ...args));
+    desktop.onMenuAction?.((name, ...args) => runActionFrom('menu', name, ...args));
   } catch (e) { console.warn('desktop bridge', e); }
 }
 let unread = 0;

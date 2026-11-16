@@ -201,9 +201,11 @@ export function computeContextPlan(p) {
 
   // Servers that fix the context at launch (llama-server -c, LM Studio load settings).
   if (providerKind !== 'ollama') {
-    const numCtx = serverCtx || modelMaxIn || DEFAULT_FALLBACK_CTX;
-    const known = !!(serverCtx || modelMaxIn);
-    if (!known) warnings.push({ code: 'context_unknown', message: `The server did not report its context size; assuming ${formatTokensK(numCtx)}.` });
+    // Never assume more than the fallback when the server did not tell us its loaded context: the model's
+    // trained maximum (e.g. LM Studio before JIT loading) is not what the server will accept.
+    const numCtx = serverCtx || Math.min(modelMaxIn || DEFAULT_FALLBACK_CTX, DEFAULT_FALLBACK_CTX);
+    const known = !!serverCtx;
+    if (!known) warnings.push({ code: 'context_unknown', message: `The server did not report its loaded context size; assuming ${formatTokensK(numCtx)}.` });
     return {
       numCtx, mode: 'server', modelMax: modelMaxIn || null, modelMaxSource, advertisedMax, limitedBy: 'server', fits: null, fitMax: null,
       memory: { ...memBase, modelBytes: modelBytes || null, overheadBytes: null, kvBytesPerToken: null, kvFixedBytes: null, kvCacheType: null, kvSource: null, kvBytes: null, otherModelsBytes, estimatedTotalBytes: null, basis: 'estimate', measurement: null },

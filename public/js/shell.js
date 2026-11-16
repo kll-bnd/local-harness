@@ -114,15 +114,16 @@ export class Shell {
 
   // ------------------------------------------------------------------------------------------ routing
   async route(r) {
+    // Every navigation gets a token; a slower, earlier one (e.g. a lazily imported page) must not win.
+    const token = Symbol('route');
+    this.routing = token;
     if (this.narrow.matches && this.overlaySidebar) { this.overlaySidebar = false; this.applyLayout(); }
     let view = this.views.get(r.view);
     if (!view && LAZY_VIEWS[r.view]) {
-      const token = Symbol('route');
-      this.routing = token;
       try {
         const Cls = await LAZY_VIEWS[r.view]();
         if (this.routing !== token) return;
-        view = new Cls(this);
+        view = this.views.get(r.view) || new Cls(this);
         this.views.set(r.view, view);
       } catch (e) { showError(e, 'open this page'); return; }
     }
@@ -134,6 +135,7 @@ export class Shell {
       this.setScrolled(false);
     }
     await view.show?.(r);
+    if (this.routing !== token) return;
     this.inspector.bind(r.view === 'chat' ? this.chatView.model : null);
     this.updateToolbar();
     document.title = this.titleFor(r);

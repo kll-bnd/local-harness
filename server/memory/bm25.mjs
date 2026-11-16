@@ -33,16 +33,25 @@ export function tokenize(text) {
   return out;
 }
 
+/** Max distinct query terms used per search (the rarest ones): a pasted 1500-word message stays cheap. */
+export const MAX_QUERY_TERMS = 48;
+
 export class BM25Index {
   constructor({ k1 = 1.2, b = 0.75 } = {}) {
     this.k1 = k1;
     this.b = b;
     this.docs = new Map(); // id -> { tf: Map, len }
-    this.df = new Map();
+    this.postings = new Map(); // term -> Map(id -> tf)   (inverted index)
     this.totalLen = 0;
   }
 
   get size() { return this.docs.size; }
+
+  /** Document frequency (kept for callers that used the old `df` map). */
+  get df() {
+    const self = this;
+    return { get: (t) => self.postings.get(t)?.size || 0, has: (t) => self.postings.has(t) };
+  }
 
   add(id, text) {
     if (this.docs.has(id)) this.remove(id);
@@ -50,7 +59,11 @@ export class BM25Index {
     const tf = new Map();
     for (const t of toks) tf.set(t, (tf.get(t) || 0) + 1);
     this.docs.set(id, { tf, len: toks.length });
-    for (const t of tf.keys()) this.df.set(t, (this.df.get(t) || 0) + 1);
+    for (const [t, f] of tf) {
+      let p = this.postings.get(t);
+      if (!p) { p = new Map(); this.postings.set(t, p); }
+      p.set(id, f);
+    }
     this.totalLen += toks.length;
   }
 
@@ -58,8 +71,10 @@ export class BM25Index {
     const d = this.docs.get(id);
     if (!d) return;
     for (const t of d.tf.keys()) {
-      const n = (this.df.get(t) || 1) - 1;
-      if (n <= 0) this.df.delete(t); else this.df.set(t, n);
+      const p = this.postings.get(t);
+      if (!p) continue;
+      p.delete(id);
+      if (!p.size) this.postings.delete(t);
     }
     this.totalLen -= d.len;
     this.docs.delete(id);
@@ -67,25 +82,31 @@ export class BM25Index {
 
   idf(t) {
     const N = this.docs.size;
-    const n = this.df.get(t) || 0;
+    const n = this.postings.get(t)?.size || 0;
     return Math.log(1 + (N - n + 0.5) / (n + 0.5));
   }
 
-  /** @returns {Array<{id, score}>} sorted desc; `filter(id)` restricts candidates. */
+  /** The distinct query terms actually used (present in the index, rarest first, capped). */
+  queryTerms(query) {
+    const qt = [...new Set(tokenize(query))].filter((t) => this.postings.has(t));
+    if (qt.length <= MAX_QUERY_TERMS) return qt;
+    return qt.sort((a, b) => this.postings.get(a).size - this.postings.get(b).size).slice(0, MAX_QUERY_TERMS);
+  }
+
+  /** @returns {Array<{id, score}>} sorted desc; `filter(id)` restricts candidates. Cost ∝ matching postings. */
   search(query, { k = 10, filter } = {}) {
-    const qt = [...new Set(tokenize(query))];
-    if (!qt.length || !this.docs.size) return [];
+    if (!this.docs.size) return [];
+    const qt = this.queryTerms(query);
+    if (!qt.length) return [];
     const avg = this.totalLen / this.docs.size || 1;
     const scores = new Map();
     for (const t of qt) {
-      if (!this.df.has(t)) continue;
       const idf = this.idf(t);
-      for (const [id, d] of this.docs) {
-        const f = d.tf.get(t);
-        if (!f) continue;
+      for (const [id, f] of this.postings.get(t)) {
         if (filter && !filter(id)) continue;
-        const s = idf * ((f * (this.k1 + 1)) / (f + this.k1 * (1 - this.b + (this.b * d.len) / avg)));
-        scores.set(id, (scores.get(id) || 0) + s);
+        const d = this.docs.get(id);
+        const sc = idf * ((f * (this.k1 + 1)) / (f + this.k1 * (1 - this.b + (this.b * d.len) / avg)));
+        scores.set(id, (scores.get(id) || 0) + sc);
       }
     }
     return [...scores.entries()].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score).slice(0, k);

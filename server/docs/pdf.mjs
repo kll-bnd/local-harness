@@ -5,6 +5,21 @@
 // LZW streams, text inside form XObjects, Type3 glyph mapping.
 import zlib from 'node:zlib';
 
+// Hard limits so a hostile or merely unusual PDF cannot freeze the server or exhaust RAM (extraction also runs
+// in a worker thread with memory limits and a timeout — see store/attachments.mjs).
+export const PDF_LIMITS = {
+  maxStreamBytes: 16 * 1024 * 1024, // one decoded stream
+  maxDecodedBytes: 96 * 1024 * 1024, // all decoded streams together
+  maxContentBytes: 64 * 1024 * 1024, // content-stream bytes interpreted across all pages
+  maxOperators: 2_000_000, // per document
+  maxTextChars: 8 * 1024 * 1024,
+  maxObjects: 500_000,
+  maxCMapEntries: 100_000, // expanded bfchar/bfrange entries per CMap (larger ranges are looked up lazily)
+  maxCMapRanges: 10_000,
+};
+
+let doc = null; // per-extraction state (synchronous, one document at a time per thread)
+
 function parseObjects(s, buf) {
   const objs = new Map();
   const re = /(\d+)\s+(\d+)\s+obj\b/g;
@@ -36,6 +51,7 @@ function parseObjects(s, buf) {
       stream = buf.subarray(dataStart, dataEnd);
     }
     objs.set(num, { dict, stream });
+    if (objs.size > PDF_LIMITS.maxObjects) break;
     re.lastIndex = end + 6;
   }
   return objs;
@@ -68,13 +84,31 @@ function ascii85(str) {
 
 function decodeStream(obj) {
   if (!obj?.stream) return null;
+  if (doc?.decodedCache.has(obj)) return doc.decodedCache.get(obj);
+  const data = decodeStreamRaw(obj);
+  if (doc) {
+    if (data) {
+      doc.decodedBytes += data.length;
+      if (doc.decodedBytes > PDF_LIMITS.maxDecodedBytes) { doc.warn('PDF is too large to extract completely; text is truncated.'); doc.decodedCache.set(obj, null); return null; }
+    }
+    doc.decodedCache.set(obj, data);
+  }
+  return data;
+}
+
+function inflate(data, finishFlush) {
+  return zlib.inflateSync(data, { maxOutputLength: PDF_LIMITS.maxStreamBytes, ...(finishFlush ? { finishFlush } : {}) });
+}
+
+function decodeStreamRaw(obj) {
   const fm = obj.dict.match(/\/Filter\s*(\[[^\]]*\]|\/\w+)/);
   const filters = fm ? (fm[1].match(/\/\w+/g) || []).map((f) => f.slice(1)) : [];
   let data = obj.stream;
   for (const f of filters) {
     if (f === 'FlateDecode' || f === 'Fl') {
-      try { data = zlib.inflateSync(data); } catch {
-        try { data = zlib.inflateSync(data, { finishFlush: zlib.constants.Z_SYNC_FLUSH }); } catch { return null; }
+      try { data = inflate(data); } catch (e) {
+        if (e?.code === 'ERR_BUFFER_TOO_LARGE' || e instanceof RangeError) { doc?.warn('A PDF stream is too large to decode; part of the text is skipped.'); return null; }
+        try { data = inflate(data, zlib.constants.Z_SYNC_FLUSH); } catch { return null; }
       }
     } else if (f === 'ASCIIHexDecode' || f === 'AHx') {
       data = Buffer.from(data.toString('latin1').replace(/[^0-9a-fA-F]/g, ''), 'hex');
@@ -139,31 +173,58 @@ function utf16be(bytes) {
 
 function parseCMap(text) {
   const map = new Map();
+  const ranges = []; // { lo, hi, base: Buffer } — looked up lazily, never fully expanded
   let codeBytes = 1;
-  const cs = text.match(/begincodespacerange\s*<([0-9a-fA-F]+)>/);
-  if (cs) codeBytes = Math.max(1, cs[1].length / 2);
-  for (const block of text.match(/beginbfchar([\s\S]*?)endbfchar/g) || []) {
-    for (const m of block.matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]*)>/g)) map.set(parseInt(m[1], 16), utf16be(hexToBytes(m[2])));
-  }
-  for (const block of text.match(/beginbfrange([\s\S]*?)endbfrange/g) || []) {
-    for (const m of block.matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(<([0-9a-fA-F]+)>|\[([^\]]*)\])/g)) {
+  const cs = text.match(/begincodespacerange\s*<([0-9a-fA-F]{1,8})>/);
+  if (cs) codeBytes = Math.max(1, Math.min(4, cs[1].length / 2));
+  const blocks = (open, close, fn) => {
+    let i = 0;
+    for (;;) {
+      const a = text.indexOf(open, i);
+      if (a < 0) return;
+      const b = text.indexOf(close, a + open.length);
+      if (b < 0) return;
+      fn(text.slice(a + open.length, b));
+      i = b + close.length;
+    }
+  };
+  blocks('beginbfchar', 'endbfchar', (block) => {
+    for (const m of block.matchAll(/<([0-9a-fA-F]{1,8})>\s*<([0-9a-fA-F]{0,64})>/g)) {
+      if (map.size >= PDF_LIMITS.maxCMapEntries) return;
+      map.set(parseInt(m[1], 16), utf16be(hexToBytes(m[2])));
+    }
+  });
+  blocks('beginbfrange', 'endbfrange', (block) => {
+    for (const m of block.matchAll(/<([0-9a-fA-F]{1,8})>\s*<([0-9a-fA-F]{1,8})>\s*(<([0-9a-fA-F]{0,64})>|\[([^\]]{0,200000})\])/g)) {
       const lo = parseInt(m[1], 16);
       const hi = parseInt(m[2], 16);
-      if (hi - lo > 65535) continue;
+      if (!(hi >= lo) || hi - lo > 65535) continue;
       if (m[4] !== undefined) {
-        const base = hexToBytes(m[4]);
-        for (let c = lo; c <= hi; c++) {
-          const b = Buffer.from(base);
-          b[b.length - 1] += c - lo;
-          map.set(c, utf16be(b));
-        }
+        if (ranges.length < PDF_LIMITS.maxCMapRanges) ranges.push({ lo, hi, base: hexToBytes(m[4]) });
       } else {
-        const items = [...m[5].matchAll(/<([0-9a-fA-F]*)>/g)].map((x) => utf16be(hexToBytes(x[1])));
-        items.forEach((u, k) => map.set(lo + k, u));
+        let k = 0;
+        for (const x of m[5].matchAll(/<([0-9a-fA-F]{0,64})>/g)) {
+          if (map.size >= PDF_LIMITS.maxCMapEntries || lo + k > hi) break;
+          map.set(lo + k++, utf16be(hexToBytes(x[1])));
+        }
       }
     }
+  });
+  return { map, ranges, codeBytes };
+}
+
+function cmapLookup(cmap, code) {
+  const v = cmap.map.get(code);
+  if (v !== undefined) return v;
+  for (let i = cmap.ranges.length - 1; i >= 0; i--) {
+    const r = cmap.ranges[i];
+    if (code >= r.lo && code <= r.hi) {
+      const b = Buffer.from(r.base);
+      if (b.length) b[b.length - 1] += code - r.lo;
+      return utf16be(b);
+    }
   }
-  return { map, codeBytes };
+  return undefined;
 }
 
 function fontsForPage(objs, pageDict) {
@@ -179,6 +240,8 @@ function fontsForPage(objs, pageDict) {
   }
   const fonts = new Map();
   if (!resources) return fonts;
+  if (doc?.fontCache.has(resources)) return doc.fontCache.get(resources);
+  doc?.fontCache.set(resources, fonts);
   const fontDict = subDict(objs, resources, 'Font');
   if (!fontDict) return fonts;
   for (const m of fontDict.matchAll(/\/([^\s/<>[\]()]+)\s+(\d+)\s+\d+\s+R/g)) {
@@ -187,8 +250,12 @@ function fontsForPage(objs, pageDict) {
     const tu = refOf(fobj.dict, 'ToUnicode');
     let cmap = null;
     if (tu) {
-      const data = decodeStream(objs.get(tu));
-      if (data) cmap = parseCMap(data.toString('latin1'));
+      if (doc?.cmapCache.has(tu)) cmap = doc.cmapCache.get(tu);
+      else {
+        const data = decodeStream(objs.get(tu));
+        if (data) cmap = parseCMap(data.toString('latin1'));
+        doc?.cmapCache.set(tu, cmap);
+      }
     }
     const type0 = /\/Subtype\s*\/Type0/.test(fobj.dict);
     fonts.set(m[1], { cmap, codeBytes: cmap?.codeBytes || (type0 ? 2 : 1) });
@@ -203,7 +270,8 @@ function decodePdfString(bytes, font) {
   let out = '';
   for (let i = 0; i + codeBytes <= bytes.length; i += codeBytes) {
     const code = codeBytes === 2 ? (bytes[i] << 8) | bytes[i + 1] : bytes[i];
-    if (cmap?.map.has(code)) out += cmap.map.get(code);
+    const u = cmap ? cmapLookup(cmap, code) : undefined;
+    if (u !== undefined) out += u;
     else if (codeBytes === 1) out += String.fromCharCode(code);
   }
   return out;
@@ -245,6 +313,7 @@ function extractTextFromContent(content, fonts) {
   let i = 0;
   let out = '';
   let stack = [];
+  let arrStarts = [];
   let font = null;
   let lastY = null;
   const push = (t) => { out += t; };
@@ -257,11 +326,10 @@ function extractTextFromContent(content, fonts) {
     if (c === '<' && s[i + 1] === '<') { stack.push({ dict: true }); i += 2; continue; }
     if (c === '>' && s[i + 1] === '>') { i += 2; continue; }
     if (c === '<') { const j = s.indexOf('>', i); stack.push({ str: hexToBytes(s.slice(i + 1, j < 0 ? s.length : j)) }); i = j < 0 ? s.length : j + 1; continue; }
-    if (c === '[') { stack.push({ arrStart: true }); i++; continue; }
+    if (c === '[') { arrStarts.push(stack.length); i++; continue; }
     if (c === ']') {
-      const arr = [];
-      while (stack.length && !stack[stack.length - 1].arrStart) arr.unshift(stack.pop());
-      stack.pop();
+      const st = arrStarts.length ? arrStarts.pop() : 0;
+      const arr = stack.splice(st); // linear: no repeated unshift
       stack.push({ arr });
       i++;
       continue;
@@ -291,10 +359,12 @@ function extractTextFromContent(content, fonts) {
       case 'Tm': { const n = nums(); const y = n[5]; if (lastY !== null && y !== undefined && Math.abs(y - lastY) > 0.5) newline(); lastY = y ?? lastY; break; }
       case 'T*': newline(); break;
       case 'ET': if (!out.endsWith('\n') && !out.endsWith(' ')) push(' '); break;
-      case 'ID': { const e = s.slice(i).search(/\sEI\b/); i = e < 0 ? s.length : i + e + 3; break; }
+      case 'ID': { const re = /\sEI\b/g; re.lastIndex = i; const m = re.exec(s); i = m ? m.index + 3 : s.length; break; }
       default: break;
     }
     stack = [];
+    arrStarts = [];
+    if (doc && (++doc.operators > PDF_LIMITS.maxOperators || out.length > PDF_LIMITS.maxTextChars)) { doc.warn('PDF has too many drawing operations; text is truncated.'); break; }
   }
   return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
 }
@@ -328,26 +398,45 @@ export function extractPdfText(buf) {
   const s = buf.toString('latin1');
   if (!s.startsWith('%PDF')) throw new Error('Not a PDF file');
   if (/\/Encrypt\s+\d+\s+\d+\s+R|\/Encrypt\s*<</.test(s)) throw new Error('Encrypted PDFs are not supported');
-  const objs = parseObjects(s, buf);
-  expandObjectStreams(objs);
-  const pages = orderedPages(objs);
   const warnings = [];
-  const texts = [];
-  for (const pn of pages) {
-    const page = objs.get(pn);
-    const fonts = fontsForPage(objs, page.dict);
-    let refs = [];
-    const arr = page.dict.match(/\/Contents\s*\[([^\]]*)\]/);
-    if (arr) refs = [...arr[1].matchAll(/(\d+)\s+\d+\s+R/g)].map((m) => Number(m[1]));
-    else { const r = refOf(page.dict, 'Contents'); if (r) refs = [r]; }
-    let content = '';
-    for (const r of refs) {
-      const data = decodeStream(objs.get(r));
-      if (data) content += data.toString('latin1') + '\n';
+  doc = { decodedCache: new Map(), cmapCache: new Map(), fontCache: new Map(), pageText: new Map(), decodedBytes: 0, contentBytes: 0, operators: 0, warn: (w) => { if (!warnings.includes(w)) warnings.push(w); } };
+  try {
+    const objs = parseObjects(s, buf);
+    expandObjectStreams(objs);
+    const pages = orderedPages(objs);
+    const texts = [];
+    let textChars = 0;
+    for (const pn of pages) {
+      const page = objs.get(pn);
+      const fonts = fontsForPage(objs, page.dict);
+      let refs = [];
+      const arr = page.dict.match(/\/Contents\s*\[([^\]]{0,100000})\]/);
+      if (arr) refs = [...arr[1].matchAll(/(\d+)\s+\d+\s+R/g)].map((m) => Number(m[1]));
+      else { const r = refOf(page.dict, 'Contents'); if (r) refs = [r]; }
+      // Pages that share the same content streams and fonts are interpreted once.
+      const key = `${refs.join(',')}|${[...fonts.keys()].join(',')}|${fonts.size ? doc.fontCache.size : 0}`;
+      let pageText = doc.pageText.get(key);
+      if (pageText === undefined) {
+        let content = '';
+        for (const r of refs) {
+          const data = decodeStream(objs.get(r));
+          if (!data) continue;
+          doc.contentBytes += data.length;
+          if (doc.contentBytes > PDF_LIMITS.maxContentBytes) { doc.warn('PDF is too large to extract completely; text is truncated.'); break; }
+          content += data.toString('latin1') + '\n';
+        }
+        pageText = extractTextFromContent(content, fonts).trim();
+        doc.pageText.set(key, pageText);
+      }
+      texts.push(pageText);
+      textChars += pageText.length;
+      if (textChars > PDF_LIMITS.maxTextChars || doc.operators > PDF_LIMITS.maxOperators || doc.contentBytes > PDF_LIMITS.maxContentBytes) break;
     }
-    texts.push(extractTextFromContent(content, fonts).trim());
+    var text = texts.join('\n\n').trim().slice(0, PDF_LIMITS.maxTextChars);
+    var pageCount = pages.length;
+  } finally {
+    doc = null;
   }
-  const text = texts.join('\n\n').trim();
   if (!text) warnings.push('No extractable text found (the PDF may be scanned images; OCR is not supported).');
-  return { text, pages: pages.length, warnings };
+  return { text, pages: pageCount, warnings };
 }

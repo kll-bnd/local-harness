@@ -119,8 +119,8 @@ test('edit & resend creates a branch; ‹ 1/2 › switches between versions; reg
     await editor.fill('second version of the question');
     await user.locator('button', { hasText: 'Save & send' }).click();
     await waitIdle(page);
+    await page.waitForFunction(() => /^You said: second version/.test(document.querySelector('.turn:last-child .msg-assistant .prose')?.textContent || ''));
     assert.match(await lastTurn(page).locator('.msg-user .user-text').textContent(), /second version/);
-    assert.match(await lastTurn(page).locator('.msg-assistant .prose').textContent(), /You said: second version/);
     assert.equal(await lastTurn(page).locator('.msg-user .branch-pos').textContent(), '2/2');
     await lastTurn(page).locator('button[aria-label="Previous message version"]').click();
     await page.waitForFunction(() => /first version/.test(document.querySelector('.turn:last-child .msg-user .user-text')?.textContent || ''));
@@ -198,7 +198,8 @@ test('desktop shell: every native menu action is handled; traffic-light zone is 
     await menu('toggle-inspector'); await page.waitForSelector('.app.inspector-open');
     await menu('toggle-inspector'); await page.waitForSelector('.app:not(.inspector-open)');
     await menu('search-chats'); await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === 'Search chats');
-    await menu('focus-composer'); await page.waitForFunction(() => document.activeElement?.classList.contains('composer-input'));
+    await menu('focus-composer');
+    await page.waitForFunction(() => document.activeElement?.classList.contains('composer-input'));
     await menu('command-palette'); await page.waitForSelector('dialog.palette[open]'); await page.keyboard.press('Escape');
     await menu('show-shortcuts'); await page.waitForSelector('dialog.dialog[open] .shortcuts-grid'); await page.keyboard.press('Escape');
     await menu('export-chat'); await page.waitForSelector('dialog.dialog[open] .export-opt'); await page.keyboard.press('Escape');

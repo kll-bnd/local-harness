@@ -10,6 +10,7 @@ import { HttpError, ProviderError } from '../lib/errors.mjs';
 
 const STATUS_TTL = 3000;
 const MODELS_TTL = 4000;
+const SERVER_INFO_TTL = 3000;
 
 export class ProviderRegistry {
   constructor({ settings, bus, system, autodetect = true, ollamaProcess = null }) {
@@ -22,6 +23,7 @@ export class ProviderRegistry {
     this._statusCache = new Map();
     this._modelsCache = null;
     this._infoCache = new Map();
+    this.toolsRejected = new Set(); // `${providerId}|${model}` that refused tool definitions
     this._configKey = null;
   }
 
@@ -163,23 +165,28 @@ export class ProviderRegistry {
   async modelInfo(provider, model, { refresh = false } = {}) {
     const tag = await this.findModel(model, provider.id).catch(() => null);
     const key = `${provider.id}|${model}|${tag?.digest || ''}`;
-    if (!refresh && this._infoCache.has(key)) return this._infoCache.get(key);
+    // Ollama metadata is tied to the model digest. OpenAI-compatible servers have no digest and their context is
+    // set at launch (llama-server -c, LM Studio JIT loading), so their info is only reused for a few seconds.
+    const hit = this._infoCache.get(key);
+    if (!refresh && hit && (provider.kind === 'ollama' || Date.now() - hit.at < SERVER_INFO_TTL)) return hit.info;
     let info;
     if (provider.kind === 'ollama') {
       const show = await provider.show(model);
       info = normalizeOllamaShow(model, show, tag);
       if (!info.sizeBytes && tag?.sizeBytes) info.sizeBytes = tag.sizeBytes;
     } else {
-      const si = await provider.serverInfo().catch(() => ({}));
+      const si = await provider.serverInfo({ refresh: true }).catch(() => ({}));
       info = normalizeOpenAIModel(provider, tag || { model }, si);
     }
     info.providerId = provider.id;
-    this._infoCache.set(key, info);
+    this._infoCache.set(key, { at: Date.now(), info });
+    if (this._infoCache.size > 500) this._infoCache.delete(this._infoCache.keys().next().value);
     return info;
   }
 
   dropInfo(providerId, model) {
     for (const k of this._infoCache.keys()) if (k.startsWith(`${providerId}|${model}|`)) this._infoCache.delete(k);
+    this.toolsRejected.delete(`${providerId}|${model}`);
     this._modelsCache = null;
   }
 
