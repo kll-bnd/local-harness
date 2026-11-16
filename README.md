@@ -14,18 +14,26 @@ catalogue** (the Ollama library and GGUF models on Hugging Face, filtered to wha
 Under the hood it is a small backend (plain Node.js, no dependencies) and a web UI, shown in the native app
 (recommended), the Electron app or your web browser.
 
-> **Status (0.2.0).** Harness 0.1 was verified on a real Mac in CI (GitHub's Apple Silicon runner, "Apple M1
-> (Virtual)", 7 GB RAM, macOS 26, real Ollama 0.40.13): the backend tests, building and signing the Electron app,
-> its end-to-end test from source and packaged, the UI tests in WebKit, the live check against real Ollama, and
-> Nemotron 3.5 Bolt E4B (text-only `UD-Q3_K_XL`) chatting, calling tools, thinking on/off and JSON output. For
-> 0.2, verified on that runner: the **native app** with the real backend passed its 21-step self-test (first-run
-> setup, a streamed chat, an attachment image, an export download, the chat's marker text absent from every file in
-> the data folder, allow/block internet, lock — data routes refuse and Ollama holds no model —, wrong password
-> rejected, keychain mode across launches; neither the app nor its backend held a listening socket); and the
-> blocker's macOS layer ([below](#the-internet-blocker)). The 0.2 changes to the Electron app, the command-line
-> tools and the live check are tested on Linux; their Mac runs are pending. Not verified on real hardware: a person
-> using the native window (or any window), real speeds on a real M1, Gatekeeper on a physical machine, and Draw
-> Things / ComfyUI / llama.cpp / LM Studio, which were only tested against fakes.
+> **Status (0.2.0).** Verified on a real Mac in CI (GitHub's Apple Silicon runners, "Apple M1/M2 (Virtual)",
+> 7–14 GB RAM, macOS 26, real Ollama 0.40.13). **On the final code:** the backend and tool tests plus a check
+> against the real Keychain with a throw-away item; the UI test suite in WebKit, the engine of the native app and
+> Safari; and the **native app** with the real backend — all 23 checks of its self-test (first-run setup, a streamed
+> chat, an attachment, an export download, no chat text readable in the data folder, allow/block internet with
+> Ollama confined by the macOS sandbox, lock, wrong password rejected, "Don't ask on this Mac" across launches), with
+> neither the app nor its backend holding a listening socket. **On 0.2 code from earlier the same day** (GitHub's Mac
+> runners ran out of capacity before these could be repeated on the final commit; the changes since are covered by
+> the tests above and by the same suites on Linux): ten out of ten starts of Harness's own Ollama confined by the
+> sandbox on a busy machine (three small commits before the final one); Nemotron 3.5 Bolt E4B (text-only
+> `UD-Q3_K_XL`) with the shipped defaults — password setup, a download through the blocker's allow window, chat, the
+> image tool, thinking on/off, auto-title, memory extraction, compaction and lock (before the last two rounds of
+> security fixes); the live check against real Ollama, 85 checks with no failure, and the Electron app built, signed
+> and run end to end (both before the security fixes; the Electron app has since stopped attaching to another
+> running Harness, which is tested on Linux only). The security code was reviewed in four rounds by a reviewer who
+> did not write it; every defect it could reproduce was fixed and attacked again
+> ([what is and is not protected](#privacy-and-security)). Not verified on real hardware: a person using the native
+> window (or any window), real speeds on a real M1 (the runners' graphics are virtual and slow), Gatekeeper on a
+> physical machine, real sleep and screen lock, and Draw Things / ComfyUI / llama.cpp / LM Studio, which were only
+> tested against stand-ins.
 > See [If something doesn't work](#if-something-doesnt-work).
 
 ---
@@ -114,8 +122,9 @@ scripts/build-native.sh --install    # builds dist/native/Harness.app (ad-hoc si
 ```
 
 It uses the same data folder, password and settings as every other way of running Harness, the same menus and
-shortcuts (⌃⌘L locks; it also locks when the Mac sleeps or the screen locks), and idles at about 96 MB physical
-footprint against 108 MB for the Electron app (240 MB against 418 MB resident; 120 MB on disk against 309 MB).
+shortcuts (⌃⌘L locks; it also locks when the Mac sleeps or the screen locks). It is a third of the Electron app's
+size on disk (120 MB against 309 MB) and keeps less memory resident when idle (about 300 MB against 415 MB, measured
+on the test Mac; the physical footprint of both is about 105 MB).
 
 **The command-line tools and the app.** Because the app has no local address, `npm run get-model` and the live
 parts of `npm run doctor` cannot talk to it; while the app is open they say so instead of guessing. Download
@@ -126,10 +135,12 @@ quit the app first (⌘Q): they then start a short-lived Harness of their own on
 **Verified on GitHub's Apple Silicon runner** (macOS 26, driving the built app in a self-test mode): the build with
 the Command Line Tools only and a strict signature check; the page contract, all 15 menu actions, uploads up to
 50 MB, downloads, streaming, navigation and remote-content blocking, locking on sleep/screen lock/menu. With the
-real backend the app passed its 21-step self-test: first-run setup, a streamed chat, an attachment image, an export
-download, the chat's marker text absent from every file in the data folder, allow/block internet, lock (data routes
-refuse and Ollama holds no model), wrong password rejected, keychain mode across launches. Neither the app nor its
-backend held a listening socket. **Not verified:** a person looking at and using
+real backend the app passed all 23 checks of its self-test: first-run setup, a streamed chat, an attachment image,
+an export download, the chat's marker text absent from every file in the data folder, allow/block internet with the
+Ollama it started confined by the sandbox, lock (data routes refuse and Ollama holds no model), wrong password
+rejected, and "Don't ask on this Mac" across launches (the Keychain item is created, used, left alone when it is not
+ours, and deleted on leaving the mode — also on the default data folder). Neither the app nor its backend held a
+listening socket. **Not verified:** a person looking at and using
 the window (title bar, icon, dark mode, panels), dragging the window by the UI's title bar, the Keychain prompt
 after a rebuild, real sleep and screen locking (the self-test posts the same notifications), the global shortcut
 on a real keyboard, Gatekeeper with a downloaded copy, and a physical 8 GB M1. Details: [docs/NATIVE.md](docs/NATIVE.md).

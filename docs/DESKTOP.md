@@ -273,7 +273,11 @@ Config: the `build` key in `package.json`. Highlights:
 
 ## Verification status
 
-**0.2: verified on Linux only** (Electron 44 under Xvfb, against the finished 0.2 backend). Unit tests for the 15-action menu
+**0.2: verified on Linux** (Electron 44 under Xvfb, against the finished 0.2 backend) **and, for an earlier 0.2
+commit, on the Mac runner**: `npm run dist` and `npm run test:e2e` from source and against the packaged app passed
+there at commit 63a7b10 — with the 0.2 checks below, but before the app stopped attaching to another running Harness
+(start-or-refuse) and before the security fixes that followed the review. GitHub's Mac runners ran out of capacity
+before the job could be repeated on the final commit, so those later changes are verified on Linux only. Unit tests for the 15-action menu
 contract, Lock Harness ⌃⌘L, instance detection by lock file + health, start-or-refuse (each holder, the race,
 the dialog texts, a stand-in named by the lock receiving only `GET /api/health`, a lock from another computer
 never contacted, no address shown unless it is `http://127.0.0.1:<valid port>`); `npm run test:e2e` adds
@@ -282,7 +286,7 @@ in the documented shape, the window's own session (`/api/auth/status` from the p
 being memory-only, data routes refused without a session, the `lock` menu action reaching the page, and an
 emitted `lock-screen` locking the backend (data routes → 423) and releasing the App Nap blocker; and a damaged key
 store starting in state `error` with the key store left untouched. **Not yet
-run on a Mac:** all of the above, real sleep/screen-lock events, and the sandboxed Ollama.
+run on a Mac:** start-or-refuse and its dialogs, and real sleep/screen-lock events.
 
 **0.1, verified on a real Mac in CI** (`.github/workflows/macos.yml`, GitHub's Apple Silicon runner: "Apple M1
 (Virtual)", 7 GB RAM, macOS 26):
