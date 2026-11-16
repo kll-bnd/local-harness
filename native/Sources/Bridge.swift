@@ -22,11 +22,28 @@ struct Frame {
     let payload: Data
 }
 
+/// Big-endian bytes of a 32-bit value (kept as plain statements: long integer expressions are slow to type-check).
+func be32(_ v: UInt32) -> [UInt8] {
+    let a = UInt8(truncatingIfNeeded: v >> 24)
+    let b = UInt8(truncatingIfNeeded: v >> 16)
+    let c = UInt8(truncatingIfNeeded: v >> 8)
+    let d = UInt8(truncatingIfNeeded: v)
+    return [a, b, c, d]
+}
+
+func readBE32(_ buf: [UInt8], _ i: Int) -> UInt32 {
+    var v = UInt32(buf[i])
+    v = (v << 8) | UInt32(buf[i + 1])
+    v = (v << 8) | UInt32(buf[i + 2])
+    v = (v << 8) | UInt32(buf[i + 3])
+    return v
+}
+
 func encodeFrame(_ type: UInt8, _ stream: UInt32, _ payload: Data = Data()) -> Data {
-    let n = UInt32(5 + payload.count)
     var d = Data(capacity: 9 + payload.count)
-    d.append(contentsOf: [UInt8((n >> 24) & 0xff), UInt8((n >> 16) & 0xff), UInt8((n >> 8) & 0xff), UInt8(n & 0xff), type,
-                          UInt8((stream >> 24) & 0xff), UInt8((stream >> 16) & 0xff), UInt8((stream >> 8) & 0xff), UInt8(stream & 0xff)])
+    d.append(contentsOf: be32(UInt32(5 + payload.count)))
+    d.append(type)
+    d.append(contentsOf: be32(stream))
     d.append(payload)
     return d
 }
@@ -42,11 +59,11 @@ final class FrameDecoder {
         buf.append(contentsOf: chunk)
         var out: [Frame] = []
         while buf.count - pos >= 4 {
-            let n = Int(buf[pos]) << 24 | Int(buf[pos + 1]) << 16 | Int(buf[pos + 2]) << 8 | Int(buf[pos + 3])
+            let n = Int(readBE32(buf, pos))
             if n < 5 || n > maxFramePayload + 5 { throw CorruptStream() }
             if buf.count - pos < 4 + n { break }
             let type = buf[pos + 4]
-            let sid = UInt32(buf[pos + 5]) << 24 | UInt32(buf[pos + 6]) << 16 | UInt32(buf[pos + 7]) << 8 | UInt32(buf[pos + 8])
+            let sid = readBE32(buf, pos + 5)
             let payload = n > 5 ? Data(buf[(pos + 9)..<(pos + 4 + n)]) : Data()
             out.append(Frame(type: type, stream: sid, payload: payload))
             pos += 4 + n

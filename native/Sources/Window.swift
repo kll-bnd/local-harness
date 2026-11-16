@@ -13,8 +13,8 @@ final class HarnessWebView: WKWebView {
 
 let windowBackground = NSColor(name: nil) { appearance in
     appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        ? NSColor(srgbRed: 0x1c / 255.0, green: 0x1c / 255.0, blue: 0x1e / 255.0, alpha: 1)
-        : NSColor(srgbRed: 0xfa / 255.0, green: 0xfa / 255.0, blue: 0xfa / 255.0, alpha: 1)
+        ? NSColor(srgbRed: 0.10980, green: 0.10980, blue: 0.11765, alpha: 1) // #1c1c1e
+        : NSColor(srgbRed: 0.98039, green: 0.98039, blue: 0.98039, alpha: 1) // #fafafa
 }
 
 final class MainWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
@@ -416,7 +416,10 @@ enum WindowState {
         var best: (area: CGFloat, screen: NSRect)? = nil
         for s in NSScreen.screens {
             let i = rect.intersection(s.visibleFrame)
-            if !i.isNull, i.width >= 120, i.height >= 60, best == nil || i.width * i.height > best!.area { best = (i.width * i.height, s.visibleFrame) }
+            if i.isNull || i.width < 120 || i.height < 60 { continue }
+            let a: CGFloat = i.width * i.height
+            if let b = best, b.area >= a { continue }
+            best = (a, s.visibleFrame)
         }
         guard let area = best?.screen else { return (centred(NSSize(width: w, height: h)), zoomed) }
         let cw = max(minWidth, min(w, area.width)), ch = max(minHeight, min(h, area.height))

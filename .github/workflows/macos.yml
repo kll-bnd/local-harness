@@ -309,6 +309,7 @@ jobs:
             echo "toolchain| Command Line Tools: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools xcrun swiftc --version 2>&1 | head -n 1)"
           } >> "$FACTS"
       - name: Build Harness.app with the Command Line Tools only
+        timeout-minutes: 12
         env:
           DEVELOPER_DIR: /Library/Developer/CommandLineTools
         run: |

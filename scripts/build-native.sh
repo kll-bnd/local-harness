@@ -55,8 +55,12 @@ rm -rf "$APP"
 mkdir -p "$C/MacOS" "$C/Resources/app"
 
 say "Compiling Harness $VERSION ($(xcrun swiftc --version 2>&1 | head -n 1 | sed 's/^.*\(Swift version [0-9.]*\).*$/\1/'))"
+# Slow-to-type-check expressions are reported (and, past HARNESS_SWIFT_SOLVER_LIMIT seconds, refused) instead of
+# silently taking minutes.
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos12.0 -o "$C/MacOS/Harness" native/Sources/*.swift \
-  -framework AppKit -framework WebKit -framework Security -framework Carbon
+  -framework AppKit -framework WebKit -framework Security -framework Carbon \
+  -Xfrontend -warn-long-expression-type-checking=400 \
+  -Xfrontend -solver-expression-time-threshold="${HARNESS_SWIFT_SOLVER_LIMIT:-60}"
 
 say "Assembling the bundle"
 sed "s/__VERSION__/$VERSION/g" native/Info.plist > "$C/Info.plist"
