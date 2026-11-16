@@ -106,6 +106,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuItemValidation
         }
         log = LogFile(paths.logFile)
         if !takeInstanceLock() { return }
+        DataKeyStore.account = DataKeyStore.accountFor(dataDir: paths.dataDir)
         if let dir = options.selfTestDir { selfTest = SelfTest(app: self, dir: URL(fileURLWithPath: dir), options: options) }
         config = DesktopConfig.load(paths.desktopConfig)
         for w in config.warnings { log.info("desktop.json: \(w)") }

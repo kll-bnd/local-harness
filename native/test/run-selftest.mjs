@@ -18,11 +18,17 @@ const backend = opt('backend') ? path.resolve(opt('backend')) : null;
 const launches = Number(opt('launches', '1'));
 const files = opt('files', '');
 const timeoutS = Number(opt('timeout', '300'));
-const dataDir = path.resolve(opt('data', fs.mkdtempSync(path.join(os.tmpdir(), `harness-${label}-data-`))));
+// `--data default` means the real default data folder (~/Library/Application Support/Harness). It is wiped before and
+// after, so it is allowed only on CI and with --allow-default-data (never on someone's own Mac).
+const defaultData = path.join(os.homedir(), 'Library', 'Application Support', 'Harness');
+const useDefault = opt('data') === 'default';
+if (useDefault && !(process.env.CI === 'true' && argv.includes('--allow-default-data'))) { console.error('--data default wipes ~/Library/Application Support/Harness: CI only, with --allow-default-data'); process.exit(2); }
+if (useDefault) fs.rmSync(defaultData, { recursive: true, force: true });
+const dataDir = useDefault ? defaultData : path.resolve(opt('data', fs.mkdtempSync(path.join(os.tmpdir(), `harness-${label}-data-`))));
 const outDir = fs.mkdtempSync(path.join(os.tmpdir(), `harness-${label}-out-`));
 const FACTS = process.env.FACTS || '/tmp/native-facts.txt';
 const lines = [];
-const say = (k, v) => { const l = `selftest| ${label} ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`.slice(0, 700); lines.push(l); console.log(l); };
+const say = (k, v) => { const l = `selftest| ${label} ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`.slice(0, k.startsWith('FAIL') ? 1500 : 700); lines.push(l); console.log(l); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sh = (cmd, args) => { try { return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); } catch (e) { return e.stdout || ''; } };
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
@@ -130,4 +136,6 @@ if (fs.existsSync(appLog)) {
   for (const l of tail) say('log', l.replace(/^\[native \S+\] /, '').slice(0, 200));
 }
 fs.appendFileSync(FACTS, lines.join('\n') + '\n');
+if (useDefault) fs.rmSync(defaultData, { recursive: true, force: true });
+// The job's last step (native/ci/summary.mjs) turns any failure into a failed job, after every step has run.
 process.exit(0);

@@ -322,7 +322,7 @@ jobs:
     name: Native macOS app (WKWebView + bridge + offline lock)
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'native' }}
     runs-on: macos-latest
-    timeout-minutes: 50
+    timeout-minutes: 35
     env:
       FACTS: /tmp/native-facts.txt
     steps:
@@ -373,12 +373,16 @@ jobs:
         run: |
           node native/test/bridge-client.mjs server/index.mjs "$RUNNER_TEMP/bridge-check" 2>&1 | sed 's/^/bridge| /' >> "$FACTS"
           node native/test/run-selftest.mjs --app dist/native/Harness.app --label real --script native/test/selftest-real.js --launches 3 --timeout 900 --settle 5 --log-lines 20 --show chatStreamsFromRealModel,appNapHeldOnlyWhileGenerating,offlineLockAroundOllama,allowThenBlockAgain,lockUnloadsAndLocks,keychainModeOpensWithoutPassword,wrongKeychainKeyFallsBackToPassword > /dev/null
+      - name: Keychain mode on the default data folder (the real user's case)
+        if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
+        continue-on-error: true
+        run: node native/test/run-selftest.mjs --app dist/native/Harness.app --label keychain-default --script native/test/selftest-keychain-default.js --launches 2 --timeout 240 --data default --allow-default-data > /dev/null
       - name: Idle memory, native app on the real UI
         if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
         continue-on-error: true
         run: node native/test/run-selftest.mjs --app dist/native/Harness.app --label idle --script native/test/selftest-idle.js --launches 1 --timeout 120 --settle 15 > /dev/null
-      - name: Electron build for comparison (size, idle memory)
-        if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
+      - name: Electron build for comparison (size, idle memory; only when the native job runs alone)
+        if: ${{ inputs.jobs == 'native' && hashFiles('server/bridge/server.mjs') != '' }}
         continue-on-error: true
         run: |
           npm ci > /dev/null 2>&1
@@ -388,4 +392,4 @@ jobs:
         if: always()
         run: |
           cat "$FACTS"
-          node native/ci/summary.mjs
+          node native/ci/summary.mjs mock real keychain-default idle

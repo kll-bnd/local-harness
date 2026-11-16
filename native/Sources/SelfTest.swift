@@ -244,7 +244,7 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
                 let exists = DataKeyStore.exists()
                 var fp: Any = NSNull()
                 if exists, case .found(let k) = DataKeyStore.read() { fp = DataKeyStore.fingerprint(k) }
-                DispatchQueue.main.async { r(["exists": exists, "fingerprint": fp]) }
+                DispatchQueue.main.async { r(["exists": exists, "fingerprint": fp, "account": DataKeyStore.account]) }
             }
         case "ollama":
             // Ask the local Ollama directly (the page cannot reach 127.0.0.1): GET /api/ps, POST /api/pull, …
@@ -266,6 +266,9 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
             var bytes = [UInt8](repeating: 0, count: 32)
             _ = SecRandomCopyBytes(kSecRandomDefault, 32, &bytes)
             r(["status": Int(DataKeyStore.store(Data(bytes).base64EncodedString()))])
+        case "keychainDelete":
+            // Test clean-up only (the item of this test's own data folder).
+            r(["status": Int(DataKeyStore.delete())])
         case "stash":
             if let k = b["key"] as? String { stash[k] = b["value"] ?? NSNull() }
             write(stash, "stash.json")

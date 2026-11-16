@@ -9,7 +9,8 @@
   async function check(name, fn, ms = 120000) {
     const t0 = performance.now();
     let v;
-    try { v = await Promise.race([fn(), sleep(ms).then(() => ({ ok: false, error: 'timeout' }))]); } catch (e) { v = { ok: false, error: String((e && e.message) || e) }; }
+    window.__progress = null;
+    try { v = await Promise.race([fn(), sleep(ms).then(() => ({ ok: false, error: 'timeout', progress: window.__progress }))]); } catch (e) { v = { ok: false, error: String((e && e.message) || e), progress: window.__progress }; }
     v.ms = Math.round(performance.now() - t0);
     await native('result', { key: name, value: v });
     return v;
@@ -25,47 +26,75 @@
   const waitFor = async (cond, ms = 20000) => { const end = Date.now() + ms; while (Date.now() < end) { if (await cond()) return true; await sleep(250); } return false; };
   const MODEL = { providerId: 'ollama', model: 'qwen3:0.6b' };
 
-  async function chat(chatId, content) {
-    // Right after an unlock the backend may still be starting its Ollama (503 connection_failed): retry for a while.
+  /**
+   * One chat turn through the UI's own path (fetch → harness:// → bridge). Progress is kept in window.__progress so a
+   * check that times out says how far the stream got. `abortAfter`: abort the request after that many pieces (the
+   * UI's Stop). `deadlineMs`: abort and report instead of waiting for ever (a small model can ramble).
+   */
+  async function chat(chatId, content, { abortAfter = 0, deadlineMs = 150000 } = {}) {
+    const P = { phase: 'request', pieces: 0, types: {}, chars: 0, startedAt: Date.now(), lastEventAt: null, lastType: null };
+    window.__progress = P;
+    const ac = new AbortController();
+    const deadline = setTimeout(() => { P.phase = 'deadline'; ac.abort(); }, deadlineMs);
     let res;
     let waitedForOllamaMs = 0;
-    for (const end = Date.now() + 90000; ;) {
-      res = await fetch(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
-        method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
-        body: JSON.stringify({ content, model: MODEL }),
-      });
-      if (res.status !== 503 || Date.now() > end) break;
-      await res.text();
-      await sleep(2000);
-      waitedForOllamaMs += 2000;
-    }
-    if (!res.ok) return { status: res.status, body: (await res.text()).slice(0, 200), waitedForOllamaMs };
+    try {
+      // Right after an unlock the backend may still be starting its Ollama (503 in older backends): retry a while.
+      for (const end = Date.now() + 90000; ;) {
+        res = await fetch(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
+          method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+          body: JSON.stringify({ content, model: MODEL }), signal: ac.signal,
+        });
+        if (res.status !== 503 || Date.now() > end) break;
+        await res.text();
+        await sleep(2000);
+        waitedForOllamaMs += 2000;
+      }
+    } catch (e) { clearTimeout(deadline); return { status: 0, error: String(e.message || e), progress: P }; }
+    P.status = res.status;
+    if (!res.ok) { clearTimeout(deadline); return { status: res.status, body: (await res.text()).slice(0, 200), waitedForOllamaMs }; }
+    P.phase = 'streaming';
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     const times = [];
-    const types = {};
-    let text = '';
     let buf = '';
     let napHeldDuring = null;
+    let aborted = false;
     const t0 = performance.now();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      times.push(Math.round(performance.now() - t0));
-      if (times.length === 3) napHeldDuring = (await native('state')).activityHeld;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf('\n\n')) >= 0) {
-        const block = buf.slice(0, i);
-        buf = buf.slice(i + 2);
-        const data = block.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('\n');
-        if (!data) continue;
-        try { const ev = JSON.parse(data); types[ev.type] = (types[ev.type] || 0) + 1; if (ev.type === 'token' && ev.delta) text += ev.delta; } catch { /* ignore */ }
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        times.push(Math.round(performance.now() - t0));
+        P.pieces = times.length;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          const data = block.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('\n');
+          if (!data) continue;
+          try {
+            const ev = JSON.parse(data);
+            P.types[ev.type] = (P.types[ev.type] || 0) + 1;
+            P.lastType = ev.type === 'model_status' ? `model_status:${ev.phase || ev.reason || ev.status || ''}` : ev.type;
+            P.lastEventAt = Date.now();
+            if ((ev.type === 'token' || ev.type === 'reasoning') && ev.delta) P.chars += ev.delta.length;
+          } catch { /* ignore */ }
+        }
+        if (times.length === 3) { const sNow = await Promise.race([native('state'), sleep(10000).then(() => null)]); napHeldDuring = sNow ? sNow.activityHeld : 'no-reply'; }
+        if (abortAfter && times.length >= abortAfter && napHeldDuring !== null) { aborted = true; P.phase = 'aborting'; ac.abort(); break; }
       }
+    } catch (e) {
+      if (!aborted && P.phase !== 'deadline') { clearTimeout(deadline); return { status: res.status, error: String(e.message || e), progress: P }; }
     }
-    await sleep(500);
-    const napHeldAfter = (await native('state')).activityHeld;
-    return { status: res.status, pieces: times.length, firstMs: times[0], lastMs: times[times.length - 1], types, chars: text.length, napHeldDuring, napHeldAfter, waitedForOllamaMs };
+    clearTimeout(deadline);
+    const timedOut = P.phase === 'deadline';
+    P.phase = 'done';
+    // App Nap must be released when the generation ends (or is stopped): poll, the backend publishes its end first.
+    let napHeldAfter = true;
+    for (let i = 0; i < 40 && napHeldAfter; i++) { await sleep(250); napHeldAfter = (await native('state')).activityHeld; }
+    return { status: res.status, pieces: times.length, firstMs: times[0], lastMs: times[times.length - 1], types: P.types, chars: P.chars, napHeldDuring, napHeldAfter, aborted, timedOut, waitedForOllamaMs };
   }
 
   // ------------------------------------------------------------------------------------------- launch 3
@@ -79,10 +108,13 @@
       const after = (await req('GET', '/api/chats')).status;
       return { ok: s.events.includes('fatal') && pids.length === 2 && s.ready.locked === true && before === 423 && u.status === 200 && after === 200, eventsSeen: s.events, backendStarts: pids.length, lockedAfterFallback: s.ready.locked, state: sec.body?.state, chatsBefore: before, unlock: u.status, chatsAfter: after };
     });
-    await check('leavingKeychainModeDeletesItem', async () => {
+    await check('foreignKeychainItemLeftAlone', async () => {
+      // The item now holds a key that does not open this data: leaving keychain mode must not delete it.
       const r = await req('POST', '/api/security/mode', { password: st.pw, mode: 'password' });
-      const gone = await waitFor(async () => !(await native('keychain')).exists, 15000);
-      return { ok: r.status === 200 && gone, status: r.status, itemDeleted: gone };
+      await sleep(1500);
+      const k = await native('keychain');
+      await native('keychainDelete'); // clean up this test's own item
+      return { ok: r.status === 200 && k.exists && k.fingerprint === st.wrongFingerprint, status: r.status, kept: k.exists, sameItem: k.fingerprint === st.wrongFingerprint };
     });
     await native('finish', { status: 'launch3-done' });
     return;
@@ -95,10 +127,22 @@
       const sec = await req('GET', '/api/security');
       const chats = await req('GET', '/api/chats');
       const k = await native('keychain');
-      return { ok: s.ready.locked === false && sec.body?.state === 'unlocked' && chats.status === 200 && k.fingerprint === st.keyFingerprint, readyLocked: s.ready.locked, state: sec.body?.state, chats: chats.status, sameKeychainItem: k.fingerprint === st.keyFingerprint, keychainRead: s.records.keychainRead };
+      return { ok: s.ready.locked === false && sec.body?.state === 'unlocked' && chats.status === 200 && k.fingerprint === st.keyFingerprint && /^data-key-[0-9a-f]{16}$/.test(k.account), readyLocked: s.ready.locked, state: sec.body?.state, chats: chats.status, sameKeychainItem: k.fingerprint === st.keyFingerprint, account: k.account, keychainRead: s.records.keychainRead };
     });
-    // Leave a valid but wrong key in the Keychain for launch 3.
-    await native('keychainOverwrite');
+    await check('leavingKeychainModeDeletesItem', async () => {
+      const r = await req('POST', '/api/security/mode', { password: st.pw, mode: 'password' });
+      const gone = await waitFor(async () => !(await native('keychain')).exists, 15000);
+      return { ok: r.status === 200 && gone, status: r.status, itemDeleted: gone };
+    });
+    await check('keychainModeAgainThenAWrongKey', async () => {
+      const r = await req('POST', '/api/security/mode', { password: st.pw, mode: 'keychain' });
+      const stored = await waitFor(async () => (await native('keychain')).exists, 15000);
+      // Leave a valid but wrong key in the Keychain for launch 3.
+      await native('keychainOverwrite');
+      const k = await native('keychain');
+      await native('stash', { key: 'wrongFingerprint', value: k.fingerprint });
+      return { ok: r.status === 200 && stored && k.exists && k.fingerprint !== st.keyFingerprint, status: r.status, stored };
+    });
     await native('finish', { status: 'launch2-done' });
     return;
   }
@@ -135,15 +179,16 @@
     const c = await req('POST', '/api/chats', { title: `Self-test ${marker}` });
     chatId = c.body?.chat?.id;
     const r = await chat(chatId, `Reply with the single word "ok". Do not think. ${marker}`);
-    return { ok: r.status === 200 && r.pieces >= 3 && (r.types.token || 0) >= 1 && (r.types.done || 0) === 1, created: c.status, ...r };
-  }, 300000);
+    return { ok: r.status === 200 && r.pieces >= 3 && (r.types.token || 0) >= 1 && (r.types.done || 0) === 1 && r.napHeldDuring === true && r.napHeldAfter === false, created: c.status, ...r };
+  }, 200000);
   await native('result', { key: 'marker', value: { ok: true, marker } });
 
   await check('appNapHeldOnlyWhileGenerating', async () => {
-    const r = await chat(chatId, `Count from one to twenty in words. ${marker}`);
+    // Held while a reply streams, released when the user stops it (Stop = abort → CANCEL → generation.finished).
+    const r = await chat(chatId, `Write a long story about a lighthouse. ${marker}`, { abortAfter: 6, deadlineMs: 120000 });
     const s = await native('state');
-    return { ok: r.napHeldDuring === true && r.napHeldAfter === false && s.busyCount === 0, heldWhileStreaming: r.napHeldDuring, heldAfter: r.napHeldAfter, pieces: r.pieces };
-  }, 300000);
+    return { ok: r.napHeldDuring === true && r.aborted === true && r.napHeldAfter === false && s.busyCount === 0, heldWhileStreaming: r.napHeldDuring, stopped: r.aborted, heldAfterStop: r.napHeldAfter, pieces: r.pieces, types: r.types, timedOut: r.timedOut };
+  }, 180000);
 
   await check('offlineLockAroundOllama', async () => {
     const net = await req('GET', '/api/network');
