@@ -243,9 +243,9 @@ real page, `native/Sources/SelfTest.swift` on the native side).
   it; the window frame restored at the next launch; a clean quit both times, no process left behind. Neither the app
   nor the backend held any socket (`lsof`: no TCP, no UDP, no Unix socket).
 * **Against the real backend** (`node server/index.mjs --bridge`, password mode, fresh data folder, real Ollama with
-  `qwen3:0.6b`, three launches; 21 checks + 3 clean quits, run against the finished 0.2 backend): `ready.locked`, every data route 423 until setup; setup
+  `qwen3:0.6b`, three launches; 20 checks + 3 clean quits, run against the final 0.2 backend): `ready.locked`, every data route 423 until setup; setup
   with a throw-away password (never printed), recovery key returned; a real chat streaming through the bridge (13
-  pieces over 16 s); App Nap held during the stream and released after it; a PNG uploaded as a `File` and shown from
+  pieces over 16 s); App Nap held during the stream and released after it and after Stop; a PNG uploaded as a `File` and shown from
   `harness://app/api/attachments/…/content`; a chat export saved through the bridge; **the chat's marker string not
   found in any file of the data folder**; with internet blocked `GET /api/network` reports `osEnforced: true,
   osScope: "ollama"`, a pull through Harness is refused (403 `offline_lock`) and a pull sent straight to the sandboxed
@@ -253,16 +253,20 @@ real page, `native/Sources/SelfTest.swift` on the native side).
   pull succeeds, "block" puts it back in the sandbox and the pull fails again — without a backend restart; `lock`
   makes every route 423 and Ollama holds no model; a wrong password → 401 `wrong_password`; unlock → the chat is still
   there and answers again; sleep and screen lock lock it; keychain mode → the next launch opens without the password
-  (`ready.locked: false`) with the same Keychain item; a valid but wrong key in the Keychain → `fatal: wrong_key` →
-  the app starts the backend again without the key → locked → the password opens it; leaving keychain mode deletes
-  the item. No listening socket in the app or the backend at any point; the backend's only TCP socket is its client
+  (`ready.locked: false`) with the same Keychain item (account `data-key-<16 hex>` for this non-default folder);
+  leaving keychain mode deletes the item; a valid but wrong key in the Keychain → `fatal: wrong_key` → the app starts
+  the backend again without the key → locked → the password opens it, and leaving keychain mode then leaves that
+  foreign item alone. On the **default** data folder (a separate step, run first on the fresh runner): the account is
+  `data-key`, the next launch opens from the Keychain, leaving keychain mode deletes the item. No listening socket in the app or the backend at any point; the backend's only TCP socket is its client
   connection to Ollama on 127.0.0.1:11434, and only Ollama listens (on 127.0.0.1).
 * **Offline-lock profile**: see `docs/BRIDGE.md` ("Offline lock") for the measured blocks and their limit. The
   backend's own `POST /api/network/test` under the lock reported the code layer blocking huggingface.co,
   ollama.com and registry.ollama.ai before any name lookup and the OS layer refusing a direct TCP connection to
   1.1.1.1:443 with `EPERM`.
-* The last full run: workflow run 43821667376 (commit 94b1d4b on top of the finished backend): mock 34/34, real
-  backend 21/21 + clean quits, idle memory as in the table above.
+* The last full run: workflow run 43829649835 (commit 3ce3e9e, the final code): mock 34/34, real backend 23/23,
+  default-folder Keychain 5/5, idle 2/2 — "RESULT: all checks passed". The job fails when a check fails: run
+  43828511347 (commit 587d9cf, before the backend's Keychain fix) ended with "RESULT: FAILED" and the two failing
+  checks printed last.
 
 ## Not verified
 
