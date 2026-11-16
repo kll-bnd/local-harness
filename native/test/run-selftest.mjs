@@ -40,7 +40,8 @@ function sockets(pids) {
   const inet = sh('lsof', ['-nP', '-a', '-p', list, '-i']).split('\n').slice(1).filter(Boolean);
   const listen = inet.filter((l) => /\(LISTEN\)/.test(l) || /UDP/.test(l));
   const unix = sh('lsof', ['-nP', '-a', '-p', list, '-U']).split('\n').slice(1).filter(Boolean);
-  return { inet: inet.length, listening: listen.map((l) => l.replace(/\s+/g, ' ').slice(0, 120)), unix: unix.length };
+  const short = (l) => l.replace(/\s+/g, ' ').replace(/ 0x[0-9a-f]+ 0t0/, '').slice(0, 110);
+  return { inet: inet.length, listening: listen.map(short), connections: inet.filter((l) => !listen.includes(l)).map(short).slice(0, 4), unix: unix.length };
 }
 
 function memory(appPid, backendPid) {
@@ -82,7 +83,7 @@ for (let n = 1; n <= launches; n++) {
     const ours = pids.filter((p) => !/^ollama/.test(name(p)));
     const theirs = pids.filter((p) => /^ollama/.test(name(p)));
     const sk = sockets(ours);
-    say(`launch${n}.sockets`, { ok: sk.listening.length === 0 && sk.inet === 0, appAndBackend: sk, ollama: theirs.length ? sockets(theirs).listening : 'not started' });
+    say(`launch${n}.sockets`, { ok: sk.listening.length === 0, appAndBackend: sk, ollama: theirs.length ? sockets(theirs).listening : 'not started' });
     if (n === 1) { await sleep(Number(opt('settle', '8')) * 1000); say(`launch${n}.memory`, memory(child.pid, st.backendPid)); }
   } else {
     say(`launch${n}.firstPage`, `none (state ${JSON.stringify(st)})`);

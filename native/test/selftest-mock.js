@@ -320,9 +320,9 @@
   });
 
   await check('windowFrameSaved', async () => {
-    const r = await native('setFrame', { x: 140, y: 120, width: 1010, height: 710 });
+    const r = await native('setFrame', { x: 60, y: 90, width: 760, height: 520 });
     await native('stash', { key: 'frame', value: r.frame });
-    return { ok: r.ok && r.frame[2] === 1010 && r.frame[3] === 710, frame: r.frame };
+    return { ok: r.ok && r.frame[2] === 760 && r.frame[3] === 520, frame: r.frame };
   });
 
   await check('keychainItemCreated', async () => {

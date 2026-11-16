@@ -5,6 +5,7 @@
 import AppKit
 import Carbon
 import CryptoKit
+import Security
 import WebKit
 
 final class SelfTest: NSObject, WKScriptMessageHandler {
@@ -204,7 +205,10 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
             guard let win = w?.window else { r(["ok": false]); return }
             let on = (b["on"] as? Bool) ?? true
             if win.styleMask.contains(.fullScreen) != on { win.toggleFullScreen(nil) }
-            waitUntil(8) { win.styleMask.contains(.fullScreen) == on } then: { ok in r(["ok": ok, "fullscreen": win.styleMask.contains(.fullScreen)]) }
+            // Done when the transition has finished (a toggle during the animation is ignored by AppKit).
+            waitUntil(10) { win.styleMask.contains(.fullScreen) == on && w?.fullScreenTransition == false } then: { ok in
+                r(["ok": ok, "fullscreen": win.styleMask.contains(.fullScreen)])
+            }
         case "closeWindow":
             guard let win = w?.window else { r(["ok": false]); return }
             win.performClose(nil)
@@ -257,6 +261,11 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
                 let text = data.map { String(decoding: $0.prefix(4000), as: UTF8.self) } ?? ""
                 DispatchQueue.main.async { r(["status": status, "body": text, "error": err?.localizedDescription ?? NSNull()]) }
             }.resume()
+        case "keychainOverwrite":
+            // Replace the Keychain item with a valid but wrong key (to test the backend's wrong_key path).
+            var bytes = [UInt8](repeating: 0, count: 32)
+            _ = SecRandomCopyBytes(kSecRandomDefault, 32, &bytes)
+            r(["status": Int(DataKeyStore.store(Data(bytes).base64EncodedString()))])
         case "stash":
             if let k = b["key"] as? String { stash[k] = b["value"] ?? NSNull() }
             write(stash, "stash.json")

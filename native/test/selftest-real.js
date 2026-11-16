@@ -68,6 +68,26 @@
     return { status: res.status, pieces: times.length, firstMs: times[0], lastMs: times[times.length - 1], types, chars: text.length, napHeldDuring, napHeldAfter, waitedForOllamaMs };
   }
 
+  // ------------------------------------------------------------------------------------------- launch 3
+  if (st.launches >= 3) {
+    await check('wrongKeychainKeyFallsBackToPassword', async () => {
+      const s = await native('state');
+      const pids = s.records.lists.backendPids || [];
+      const sec = await req('GET', '/api/security');
+      const before = (await req('GET', '/api/chats')).status;
+      const u = await req('POST', '/api/security/unlock', { password: st.pw });
+      const after = (await req('GET', '/api/chats')).status;
+      return { ok: s.events.includes('fatal') && pids.length === 2 && s.ready.locked === true && before === 423 && u.status === 200 && after === 200, eventsSeen: s.events, backendStarts: pids.length, lockedAfterFallback: s.ready.locked, state: sec.body?.state, chatsBefore: before, unlock: u.status, chatsAfter: after };
+    });
+    await check('leavingKeychainModeDeletesItem', async () => {
+      const r = await req('POST', '/api/security/mode', { password: st.pw, mode: 'password' });
+      const gone = await waitFor(async () => !(await native('keychain')).exists, 15000);
+      return { ok: r.status === 200 && gone, status: r.status, itemDeleted: gone };
+    });
+    await native('finish', { status: 'launch3-done' });
+    return;
+  }
+
   // ------------------------------------------------------------------------------------------- launch 2
   if (st.launches >= 2) {
     await check('keychainModeOpensWithoutPassword', async () => {
@@ -77,11 +97,8 @@
       const k = await native('keychain');
       return { ok: s.ready.locked === false && sec.body?.state === 'unlocked' && chats.status === 200 && k.fingerprint === st.keyFingerprint, readyLocked: s.ready.locked, state: sec.body?.state, chats: chats.status, sameKeychainItem: k.fingerprint === st.keyFingerprint, keychainRead: s.records.keychainRead };
     });
-    await check('leavingKeychainModeDeletesItem', async () => {
-      const r = await req('POST', '/api/security/mode', { password: st.pw, mode: 'password' });
-      const gone = await waitFor(async () => !(await native('keychain')).exists, 15000);
-      return { ok: r.status === 200 && gone, status: r.status, itemDeleted: gone };
-    });
+    // Leave a valid but wrong key in the Keychain for launch 3.
+    await native('keychainOverwrite');
     await native('finish', { status: 'launch2-done' });
     return;
   }

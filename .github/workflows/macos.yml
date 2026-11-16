@@ -344,7 +344,7 @@ jobs:
         continue-on-error: true
         run: |
           node native/test/bridge-client.mjs server/index.mjs "$RUNNER_TEMP/bridge-check" 2>&1 | sed 's/^/bridge| /' >> "$FACTS"
-          node native/test/run-selftest.mjs --app dist/native/Harness.app --label real --script native/test/selftest-real.js --launches 2 --timeout 900 --settle 5 --log-lines 20 > /dev/null
+          node native/test/run-selftest.mjs --app dist/native/Harness.app --label real --script native/test/selftest-real.js --launches 3 --timeout 900 --settle 5 --log-lines 20 --show chatStreamsFromRealModel,appNapHeldOnlyWhileGenerating,offlineLockAroundOllama,allowThenBlockAgain,lockUnloadsAndLocks,keychainModeOpensWithoutPassword,wrongKeychainKeyFallsBackToPassword > /dev/null
       - name: Idle memory, native app on the real UI
         if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
         continue-on-error: true

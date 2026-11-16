@@ -28,6 +28,7 @@ final class MainWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDe
     private var overlay: NSTextField?
     var lastMouseDown: NSEvent?
     private var hideAfterFullScreen = false
+    private(set) var fullScreenTransition = false
     private var downloadNames: [ObjectIdentifier: URL] = [:]
 
     init(app: AppController) {
@@ -207,11 +208,14 @@ final class MainWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDe
     }
 
     // The class changes as the transition starts (the traffic lights go away then) and is confirmed at its end.
-    func windowWillEnterFullScreen(_ notification: Notification) { sendFullscreen(true) }
-    func windowWillExitFullScreen(_ notification: Notification) { sendFullscreen(false) }
-    func windowDidEnterFullScreen(_ notification: Notification) { sendFullscreen() }
+    func windowWillEnterFullScreen(_ notification: Notification) { fullScreenTransition = true; sendFullscreen(true) }
+    func windowWillExitFullScreen(_ notification: Notification) { fullScreenTransition = true; sendFullscreen(false) }
+    func windowDidEnterFullScreen(_ notification: Notification) { fullScreenTransition = false; sendFullscreen() }
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) { fullScreenTransition = false; sendFullscreen() }
+    func windowDidFailToExitFullScreen(_ window: NSWindow) { fullScreenTransition = false; sendFullscreen() }
 
     func windowDidExitFullScreen(_ notification: Notification) {
+        fullScreenTransition = false
         sendFullscreen()
         if hideAfterFullScreen { hideAfterFullScreen = false; window.orderOut(nil) }
     }
