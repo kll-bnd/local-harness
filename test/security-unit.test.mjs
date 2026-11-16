@@ -344,3 +344,23 @@ describe('the managed Ollama listens on this Mac only', () => {
     assert.equal(p.managed, false);
   });
 });
+
+describe('key buffers handed out are copies', () => {
+  test('every Keychain store returns a fresh Buffer from get(): wiping it never damages the stored key', async () => {
+    const { appKeychain, fileKeychain } = await import('../server/security/keychain.mjs');
+    const k = crypto.randomBytes(32);
+    const events = [];
+    const app = appKeychain({ initialKey: k, emit: (e) => events.push(e) });
+    const got = await app.get();
+    got.fill(0);
+    assert.deepEqual(await app.get(), k, 'the app store keeps its key');
+    await app.set(Buffer.alloc(32, 3));
+    const g2 = await app.get(); g2.fill(0);
+    assert.deepEqual(await app.get(), Buffer.alloc(32, 3));
+    const dir = await tmpDir();
+    const file = fileKeychain(dir);
+    await file.set(k);
+    (await file.get()).fill(0);
+    assert.deepEqual(await file.get(), k);
+  });
+});

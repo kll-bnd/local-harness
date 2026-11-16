@@ -134,12 +134,15 @@ export function fileKeychain(dataDir) {
   };
 }
 
-/** Bridge mode: the native app keeps the item; the backend only hands it over (`keychain-key` event). */
+/**
+ * Bridge mode: the native app keeps the item; the backend only hands it over (`keychain-key` event).
+ * Like every store, get() returns a fresh copy: callers wipe what they get.
+ */
 export function appKeychain({ initialKey = null, emit }) {
   let key = initialKey ? Buffer.from(initialKey) : null;
   return {
     kind: 'app',
-    async get() { return key; },
+    async get() { return key ? Buffer.from(key) : null; },
     async set(k) { key = Buffer.from(k); emit({ type: 'keychain-key', dataKey: key.toString('base64') }); },
     async delete() { key = null; emit({ type: 'keychain-key', dataKey: null }); },
   };

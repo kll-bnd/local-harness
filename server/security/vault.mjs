@@ -160,6 +160,8 @@ export class Vault {
     return dek;
   }
 
+  // Key ownership: unlockWith*() return the vault's OWN data-key buffer (the one the file ciphers hold) — callers
+  // must not wipe it (lock() does); setKeychainWrap(true) returns a fresh key the caller owns and wipes.
   async unlockWithPassword(password) {
     this._throttleCheck();
     const dek = typeof password === 'string' && password ? await this._openPassword(password) : null;

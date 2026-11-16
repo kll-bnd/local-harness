@@ -168,6 +168,25 @@ describe('bridge mode', () => {
       assert.equal(ready.locked, false);
       assert.deepEqual(ready.encryption, { mode: 'keychain' });
       assert.ok((await b.request('GET', '/api/chats')).json().chats.some((c) => c.title === 'kc'));
+      // leaving keychain mode after a start with hello.dataKey: the app is told to delete its item
+      // (the key handed over at start-up must still be intact, not wiped by the unlock)
+      const before = b.events.length;
+      const leave = await b.request('POST', '/api/security/mode', { body: { mode: 'password', password: PW } });
+      assert.equal(leave.status, 200, leave.text());
+      const gone = await b.waitForEvent((e) => e.type === 'keychain-key' && b.events.indexOf(e) >= before);
+      assert.equal(gone.dataKey, null);
+      // and back: a new key for the app to store
+      const back = await b.request('POST', '/api/security/mode', { body: { mode: 'keychain', password: PW } });
+      assert.equal(back.status, 200, back.text());
+      const again = await b.waitForEvent((e) => e.type === 'keychain-key' && e.dataKey && b.events.indexOf(e) > b.events.indexOf(gone));
+      assert.match(again.dataKey, /^[A-Za-z0-9+/]{43}=$/);
+      assert.notEqual(again.dataKey, dataKey);
+      dataKey = again.dataKey;
+      assert.equal((await b.shutdown()).code, 0);
+    } finally { b.kill(); }
+    b = await BridgeClient.start({ dataDir: dir, env: ENV, dataKey });
+    try {
+      assert.equal(b.events.find((e) => e.type === 'ready').locked, false, 'the new key opens the data');
       assert.equal((await b.shutdown()).code, 0);
     } finally { b.kill(); }
     const before = new Map(fss.readdirSync(path.join(dir, 'chats')).map((f) => [f, fss.readFileSync(path.join(dir, 'chats', f))]));
