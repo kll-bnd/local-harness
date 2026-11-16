@@ -13,14 +13,15 @@
 //   * A Harness this process did NOT start (found through <dataDir>/harness.lock, which any program running as the
 //     user can write) gets the password only after it PROVED it holds this folder's data key: the password is first
 //     checked locally against <dataDir>/vault.json (no request, no throttle counter), then the instance must answer
-//     a fresh random nonce with HMAC(subkey of the data key, nonce) — POST /api/security/prove. A locked instance
+//     a fresh random nonce with HMAC(subkey of the data key, nonce, "port:<the port we connected to>") — POST
+//     /api/security/prove; the port binding defeats a program that relays the nonce to the real Harness. A locked instance
 //     cannot prove anything and never gets the password. The data key never leaves this process and is wiped
 //     right after the comparison.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
-import { openDataKeyWithPassword, instanceProof } from './instance-proof.mjs';
+import { openDataKeyWithPassword, instanceProof, proofBinding, validVault } from './instance-proof.mjs';
 
 const require = createRequire(import.meta.url);
 const { findRunningHarness, findAppHarness } = require('../../electron/lib/instance.cjs');
@@ -194,6 +195,12 @@ export class HarnessClient {
       this.#password = null;
       throw unverifiedInstanceError(this.base, 'this folder has no readable key store to check your password against');
     }
+    // Not a wrong password: a key store this tool cannot check (damaged, or key-derivation parameters outside the
+    // accepted bounds). Say so instead of asking again.
+    if (!validVault(vault)) {
+      this.#password = null;
+      throw unverifiedInstanceError(this.base, 'this folder\'s key store (vault.json) cannot be checked here: it is not a valid Harness key store — run `npm run doctor`');
+    }
     for (let attempt = 1; ; attempt++) {
       const pw = this.#password ?? await this.#askPassword(prompt);
       const key = await openDataKeyWithPassword(vault, pw).catch(() => null);
@@ -227,7 +234,12 @@ export class HarnessClient {
     }
     if (r.status === 423) throw unverifiedInstanceError(this.base, 'it says it is locked');
     if (!r.ok) throw unverifiedInstanceError(this.base, `it answered the proof request with HTTP ${r.status}`);
-    const expected = instanceProof(key, nonce);
+    let expected;
+    try {
+      expected = instanceProof(key, nonce, proofBinding({ port: Number(new URL(this.base).port) }));
+    } catch {
+      throw unverifiedInstanceError(this.base, 'its address has no port to bind the proof to');
+    }
     let got = null;
     try { got = typeof r.data?.proof === 'string' ? Buffer.from(r.data.proof, 'base64url') : null; } catch { got = null; }
     const ok = !!got && got.length === expected.length && crypto.timingSafeEqual(got, expected);

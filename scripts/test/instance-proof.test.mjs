@@ -40,9 +40,10 @@ test('the helpers: the password opens the key locally; the proof depends on key 
   assert.ok(k && k.equals(dek));
   assert.equal(await openDataKeyWithPassword(vault, 'not it at all'), null);
   const n = Buffer.alloc(32, 7);
-  assert.ok(instanceProof(dek, n).equals(instanceProof(k, n)));
-  assert.ok(!instanceProof(dek, n).equals(instanceProof(dek, Buffer.alloc(32, 8))));
-  assert.ok(!instanceProof(dek, n).equals(instanceProof(Buffer.alloc(32, 1), n)));
+  assert.ok(instanceProof(dek, n, 'port:4747').equals(instanceProof(k, n, 'port:4747')));
+  assert.ok(!instanceProof(dek, n, 'port:4747').equals(instanceProof(dek, Buffer.alloc(32, 8), 'port:4747')));
+  assert.ok(!instanceProof(dek, n, 'port:4747').equals(instanceProof(Buffer.alloc(32, 1), n, 'port:4747')));
+  assert.ok(!instanceProof(dek, n, 'port:4747').equals(instanceProof(dek, n, 'port:4748')), 'bound to the port');
 });
 
 test('a genuine unlocked instance found through the lock: proof verified first, then the password', async () => {
@@ -111,6 +112,30 @@ test('an impostor that drops the connection on the proof request: unverified, no
   } finally { srv.closeAllConnections?.(); srv.close(); }
 });
 
+test('a relay on another port that forwards to the genuine instance cannot reuse its proof', async () => {
+  const dir = tmp();
+  const dek = await writeTestVault(dir, PW);
+  const genuine = await startFakeSecurity({ state: 'unlocked', password: PW, prove: 'key', dataKey: dek });
+  const seen = [];
+  const relay = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    seen.push(`${req.url} ${raw}`);
+    const up = await fetch(genuine.url + req.url, { method: req.method, headers: { 'content-type': 'application/json' }, body: raw || undefined });
+    res.writeHead(up.status, { 'content-type': 'application/json' });
+    res.end(await up.text());
+  });
+  await new Promise((r) => relay.listen(0, '127.0.0.1', r));
+  try {
+    lockFor(dir, relay.address().port);
+    const h = await reachHarness({ dataDir: dir, start: false });
+    const c = new HarnessClient({ base: h.base, dataDir: dir, password: scripted([PW]), log: quiet });
+    await assert.rejects(c.ensureSession(), (e) => e.code === 'instance_unverified' && /proof does not match/.test(e.message));
+    assert.ok(!seen.some((x) => x.includes(PW)), 'the relay saw no password');
+    assert.equal(genuine.unlockBodies.length, 0);
+  } finally { relay.closeAllConnections?.(); relay.close(); await genuine.close(); }
+});
+
 test('a locked instance found through the lock: the message, no prompt, nothing sent', async () => {
   const dir = tmp();
   const dek = await writeTestVault(dir, PW);
@@ -169,6 +194,23 @@ test('a lock without dataDir (or for another folder) is ignored', async () => {
     assert.equal(findAppHarness({ dataDir: dir }), null);
     lockFor(dir, portOf(f));
     assert.equal((await findRunningHarness({ dataDir: dir }))?.url, f.url);
+  } finally { await f.close(); }
+});
+
+test('a key store outside the accepted scrypt bounds is reported as uncheckable, not as a wrong password', async () => {
+  const dir = tmp();
+  await writeTestVault(dir, PW);
+  const file = path.join(dir, 'vault.json');
+  const v = JSON.parse(fs.readFileSync(file, 'utf8'));
+  v.wraps.password.kdf.N = 2 ** 30;
+  fs.writeFileSync(file, JSON.stringify(v));
+  const f = await startFakeSecurity({ state: 'unlocked', password: PW, prove: 'key', dataKey: Buffer.alloc(32) });
+  try {
+    const pw = scripted([PW]);
+    const c = new HarnessClient({ base: f.url, dataDir: dir, password: pw, log: quiet });
+    await assert.rejects(c.ensureSession(), (e) => e.code === 'instance_unverified' && /cannot be checked here/.test(e.message));
+    assert.equal(pw.prompts.length, 0, 'not asked at all');
+    assert.equal(f.unlockBodies.length, 0);
   } finally { await f.close(); }
 });
 

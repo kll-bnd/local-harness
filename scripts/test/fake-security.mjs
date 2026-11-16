@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { newKdf, deriveKey, seal } from '../../server/security/crypto.mjs';
-import { instanceProof } from '../lib/instance-proof.mjs';
+import { instanceProof, proofBinding } from '../lib/instance-proof.mjs';
 
 /**
  * Write a real key store (vault.json with the password wrap, as server/security/vault.mjs makes it, cheap scrypt)
@@ -56,7 +56,8 @@ export async function startFakeSecurity({ state = 'locked', mode = 'password', p
       if (prove === 'none') return err(res, 404, 'not_found');
       if (prove === 'locked' || f.state === 'locked') return err(res, 423, 'locked');
       if (prove === 'wrong') return json(res, 200, { proof: crypto.randomBytes(32).toString('base64url') });
-      return json(res, 200, { proof: instanceProof(dataKey, Buffer.from(body.nonce, 'base64url')).toString('base64url') });
+      // Bound to the port the request arrived on, like the real route (a relay on another port cannot reuse it).
+      return json(res, 200, { proof: instanceProof(dataKey, Buffer.from(body.nonce, 'base64url'), proofBinding({ port: req.socket.localPort })).toString('base64url') });
     }
     if (p === 'GET /api/health') return json(res, 200, { ok: true, name: 'harness', version: '0.2.0', state: f.state });
     if (p === 'GET /api/security') { if (f.migration) { f.migration.done++; if (f.migration.done >= f.migration.total) { f.migration = null; f.state = 'unlocked'; } } return json(res, 200, security(req)); }
