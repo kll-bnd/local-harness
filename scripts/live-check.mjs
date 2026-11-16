@@ -560,7 +560,7 @@ def('e2e.blocker.allow', 'e2e', 'Allowing internet needs the password (403 confi
 def('e2e.catalog.huggingface', 'e2e', 'While allowed (--allow-internet): the Hugging Face adapter parses the live site — a list page and the Nemotron repository with its GGUF files', []);
 def('e2e.catalog.ollama', 'e2e', 'While allowed (--allow-internet): the Ollama-library adapter parses ollama.com — the list and one model\'s tags', []);
 def('e2e.blocker.reblock', 'e2e', 'POST /api/network/block blocks again at once: the online catalogue answers offline_lock again', ['netGuard', 'egress']);
-def('e2e.blocker.sandboxed_ollama', 'e2e', 'macOS: an Ollama that Harness starts while blocked runs in the sandbox — a pull sent straight to it fails and the self-test\'s OS probe is blocked', ['netGuard']);
+def('e2e.blocker.sandboxed_ollama', 'e2e', 'macOS: an Ollama that Harness starts while blocked runs in the sandbox (start result sandboxed: true, no osFallback) — a pull sent straight to it fails and the self-test\'s OS probe is blocked', ['netGuard']);
 def('e2e.vault_error', 'e2e', 'A damaged or missing key store (and its copy) gives state "error" (vault_corrupt / vault_missing): setup 409, data routes 503, never needs_setup while encrypted files exist', ['secVault']);
 def('e2e.lock.routes', 'e2e', 'After POST /api/security/lock the data routes answer 423 locked (chats, memories, settings, ui-state, events); health and security answer', ['secAuth']);
 def('e2e.lock.models_unloaded', 'e2e', 'Locking unloads the models Harness loaded: Ollama /api/ps no longer lists the chat model', ['unload']);
@@ -3484,18 +3484,26 @@ async function sandboxedOllamaCheck(run) {
   try {
     delete process.env.HARNESS_NO_OLLAMA_AUTOSTART;
     const { startServer } = await import(pathToFileURL(path.join(ROOT, 'server/index.mjs')).href);
-    srv = await startServer({ port: 0, dataDir: dir, autodetect: false, logLevel: 'silent' });
+    srv = await startServer({ port: 0, dataDir: dir, autodetect: false, logLevel: 'silent', keychain: 'file' });
     const setup = await e2eSetup(run, srv.url);
     if (setup.error) return FAIL(setup.error, { info: setup.info });
     const api = (method, p, body, ms = 60000) => http(srv.url, p, { method, body, timeoutMs: T(ms) });
     const ps = await api('PATCH', '/api/settings', { providers: { autodetect: false, builtin: { ollama: { enabled: true, baseUrl: `http://127.0.0.1:${port}` } } }, ollama: { autoStart: true, stopOnExit: true } });
     if (!ps.ok) return FAIL(`PATCH /api/settings → ${httpSummary(ps)}`);
-    const st = await api('POST', '/api/providers/ollama/start', {}, 120000);
+    // the start may wait for Ollama's GPU discovery (up to 20 s to listen + 120 s to answer)
+    const st = await api('POST', '/api/providers/ollama/start', {}, 180000);
     info.push(`POST /api/providers/ollama/start → ${httpSummary(st)}`);
-    if (!st.ok) return FAIL('Harness could not start its own Ollama', { info });
+    const sys = (await api('GET', '/api/system')).json?.ollama || {};
     const sq = await api('GET', '/api/security');
     const o = sq.json?.offlineLock;
+    const fallback = st.json?.osFallback || o?.osFallback || sys.osFallback || null;
     info.push(`offlineLock: ${JSON.stringify(o)}`);
+    info.push(`/api/system ollama: managed ${sys.managed}, sandboxed ${sys.sandboxed}, address ${sys.address}, lastError ${JSON.stringify(sys.lastError ?? null)}`);
+    info.push(`osFallback: ${JSON.stringify(fallback)}`);
+    if (!st.ok) return FAIL('Harness could not start its own Ollama', { info });
+    if (st.json?.sandboxed !== true) {
+      return FAIL(`Harness started this Ollama outside the sandbox: ${fallback ? `${fallback.reason} — ${fallback.detail}` : `start result sandboxed ${st.json?.sandboxed}${st.json?.alreadyRunning ? ' (alreadyRunning)' : ''}`}`, { info, fix: 'server/providers/ollama-process.mjs (the sandboxed start and its fallback rules); see osFallback.' });
+    }
     const direct = await http(`http://127.0.0.1:${port}`, '/api/pull', { method: 'POST', body: { model: run.opts.pullModel, stream: false }, timeoutMs: T(120000), noAuth: true });
     info.push(`direct pull of ${run.opts.pullModel} at 127.0.0.1:${port} → ${httpSummary(direct)}`);
     const test = await api('POST', '/api/network/test', {}, 60000);

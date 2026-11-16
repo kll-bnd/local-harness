@@ -1,12 +1,63 @@
 // Find and (optionally) spawn `ollama serve` with memory-friendly environment settings.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { ramTier } from '../context/sizing.mjs';
 import { log } from '../lib/log.mjs';
 import { sleep } from '../lib/util.mjs';
 import { ROOT_DIR } from '../version.mjs';
 import { isLoopbackHost } from '../security/egress.mjs';
+import { httpRequest } from '../lib/http-client.mjs';
+
+/**
+ * Starting `ollama serve` has two phases (measured on a Mac runner, sandboxed or not — the sandbox costs nothing):
+ *   1. it listens on its port within 20–160 ms ("Listening on 127.0.0.1:<port>") — a child that exits or never gets
+ *      there within OLLAMA_LISTEN_TIMEOUT_MS has really failed to start;
+ *   2. it answers /api/version only after its GPU discovery, which blocks while another process loads a model onto
+ *      the GPU (19 s measured; Draw Things loading an image model does the same) — while the child is alive Harness
+ *      waits up to OLLAMA_READY_TIMEOUT_MS, and a timeout there is a start error, never evidence against the sandbox.
+ */
+export const OLLAMA_LISTEN_TIMEOUT_MS = 20000;
+export const OLLAMA_READY_TIMEOUT_MS = 120000;
+const listenTimeout = (callerMs) => Number(process.env.HARNESS_OLLAMA_LISTEN_MS) || callerMs || OLLAMA_LISTEN_TIMEOUT_MS;
+const readyTimeout = () => Number(process.env.HARNESS_OLLAMA_READY_MS) || OLLAMA_READY_TIMEOUT_MS;
+const LISTENING_LINE = /Listening on /i;
+/** A fallback outside the sandbox is retried (inside it) at most this many times in total per process. */
+export const MAX_SANDBOX_FAILURES = 3;
+const PROBE_TIMEOUT_MS = 2500;
+const BIND_FAILURE = /address already in use|bind: |listen tcp .*: bind|EADDRINUSE/i;
+
+const addrKey = (baseUrl) => { const u = new URL(baseUrl); return `${u.hostname}:${u.port || 11434}`; };
+
+/**
+ * What answers at an Ollama address: 'free' (connection refused: nobody listens), 'ollama' (an Ollama answered
+ * /api/version), 'port_in_use' (something else answers), 'not_responding' (accepts or hangs but gives no answer —
+ * e.g. a busy Ollama). A timeout is never taken for "nobody there".
+ */
+export async function probeOllama(baseUrl, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  const u = new URL(baseUrl);
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const port = Number(u.port || 11434);
+  const tcp = await new Promise((resolve) => {
+    const s = net.connect({ host, port });
+    const t = setTimeout(() => { s.destroy(); resolve('timeout'); }, timeoutMs);
+    s.once('connect', () => { clearTimeout(t); s.destroy(); resolve('open'); });
+    s.once('error', (e) => { clearTimeout(t); resolve(e.code === 'ECONNREFUSED' ? 'refused' : `error ${e.code || e.message}`); });
+  });
+  if (tcp === 'refused') return { state: 'free' };
+  if (tcp !== 'open') return { state: 'not_responding', detail: tcp };
+  try {
+    const r = await httpRequest(`${u.protocol}//${u.host}/api/version`, { signal: AbortSignal.timeout(timeoutMs), agent: false });
+    const text = await r.text();
+    let j = null;
+    try { j = JSON.parse(text); } catch { /* not JSON */ }
+    if (r.ok && j && typeof j.version === 'string') return { state: 'ollama', version: j.version };
+    return { state: 'port_in_use', detail: `HTTP ${r.status}` };
+  } catch (e) {
+    return { state: e?.name === 'TimeoutError' ? 'not_responding' : 'port_in_use', detail: e?.code || e?.name || 'error' };
+  }
+}
 
 /** The offline-lock profile an Ollama that Harness starts runs under while internet access is blocked. */
 export const SANDBOX_PROFILE = path.join(ROOT_DIR, 'server', 'security', 'offline-lock.sb');
@@ -99,11 +150,30 @@ export class OllamaProcess {
     this.profile = profile;
     this.platform = platform;
     this.sandboxed = false; // the running managed Ollama is inside the sandbox
-    this.sandboxBroken = false; // tried once and it did not work: do not try again in this process
+    this.sandboxFailures = 0; // starts where the sandbox (not something else) kept Ollama from starting
+    this.osFallback = null; // { at, reason, detail, count }: Harness had to start Ollama outside the sandbox
     this.external = false; // an Ollama that Harness did not start answered
+    this.childAddr = null; // host:port our child was started on
+    this.startPhase = null; // while a start runs: 'starting' | 'waiting_for_gpu'
+    this.phaseListeners = new Set();
   }
 
-  get managed() { return !!this.child; }
+  /** Follow the phase of a running start (`fn(phase)`); returns an unsubscribe function. */
+  onPhase(fn) { this.phaseListeners.add(fn); return () => this.phaseListeners.delete(fn); }
+
+  _setPhase(phase) {
+    if (this.startPhase === phase) return;
+    this.startPhase = phase;
+    for (const fn of this.phaseListeners) { try { fn(phase); } catch { /* a listener's problem */ } }
+    if (phase) this.bus?.publish('ollama.status', { managed: true, running: false, starting: true, phase });
+  }
+
+  get managed() { return this._childAlive(); }
+
+  _childAlive() { return !!(this.child && this.child.exitCode === null && this.child.signalCode === null); }
+
+  /** The sandbox stops being tried after MAX_SANDBOX_FAILURES evidenced failures (until Harness restarts). */
+  get sandboxBroken() { return this.sandboxFailures >= MAX_SANDBOX_FAILURES; }
 
   _useSandbox() {
     if (this.sandboxBroken || !this.sandboxWanted()) return false;
@@ -116,11 +186,20 @@ export class OllamaProcess {
    * that changes anything (a running pull or chat on it is cut off — this happens only on that user action).
    */
   async applySandbox() {
-    if (!this.child || this.starting) return { restarted: false };
+    while (this.starting) await this.starting.catch(() => {});
+    if (!this._childAlive()) return { restarted: false };
     if (this.sandboxed === this._useSandbox()) return { restarted: false };
     await this.stop();
     const r = await this.start();
     return { restarted: true, ...r };
+  }
+
+  /** The configured Ollama address changed: move the Ollama Harness started (it is ours) to the new one. */
+  async followAddress() {
+    while (this.starting) await this.starting.catch(() => {});
+    if (!this._childAlive() || this.childAddr === addrKey(this.getProvider().baseUrl)) return { moved: false };
+    log.info('The Ollama address changed: moving the Ollama Harness started');
+    return { moved: true, ...(await this.start()) };
   }
 
   /**
@@ -148,47 +227,99 @@ export class OllamaProcess {
       managed: this.managed,
       pid: this.child?.pid ?? null,
       env: this.env,
+      address: this._childAlive() ? this.childAddr : null,
+      sandboxed: this._childAlive() ? this.sandboxed : false,
+      osFallback: this.osFallback,
       recommendedEnv: managedOllamaEnv(s, { baseUrl: this.getProvider().baseUrl, totalMem: this.totalMem }),
       lastError: this.lastError,
       logTail: this.logTail.slice(-20),
     };
   }
 
-  async start({ timeoutMs = 20000 } = {}) {
-    if (this.starting) return this.starting;
-    this.starting = this._start(timeoutMs).finally(() => { this.starting = null; });
-    return this.starting;
+  /**
+   * Start `ollama serve` for the provider's CURRENT address. One start at a time: a call that arrives while another
+   * runs waits for it and then decides again (it never gets the result of a start for another address).
+   */
+  async start({ timeoutMs } = {}) {
+    while (this.starting) await this.starting.catch(() => {});
+    if (this.closed) return { started: false, error: 'Harness is shutting down.', code: 'closed' };
+    const p = this._start(timeoutMs);
+    this.starting = p;
+    try { return await p; } finally { if (this.starting === p) { this.starting = null; this._setPhase(null); } }
   }
 
   async _start(timeoutMs) {
+    // the address is decided once, here: a settings change during this start is handled by the next start()
     const provider = this.getProvider();
-    const st = await provider.status();
-    if (st.ok) { this.external = !this.managed; return { started: false, alreadyRunning: true, managed: this.managed, version: st.version }; }
-    this.external = false;
-    const s = this.getSettings();
-    if (!isLoopbackHost(new URL(provider.baseUrl).hostname)) {
+    const baseUrl = provider.baseUrl;
+    const addr = addrKey(baseUrl);
+    if (!isLoopbackHost(new URL(baseUrl).hostname)) {
       this.lastError = 'Harness starts Ollama only on this Mac (loopback); the configured Ollama address is another computer.';
       return { started: false, error: this.lastError, code: 'not_loopback' };
     }
+    // Our own Ollama is running: never spawn a second one onto its port.
+    if (this._childAlive()) {
+      if (this.childAddr === addr) {
+        for (let i = 0; i < 10; i++) {
+          const p = await probeOllama(baseUrl);
+          if (p.state === 'ollama') return { started: false, alreadyRunning: true, managed: true, pid: this.child.pid, version: p.version, sandboxed: this.sandboxed };
+          await sleep(500);
+          if (!this._childAlive()) break;
+        }
+        if (this._childAlive()) {
+          this.lastError = 'The Ollama that Harness started does not answer.';
+          return { started: false, error: this.lastError, code: 'not_responding', managed: true };
+        }
+      } else {
+        log.info(`Moving the Ollama Harness started from ${this.childAddr} to ${addr}`);
+        await this.stop();
+      }
+    }
+    // Probe before spawning: refused = nobody there (start ours); a timeout or a non-Ollama answer = somebody is.
+    let probe = null;
+    for (let i = 0; i < 3; i++) {
+      probe = await probeOllama(baseUrl);
+      if (probe.state === 'free' || probe.state === 'ollama') break;
+      await sleep(700);
+    }
+    if (probe.state === 'ollama') { this.external = true; return { started: false, alreadyRunning: true, managed: false, version: probe.version }; }
+    if (probe.state !== 'free') {
+      this.lastError = probe.state === 'port_in_use'
+        ? `Something that is not Ollama uses ${addr}; Harness does not start Ollama there.`
+        : `Something listens on ${addr} but does not answer (a busy Ollama?); Harness does not start another one there.`;
+      return { started: false, error: this.lastError, code: probe.state, detail: probe.detail || null };
+    }
+    this.external = false;
+    const s = this.getSettings();
     const bin = findOllamaBinary(s.ollama?.binaryPath);
     if (!bin) {
       this.lastError = 'Ollama is not installed (binary not found).';
       return { started: false, error: this.lastError, code: 'not_installed' };
     }
-    this.env = managedOllamaEnv(s, { baseUrl: provider.baseUrl, totalMem: this.totalMem });
+    this.env = managedOllamaEnv(s, { baseUrl, totalMem: this.totalMem });
     const sandboxed = this._useSandbox();
-    const r = await this._spawn(bin, provider, timeoutMs, sandboxed);
-    if (!r.started && sandboxed) {
-      // Silent fallback: the OS layer is a bonus; chat must work. Reported as osEnforced: false.
-      log.info(`Ollama did not start under the offline-lock sandbox (${r.code}); starting it without (the in-app blocker still applies).`);
-      this.sandboxBroken = true;
-      return this._spawn(bin, provider, timeoutMs, false);
-    }
-    return r;
+    const r = await this._spawn(bin, baseUrl, timeoutMs, sandboxed);
+    if (r.started || !sandboxed) return r;
+    // Not the sandbox's fault: Ollama could not bind (address in use), or it listened but its GPU discovery did not
+    // finish (another app busy on the GPU) — report the error, no fallback.
+    if (r.code === 'port_in_use' || r.code === 'gpu_discovery_timeout') return r;
+    // Evidence candidates: the sandboxed child exited (not a bind error), it never got to listening, or sandbox-exec
+    // could not run: try once without. Only if THAT works does it count against the sandbox.
+    const r2 = await this._spawn(bin, baseUrl, timeoutMs, false);
+    if (!r2.started) return r2;
+    const reason = r.code === 'spawn_failed' ? 'sandbox_unavailable' : r.code === 'not_listening' ? 'sandboxed_not_listening' : 'sandboxed_exit';
+    this.sandboxFailures += 1;
+    const detail = [r.error, ...(r.logTail || []).slice(-3)].filter(Boolean).join(' | ').slice(0, 600);
+    this.osFallback = { at: new Date().toISOString(), reason, detail, count: this.sandboxFailures };
+    log.warn(`Started Ollama OUTSIDE the offline-lock sandbox (${reason}; failure ${this.sandboxFailures} of ${MAX_SANDBOX_FAILURES}): ${detail || 'no output'}. The in-app blocker still applies; ${this.sandboxBroken ? 'the sandbox is not tried again until Harness restarts' : 'Harness tries the sandbox again when nothing is running'}.`);
+    return { ...r2, osFallback: this.osFallback };
   }
 
-  async _spawn(bin, provider, timeoutMs, sandboxed) {
+  async _spawn(bin, baseUrl, timeoutMs, sandboxed) {
+    if (this.closed) return { started: false, error: 'Harness is shutting down.', code: 'closed' };
+    if (this._childAlive()) return { started: false, error: 'Harness already runs an Ollama.', code: 'already_managed' };
     log.info(`Starting ${bin} serve${sandboxed ? ' (offline-lock sandbox)' : ''}`, this.env);
+    const own = []; // this child's output (bind failures are recognised from it)
     let child;
     try {
       const [cmd, args] = sandboxed ? [this.sandboxExec, ['-f', this.profile, bin, 'serve']] : [bin, ['serve']];
@@ -197,13 +328,18 @@ export class OllamaProcess {
       this.lastError = `Could not start ${bin}: ${e.message}`;
       return { started: false, error: this.lastError, code: 'spawn_failed' };
     }
-    this.sandboxed = sandboxed;
     // Attach the error listener before anything else: a spawn ENOENT/EACCES must never become an uncaught error.
     let spawnError = null;
-    child.on('error', (e) => { spawnError = `Could not start ${bin}: ${e.code || e.message}`; this.lastError = spawnError; if (this.child === child) this.child = null; });
+    child.on('error', (e) => { spawnError = `Could not start ${sandboxed ? this.sandboxExec : bin}: ${e.code || e.message}`; this.lastError = spawnError; });
     this.child = child;
+    this.childAddr = addrKey(baseUrl);
+    this.sandboxed = sandboxed;
     const onData = (d) => {
-      for (const line of String(d).split('\n')) if (line.trim()) this.logTail.push(line.slice(0, 500));
+      for (const line of String(d).split('\n')) {
+        if (!line.trim()) continue;
+        this.logTail.push(line.slice(0, 500));
+        if (own.length < 200) own.push(line.slice(0, 500));
+      }
       if (this.logTail.length > 200) this.logTail.splice(0, this.logTail.length - 200);
     };
     child.stdout.on('data', onData);
@@ -213,30 +349,67 @@ export class OllamaProcess {
     child.on('exit', (code, signal) => {
       if (this.child === child) {
         this.child = null;
+        this.childAddr = null;
+        this.sandboxed = false;
         this.bus?.publish('ollama.status', { managed: false, running: false, exitCode: code, signal });
       }
     });
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
+    const t0 = Date.now();
+    const listenBy = t0 + listenTimeout(timeoutMs);
+    let readyBy = null; // set once it listens
+    let listening = false;
+    this._setPhase('starting');
+    const alive = () => !spawnError && this.child === child && child.exitCode === null && child.signalCode === null;
+    for (;;) {
       await sleep(200);
-      if (!this.child) break;
-      const s2 = await provider.status();
-      if (s2.ok) {
+      if (!alive()) break;
+      const p = await probeOllama(baseUrl, { timeoutMs: 1500 });
+      if (p.state === 'ollama') {
         this.lastError = null;
-        this.bus?.publish('ollama.status', { managed: true, running: true, version: s2.version, pid: child.pid, sandboxed });
-        return { started: true, managed: true, pid: child.pid, version: s2.version, env: this.env, sandboxed };
+        this.bus?.publish('ollama.status', { managed: true, running: true, version: p.version, pid: child.pid, sandboxed });
+        return { started: true, managed: true, pid: child.pid, version: p.version, env: this.env, sandboxed, startMs: Date.now() - t0 };
       }
+      if (!listening && (p.state !== 'free' || own.some((l) => LISTENING_LINE.test(l)))) {
+        listening = true;
+        readyBy = Date.now() + readyTimeout();
+        this._setPhase('waiting_for_gpu');
+      }
+      if (!listening && Date.now() > listenBy) break;
+      if (listening && Date.now() > readyBy) break;
     }
+    await sleep(50); // the last output of an exited child
+    const lines = own;
+    const exited = !alive();
+    if (this.child === child) await this.stop();
     if (spawnError) return { started: false, error: spawnError, code: 'spawn_failed' };
-    this.lastError = this.child ? 'Ollama did not become ready in time.' : `Ollama exited during start-up.${this.logTail.length ? ` Last log line: ${this.logTail.at(-1)}` : ''}`;
-    await this.stop();
-    return { started: false, error: this.lastError, code: 'start_timeout', logTail: this.logTail.slice(-20) };
+    if (exited && lines.some((l) => BIND_FAILURE.test(l))) {
+      this.lastError = `Ollama could not use ${addrKey(baseUrl)}: ${lines.find((l) => BIND_FAILURE.test(l)).slice(0, 200)}`;
+      return { started: false, error: this.lastError, code: 'port_in_use', logTail: lines.slice(-20) };
+    }
+    if (exited) {
+      this.lastError = `Ollama exited during start-up.${lines.length ? ` Last log line: ${lines.at(-1)}` : ''}`;
+      return { started: false, error: this.lastError, code: 'exited', logTail: lines.slice(-20) };
+    }
+    if (!listening) {
+      this.lastError = `Ollama did not start: it was not listening on ${addrKey(baseUrl)} after ${Math.round(listenTimeout(timeoutMs) / 1000)} s.`;
+      return { started: false, error: this.lastError, code: 'not_listening', logTail: lines.slice(-20) };
+    }
+    this.lastError = `Ollama did not finish starting: it was still looking for the GPU after ${Math.round(readyTimeout() / 1000)} s — is another app using the GPU heavily?`;
+    return { started: false, error: this.lastError, code: 'gpu_discovery_timeout', logTail: lines.slice(-20) };
+  }
+
+  /** Harness is quitting: no start after this one; stop ours if `stop`. */
+  async shutdown({ stop = true } = {}) {
+    this.closed = true;
+    while (this.starting) await this.starting.catch(() => {});
+    if (stop) await this.stop();
   }
 
   async stop() {
     const child = this.child;
     if (!child) return { stopped: false, managed: false };
     this.child = null;
+    this.childAddr = null;
     this.sandboxed = false;
     if (child.exitCode === null && child.signalCode === null) {
       const exitedP = new Promise((r) => child.once('exit', () => r(true)));

@@ -360,7 +360,9 @@ runs inside a macOS sandbox profile (`sandbox-exec`) that **blocks outbound conn
 anything but this Mac**. Verified on a macOS 26 runner: under it every outbound TCP connection (IPv4 and IPv6)
 and UDP packet to anything but this Mac is refused, lookups of outside names fail, and a model download attempted
 directly against that Ollama fails, while loopback, the GPU and chatting keep working. Allowing internet restarts
-that Ollama outside the sandbox (a download then works); blocking puts it back. The profile does not block
+that Ollama outside the sandbox (a download then works); **Block now** puts it back at once, and when the window
+ends on its own Harness puts it back as soon as nothing is running on it (or when Harness locks), never in the
+middle of a reply. The profile does not block
 *inbound* connections; Harness binds Ollama to 127.0.0.1, so nothing outside this Mac can reach it.
 
 To download a model, **Allow internet for 15 minutes** (1–120; asks your password). A download still running

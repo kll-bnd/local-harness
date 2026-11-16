@@ -38,7 +38,7 @@ describe('the blocker', () => {
     const s = await blockedStack({ fake });
     try {
       const n = await s.call('GET', '/api/network');
-      assert.deepEqual(n.data.offlineLock, { enabled: true, blocked: true, allowedUntil: null, waitingFor: null, osEnforced: false, osScope: 'none', externalOllama: true });
+      assert.deepEqual(n.data.offlineLock, { enabled: true, blocked: true, allowedUntil: null, waitingFor: null, osEnforced: false, osScope: 'none', externalOllama: true, osPending: false, osFallback: null });
       assert.equal(JSON.parse(fss.readFileSync(path.join(s.dataDir, 'launch.json'), 'utf8')).offlineLock, true);
       assert.equal((await s.call('POST', '/api/network/allow', { minutes: 0 })).status, 400);
       assert.equal((await s.call('POST', '/api/network/allow', { minutes: 121 })).status, 400);
@@ -182,17 +182,18 @@ exec "$@"
       const b = await s.call('POST', '/api/network/block', {});
       assert.equal(b.data.offlineLock.osScope, 'ollama');
       assert.equal(log().length, 2);
-      // a window that ends on its own does NOT restart Ollama (never under a chat)
+      // a window that ends on its own while nothing runs: Ollama goes back into the sandbox by itself
       await s.call('POST', '/api/network/allow', { minutes: 5 });
       const pid2 = s.srv.core.ollamaProcess.child.pid;
       const netg = s.srv.core.network;
       netg.launch.set({ offlineLockSuspendedUntil: new Date(Date.now() + 50).toISOString() });
       netg._arm();
       await waitFor(() => netg.blocked);
-      assert.equal(s.srv.core.ollamaProcess.child.pid, pid2);
+      await waitFor(() => s.srv.core.ollamaProcess.sandboxed && s.srv.core.ollamaProcess.child?.pid !== pid2, { timeout: 15000 });
       n = (await s.call('GET', '/api/network')).data.offlineLock;
-      assert.equal(n.osEnforced, false, 'reported honestly: this Ollama runs without the sandbox until the next block action');
-      await s.call('POST', '/api/network/block', {});
+      assert.equal(n.osScope, 'ollama');
+      assert.equal(n.osPending, false);
+      assert.equal(log().length, 3);
       // the self-test: a direct TCP connection from inside the sandbox reaches a listener → the OS layer does not hold
       const listener = net.createServer((c) => c.destroy());
       await new Promise((r) => listener.listen(0, '127.0.0.2', r).on('error', () => listener.listen(0, '127.0.0.1', r)));

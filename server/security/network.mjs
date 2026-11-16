@@ -44,7 +44,7 @@ export class NetworkGuard extends EventEmitter {
     const blocked = this.blocked;
     const o = this.ollamaInfo ? this.ollamaInfo() : this.ollama;
     const osScope = !blocked || this.osBroken ? 'none' : this.sandboxed ? 'backend' : o.managed && o.sandboxed ? 'ollama' : 'none';
-    return { enabled: this.enabled, blocked, allowedUntil: this.allowedUntil, waitingFor: this.waitingFor, osEnforced: osScope !== 'none', osScope, externalOllama: !!o.external };
+    return { enabled: this.enabled, blocked, allowedUntil: this.allowedUntil, waitingFor: this.waitingFor, osEnforced: osScope !== 'none', osScope, externalOllama: !!o.external, osPending: !!(blocked && o.osPending), osFallback: o.osFallback || null };
   }
 
   /** Allow internet access for `minutes` (the caller has checked the password). */

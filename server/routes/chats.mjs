@@ -63,9 +63,9 @@ async function streamTurn(ctx, chat, { prepare, modelRef }) {
   let sse = null;
   try {
     // Right after unlocking, the Ollama Harness manages may still be starting: wait for it, visibly.
-    await app.engine.ensureOllamaUp(chat, modelRef, () => {
+    await app.engine.ensureOllamaUp(chat, modelRef, (reason) => {
       sse ||= openSse(req, res);
-      sse.send('model_status', { phase: 'loading', reason: 'starting_ollama', message: 'Starting Ollama…' });
+      sse.send('model_status', { phase: 'loading', reason, message: reason === 'waiting_for_gpu' ? 'Ollama is waiting for the GPU (another app may be using it)…' : 'Starting Ollama…' });
     });
     const prepared = await app.engine.target(chat, modelRef);
     if (app.chats.chats.get(chat.id) !== chat) throw notFound('Chat');

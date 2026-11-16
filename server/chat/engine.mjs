@@ -178,8 +178,9 @@ export class ChatEngine {
   /**
    * The first message after unlocking must not fail because the Ollama that Harness starts itself is still
    * coming up: when the chat would use the built-in Ollama, it is not answering, and Harness is starting it (or
-   * may start it), wait for that start (bounded by OllamaProcess.start's own timeout). `onWait()` is called once
-   * before waiting (the route shows model_status loading / starting_ollama). Never throws.
+   * may start it), wait for that start (bounded by OllamaProcess's limits: listening within 20 s, then GPU
+   * discovery up to 120 s). `onWait(reason)` is called with 'starting_ollama' before waiting and 'waiting_for_gpu'
+   * when Ollama listens but is still discovering the GPU (the route shows them as model_status). Never throws.
    */
   async ensureOllamaUp(chat, modelRef = null, onWait = null) {
     try {
@@ -191,8 +192,11 @@ export class ChatEngine {
       const proc = this.app.ollamaProcess;
       const mayStart = this.app.settings.get().ollama?.autoStart !== false && process.env.HARNESS_NO_OLLAMA_AUTOSTART !== '1' && proc.info().installed;
       if (!proc.starting && !mayStart) return;
-      onWait?.();
-      await proc.start();
+      onWait?.('starting_ollama');
+      let gpu = proc.startPhase === 'waiting_for_gpu';
+      if (gpu) onWait?.('waiting_for_gpu');
+      const off = proc.onPhase((ph) => { if (ph === 'waiting_for_gpu' && !gpu) { gpu = true; onWait?.('waiting_for_gpu'); } });
+      try { await proc.start(); } finally { off(); }
       this.app.registry.invalidate();
       await this.app.registry.status(provider, { refresh: true });
     } catch (e) { log.warn(`Waiting for Ollama: ${e.message}`); }

@@ -102,7 +102,10 @@ export class Core extends EventEmitter {
     try { this.vault.load(); } catch (e) { vaultError = e; }
     if (this.vault.restoredFromBackup) log.warn('vault.json was damaged; restored it from its verified copy vault.json.bak.');
     this.network = new NetworkGuard({ launch: this.launch, enabledOverride: this._lockOverride });
-    this.network.ollamaInfo = () => ({ managed: this.ollamaProcess.managed, sandboxed: !!this.ollamaProcess.sandboxed, external: !!this.ollamaProcess.external });
+    this.network.ollamaInfo = () => {
+      const p = this.ollamaProcess;
+      return { managed: p.managed, sandboxed: !!p.sandboxed, external: !!p.external, osFallback: p.osFallback, osPending: p.managed && !p.sandboxed && p._useSandbox() };
+    };
     this.network.on('change', (ev) => this._onNetworkChange(ev));
     const launchMode = this.launch.get().encryption;
     let mode = this.modeOverride || launchMode;
@@ -200,7 +203,18 @@ export class Core extends EventEmitter {
       this.app.url = this.url;
       this.app.port = this.port;
       this._cacheFromSettings();
-      this.app.bus.on('event', (ev) => { if (ev.type === 'settings.updated') this._cacheFromSettings(); });
+      const app = this.app;
+      app.bus.on('event', (ev) => {
+        if (ev.type === 'settings.updated') {
+          this._cacheFromSettings();
+          // the configured Ollama address changed: the Ollama Harness started moves with it
+          setImmediate(() => { if (this.app === app) this.ollamaProcess.followAddress().catch((e) => log.warn(`Moving Ollama: ${e.message}`)); });
+        }
+        // work ended: a chance to put Harness's Ollama back into the sandbox (never under the user's work)
+        if (ev.type === 'generation.finished' || ev.type === 'image.done' || ev.type === 'image.error' || (ev.type === 'model.pull' && ['success', 'error', 'aborted'].includes(ev.data?.status))) {
+          setTimeout(() => this.reconcileSandbox(ev.type), 50).unref?.();
+        }
+      });
       this.state = 'unlocked';
       this.lastActivity = Date.now();
       this._emitState();
@@ -282,7 +296,11 @@ export class Core extends EventEmitter {
       this._emitState();
       this.emit('locked', { reason });
       this.emitEvent({ type: 'locked' });
-    })().finally(() => { this._locking = null; });
+    })().finally(() => {
+      this._locking = null;
+      // models were unloaded: the moment to put Harness's Ollama back into the sandbox if it is outside
+      this.reconcileSandbox('lock').catch(() => {});
+    });
     return this._locking;
   }
 
@@ -647,9 +665,58 @@ export class Core extends EventEmitter {
 
   // A managed Ollama follows only the user's allow/block action (the routes restart it); when the window ends on its
   // own the in-app blocker applies at once and Ollama is left alone (never restarted under a chat).
-  _onNetworkChange({ status }) {
+  _onNetworkChange({ reason, status }) {
     this.app?.bus.publish('network.status', { offlineLock: status });
     this.emit('network', status);
+    if (reason === 'window_ended' || reason === 'download_done') this.reconcileSandbox(reason);
+  }
+
+  /**
+   * Internet access is blocked again but Harness's own Ollama runs outside the sandbox (it was restarted without
+   * it for an allow window): put it back at the first moment that costs the user nothing — Harness locked, or
+   * nothing running (no generation, pull or image job) and no model loaded. Never under the user's work. While it
+   * waits, offlineLock.osPending is true and an unref'd timer looks again about once a minute.
+   */
+  async reconcileSandbox(trigger = 'check') {
+    if (this._closed) return false;
+    const p = this.ollamaProcess;
+    const pending = () => p.managed && !p.sandboxed && p._useSandbox();
+    if (this._reconciling) return false;
+    if (!pending()) { this._stopReconcileTimer(); return false; }
+    this._reconciling = true;
+    try {
+      if (!(await this._ollamaIdle())) { this._startReconcileTimer(); return false; }
+      if (!pending()) return false;
+      log.info(`Putting the Ollama Harness started back into the offline-lock sandbox (${trigger})`);
+      await p.applySandbox();
+      return !pending();
+    } catch (e) {
+      log.warn(`Putting Ollama back into the sandbox: ${e.message}`);
+      return false;
+    } finally {
+      this._reconciling = false;
+      if (pending()) this._startReconcileTimer(); else this._stopReconcileTimer();
+      this.app?.bus.publish('network.status', { offlineLock: this.network.status() });
+    }
+  }
+
+  _startReconcileTimer() {
+    if (this._reconcileTimer) return;
+    this._reconcileTimer = setInterval(() => this.reconcileSandbox('timer'), Number(process.env.HARNESS_RECONCILE_MS) || 60000);
+    this._reconcileTimer.unref?.();
+  }
+
+  _stopReconcileTimer() { clearInterval(this._reconcileTimer); this._reconcileTimer = null; }
+
+  /** Nothing of the user's runs on Harness's Ollama: locked (models unloaded then), or idle with no model loaded. */
+  async _ollamaIdle() {
+    const app = this.app;
+    if (!app || this.state !== 'unlocked') return !this._opening;
+    if (app.engine.active.size || app.images.active || app.pulls?.size || app.background?.running) return false;
+    const ollama = app.registry.ollama();
+    if (!ollama) return true;
+    const ps = await Promise.race([ollama.ps().catch(() => null), new Promise((r) => setTimeout(() => r(null), 3000))]);
+    return Array.isArray(ps) && ps.length === 0;
   }
 
   /** Whether allowing internet access needs a restart of this process (the launcher sandboxed all of it). */
@@ -657,13 +724,16 @@ export class Core extends EventEmitter {
 
   // ------------------------------------------------------------------------------------------ shutdown
   async close() {
+    this._closed = true;
     clearInterval(this.idleTimer);
+    this._stopReconcileTimer();
     await this._migrating?.catch(() => {});
     const app = this.app;
     this.app = null;
     if (app) await app.close({ lock: false, stopOllama: false }).catch((e) => log.warn(`Closing the data: ${e.code || e.message}`));
+    // no start after this (a late reconcile or auto-start must not leave an orphan Ollama behind)
     const stopOnExit = this._ollamaCache.settings.ollama?.stopOnExit !== false;
-    if (stopOnExit) await this.ollamaProcess.stop().catch(() => {});
+    await this.ollamaProcess.shutdown({ stop: stopOnExit }).catch(() => {});
     await flushWrites().catch(() => {});
     this.vault.lock();
     this.network?.dispose();

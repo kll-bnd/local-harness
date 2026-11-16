@@ -261,7 +261,9 @@ if (!offline && !selfTest.ok) {
   add(!o.enabled || leaks.length || o.externalOllama ? 'warn' : 'ok', `Internet blocker: ${verdict}`,
     [describeOfflineLock(o),
       selfTest.ok ? `self-test ${where}: ${results.map((r) => `${r.layer} ${r.target} → ${r.result}`).join('; ') || 'no probes'}` : `self-test: not available${selfTest.status ? ` (HTTP ${selfTest.status})` : ''}`,
-      o.enabled && o.blocked && !o.osEnforced ? 'Only Harness\'s own code blocks right now; no macOS sandbox is in force (it applies to the Ollama Harness starts).' : ''].filter(Boolean).join('\n      '),
+      o.enabled && o.blocked && !o.osEnforced ? 'Only Harness\'s own code blocks right now; no macOS sandbox is in force (it applies to the Ollama Harness starts).' : '',
+      o.osFallback ? `Harness had to start its Ollama OUTSIDE the macOS sandbox (${o.osFallback.count || 1}×, last ${new Date(o.osFallback.at).toLocaleString()}): ${o.osFallback.reason}${o.osFallback.detail ? ` — ${String(o.osFallback.detail).slice(0, 160)}` : ''}` : '',
+      o.osPending ? 'The Ollama Harness started runs outside the sandbox for now; Harness puts it back as soon as nothing is running (or when it locks).' : ''].filter(Boolean).join('\n      '),
     o.externalOllama ? 'Quit the other Ollama (menu bar → Quit Ollama; brew services stop ollama) so Harness starts its own inside the sandbox.' : '');
 }
 

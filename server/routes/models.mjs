@@ -71,7 +71,10 @@ export function registerModelRoutes(r, app) {
   r.post('/api/providers/ollama/start', async () => {
     const res = await app.ollamaProcess.start();
     app.registry.invalidate();
-    if (res.error) throw new HttpError(res.code === 'not_installed' ? 404 : 500, res.code, res.error, { logTail: res.logTail });
+    if (res.error) {
+      const status = res.code === 'not_installed' ? 404 : res.code === 'port_in_use' || res.code === 'not_loopback' ? 409 : ['not_responding', 'not_listening', 'gpu_discovery_timeout'].includes(res.code) ? 503 : 500;
+      throw new HttpError(status, res.code, res.error, { logTail: res.logTail });
+    }
     return res;
   });
 
