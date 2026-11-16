@@ -53,6 +53,10 @@ let h;
 try {
   h = await reachHarness({ dataDir, port, log: (m) => console.log(m) });
 } catch (e) {
+  if (e?.code === 'HARNESS_IN_APP') {
+    console.error(`${e.message}\nIn the app: Models → the model Harness recommends → "Download and set up" (it asks your password to allow internet access for the download).`);
+    process.exit(1);
+  }
   console.error(`Harness could not start: ${e.message}\nRun: npm run doctor`);
   process.exit(1);
 }

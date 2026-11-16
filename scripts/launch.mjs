@@ -69,7 +69,9 @@ try {
 } catch (e) {
   if (e?.code === 'HARNESS_ALREADY_RUNNING') {
     // Another process holds this data folder's lock (it started between our check and now): use it.
-    console.log(e.url ? `Harness is already running at ${e.url} — opening it.` : 'Harness is already starting for this data folder.');
+    console.log(e.url ? `Harness is already running at ${e.url} — opening it.`
+      : e.transport === 'bridge' ? 'Harness is already open in the Harness app (it has no browser address): switch to the app, or quit it (⌘Q) to use Harness in the browser.'
+        : 'Harness is already starting for this data folder.');
     if (e.url) openBrowser(await launchUrlFor(e.url));
     process.exit(0);
   }

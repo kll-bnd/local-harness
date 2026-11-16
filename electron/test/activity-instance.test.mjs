@@ -10,7 +10,7 @@ import { startServer } from '../../server/index.mjs';
 process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1';
 const require = createRequire(import.meta.url);
 const { createActivityGuard, backendBusy, ACTIVITY_EVENTS } = require('../lib/activity.cjs');
-const { findRunningHarness, portRange } = require('../lib/instance.cjs');
+const { findRunningHarness, findAppHarness, portRange } = require('../lib/instance.cjs');
 
 function fakeBlocker() {
   const b = { started: [], stopped: [], next: 1, start(type) { const id = b.next++; b.started.push([id, type]); return id; }, stop(id) { b.stopped.push(id); } };
@@ -83,4 +83,31 @@ test('findRunningHarness finds a server with the same data dir only', async () =
     await fs.rm(other, { recursive: true, force: true });
   }
   assert.deepEqual(portRange(4747), [4747, 4748, 4749, 4750, 4751, 4752, 4753, 4754, 4755, 4756, 4757]);
+});
+
+test('findAppHarness: the native app holds the folder without a local address', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-inst-app-'));
+  const other = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-inst-app-'));
+  const lock = (o) => fs.writeFile(path.join(dir, 'harness.lock'), JSON.stringify(o));
+  try {
+    assert.equal(findAppHarness({ dataDir: dir }), null, 'no lock file');
+    // A live process (this one) holding the folder in bridge mode: found, and never mistaken for a server with a URL.
+    await lock({ pid: process.pid, url: null, port: null, startedAt: '2026-01-01T00:00:00.000Z', dataDir: dir, transport: 'bridge' });
+    assert.deepEqual(findAppHarness({ dataDir: dir }), { pid: process.pid, transport: 'bridge', startedAt: '2026-01-01T00:00:00.000Z' });
+    assert.equal(await findRunningHarness({ dataDir: dir }), null);
+    // The lock names another folder (a copied data folder): not ours.
+    await lock({ pid: process.pid, url: null, port: null, dataDir: other, transport: 'bridge' });
+    assert.equal(findAppHarness({ dataDir: dir }), null);
+    // The app has quit and left its lock behind.
+    await lock({ pid: 2 ** 22 + 12345, url: null, port: null, dataDir: dir, transport: 'bridge' });
+    assert.equal(findAppHarness({ dataDir: dir }), null);
+    // A listener-mode server that is still starting (no URL yet) is not "the app".
+    await lock({ pid: process.pid, url: null, port: null, dataDir: dir });
+    assert.equal(findAppHarness({ dataDir: dir }), null);
+    await fs.writeFile(path.join(dir, 'harness.lock'), '{ not json');
+    assert.equal(findAppHarness({ dataDir: dir }), null);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(other, { recursive: true, force: true });
+  }
 });

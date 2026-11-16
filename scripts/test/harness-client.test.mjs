@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
-import { HarnessClient, passwordSource, readSecretFromTty, readLaunchJson, describeOfflineLock } from '../lib/harness-client.mjs';
+import { HarnessClient, passwordSource, readSecretFromTty, readLaunchJson, describeOfflineLock, reachHarness, appHarness } from '../lib/harness-client.mjs';
 import { startFakeSecurity } from './fake-security.mjs';
 
 const quiet = () => {};
@@ -191,4 +191,19 @@ test('launch.json defaults and a legacy (0.1) backend', async () => {
   assert.equal(readLaunchJson(dir).encryption, 'keychain');
   assert.match(describeOfflineLock({ enabled: false }), /^OFF/);
   assert.match(describeOfflineLock({ enabled: true, blocked: true, osEnforced: false, externalOllama: true }), /no OS sandbox; the Ollama in use was NOT started by Harness/);
+});
+
+test('Harness open in the native app: the tools say so instead of starting a second backend', async () => {
+  const dir = tmp();
+  try {
+    // What the app's backend writes while it holds the folder (bridge mode: no URL, no port).
+    fs.writeFileSync(path.join(dir, 'harness.lock'), JSON.stringify({ pid: process.pid, url: null, port: null, startedAt: new Date().toISOString(), dataDir: dir, transport: 'bridge' }));
+    assert.equal(appHarness(dir)?.pid, process.pid);
+    await assert.rejects(reachHarness({ dataDir: dir, port: 0 }), (e) => e.code === 'HARNESS_IN_APP' && e.pid === process.pid && /open in the Harness app/.test(e.message) && /quit the app/.test(e.message));
+    assert.deepEqual(fs.readdirSync(dir), ['harness.lock'], 'nothing was started or written in the folder');
+    // Once the app has quit (a stale lock), there is no app to report.
+    fs.writeFileSync(path.join(dir, 'harness.lock'), JSON.stringify({ pid: 2 ** 22 + 4321, url: null, port: null, dataDir: dir, transport: 'bridge' }));
+    assert.equal(appHarness(dir), null);
+    assert.equal(await reachHarness({ dataDir: dir, port: 0, start: false }), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

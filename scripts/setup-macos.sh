@@ -182,6 +182,24 @@ case "$STATE" in
       done
     fi
     ;;
+  app:needs_setup)
+    say "  Harness is open in the Harness app and is waiting for you to choose its password. Choose it in the"
+    say "  app's window and save the ${B}recovery key${N} it then shows once (write it down or keep it in a password"
+    say "  manager — not in a chat, a plain-text note or a screenshot). This script does not choose or type it."
+    if [ ! -t 0 ]; then
+      note "Skipped (not interactive): choose the password in the app's window."
+    else
+      while :; do
+        read -r -p "  Press Return here when you have done that (or type s to skip): " ans || ans="s"
+        case "$ans" in [Ss]*) break ;; esac
+        STATE="$(node scripts/doctor.mjs --state 2>/dev/null || echo unknown)"
+        case "$STATE" in
+          needs_setup|not_running:needs_setup|app:needs_setup) warn "Harness still has no password. Finish the setup in the app's window." ;;
+          *) ok "Your Harness password is set."; break ;;
+        esac
+      done
+    fi
+    ;;
   migrating)
     ok "Harness is encrypting your existing data (from Harness 0.1); it continues while it runs." ;;
   error|not_running:error)
@@ -208,8 +226,12 @@ else
   say "  for this download only, blocks it again right after, and shows the blocker's state at the end."
   STATE="$(node scripts/doctor.mjs --state 2>/dev/null || echo unknown)"
   case "$STATE" in
-    needs_setup|not_running:needs_setup)
+    needs_setup|not_running:needs_setup|app:needs_setup)
       note "Skipped: choose your Harness password first (step 5), then run: npm run get-model" ;;
+    app:*)
+      note "Harness is open in the Harness app, which has no local address this script could use (by design)."
+      note "Download the model in the app instead: Models → the recommended model → \"Download and set up\"."
+      note "(Or quit the app with ⌘Q and run: npm run get-model)" ;;
     *)
       GET_MODEL_ARGS=""
       [ "$ASSUME_YES" = 1 ] && GET_MODEL_ARGS="--yes"
@@ -242,14 +264,39 @@ else
 fi
 
 # ------------------------------------------------------------------------------------------------
-step "8. Desktop app (optional — the browser version needs none of this)"
-if [ -f node_modules/electron/path.txt ]; then
-  ok "Desktop app tooling already installed (node_modules)"
-elif ask "Install the desktop app tooling with npm (Electron + electron-builder, a few hundred MB)?" y; then
+step "8. The Harness app (optional — the browser version needs none of this)"
+say "  The ${B}native app${N} (recommended) runs Harness without a local web server, so nothing else on this Mac"
+say "  can connect to it. It is built here, from this folder, with Apple's Command Line Tools; the build"
+say "  downloads the official Node.js runtime once (about 30 MB, checksum-verified) and takes about a minute."
+NATIVE_INSTALLED=0
+HAVE_SWIFT=0
+if xcrun --find swiftc >/dev/null 2>&1; then HAVE_SWIFT=1; fi
+if [ "$HAVE_SWIFT" = 0 ]; then
+  note "Not possible yet: it needs Apple's Command Line Tools. Install them with:  xcode-select --install"
+  note "and then run:  scripts/build-native.sh --install"
+elif pgrep -x Harness >/dev/null 2>&1; then
+  warn "Harness is running. Quit it (⌘Q), then run:  scripts/build-native.sh --install"
+elif ask "Build the native Harness app and put it in /Applications (replacing an older Harness.app)?" y; then
+  if scripts/build-native.sh --install; then
+    NATIVE_INSTALLED=1
+    ok "Installed /Applications/Harness.app (built on this Mac, so it opens without Gatekeeper prompts)"
+  else
+    warn "The native app did not build — see the messages above and docs/NATIVE.md."
+  fi
+fi
+
+say ""
+say "  The ${B}Electron app${N} is the alternative: the same features, a few hundred MB of developer tooling, and it"
+say "  talks to Harness over 127.0.0.1 like the browser does."
+if [ "$NATIVE_INSTALLED" = 1 ]; then
+  note "Skipped: the native app is installed. (To build it anyway: npm install && npm run dist)"
+elif [ -f node_modules/electron/path.txt ]; then
+  ok "Electron tooling already installed (node_modules)"
+elif ask "Install the Electron tooling with npm (Electron + electron-builder, a few hundred MB)?" "$([ "$HAVE_SWIFT" = 1 ] && echo n || echo y)"; then
   if [ -f package-lock.json ]; then npm ci; else npm install; fi
 fi
 
-if [ -f node_modules/electron/path.txt ]; then
+if [ "$NATIVE_INSTALLED" = 0 ] && [ -f node_modules/electron/path.txt ]; then
   APP="$REPO/dist/mac-arm64/Harness.app"
   if [ -d "$APP" ]; then ok "Already built: $APP"; fi
   if ask "Build Harness.app now (npm run dist, takes a few minutes)?" "$([ -d "$APP" ] && echo n || echo y)"; then

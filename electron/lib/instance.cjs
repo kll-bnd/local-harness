@@ -49,6 +49,24 @@ async function findRunningHarness({ dataDir, timeoutMs = 1500 } = {}) {
   return { url: `http://127.0.0.1:${port}`, port, version: h.version, pid: Number.isInteger(info.pid) ? info.pid : null, state: h.state ?? null };
 }
 
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+/**
+ * A Harness that holds this data folder WITHOUT a local address: the backend of the native app (bridge mode, no
+ * listening socket; its lock says `transport: "bridge"`). Command-line tools cannot talk to it — they can only
+ * say so instead of reporting "not running" or failing to start a second backend.
+ * @returns {{ pid: number, transport: 'bridge', startedAt: string|null } | null}
+ */
+function findAppHarness({ dataDir } = {}) {
+  const info = readLock(dataDir);
+  if (!info || info.transport !== 'bridge' || !pidAlive(info.pid)) return null;
+  if (info.dataDir && real(info.dataDir) !== real(dataDir)) return null;
+  return { pid: info.pid, transport: 'bridge', startedAt: typeof info.startedAt === 'string' ? info.startedAt : null };
+}
+
 const portRange = (preferred) => Array.from({ length: 11 }, (_, i) => preferred + i).filter((p) => p > 0 && p < 65536);
 
-module.exports = { findRunningHarness, portRange, readLock };
+module.exports = { findRunningHarness, findAppHarness, portRange, readLock };

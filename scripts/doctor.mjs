@@ -28,7 +28,7 @@ process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1'; // the temporary backend below mu
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { resolveDataDir } = require('../electron/lib/paths.cjs');
-const { findRunningHarness } = require('../electron/lib/instance.cjs');
+const { findRunningHarness, findAppHarness } = require('../electron/lib/instance.cjs');
 const { HarnessClient, passwordSource, readLaunchJson, describeOfflineLock } = await import('./lib/harness-client.mjs');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 
@@ -144,6 +144,12 @@ if (onlyState) {
   // One word for scripts: needs_setup | locked | migrating | unlocked (running) or not_running:<what the disk says>.
   const running = await findRunningHarness({ dataDir, timeoutMs: 1500 }).catch(() => null);
   if (running) { console.log(running.state || 'unlocked'); process.exit(0); }
+  if (findAppHarness({ dataDir })) {
+    // Open in the native app: no local address to ask. `app:set` = a password (or no protection) is in place,
+    // `app:needs_setup` = the app is still waiting for the owner to choose one.
+    console.log(`app:${launch.encryption === 'off' || fs.existsSync(path.join(dataDir, 'vault.json')) ? 'set' : 'needs_setup'}`);
+    process.exit(0);
+  }
   const p = await probeDataDir();
   console.log(`not_running:${p.sec?.state || (p.error ? 'unknown' : 'ready')}`);
   process.exit(0);
@@ -194,7 +200,9 @@ add(writable ? 'ok' : 'fail', `Data folder: ${dataDir}`, writable ? '' : 'Not wr
 
 // ----------------------------------------------------------------------------- security and the blocker
 const running = writable ? await findRunningHarness({ dataDir, timeoutMs: 1500 }) : null;
-const probe = running ? null : (writable ? await probeDataDir() : null);
+// The native app's backend has no local address: nothing can be asked of it, and no second backend may open the folder.
+const inApp = !running && writable ? findAppHarness({ dataDir }) : null;
+const probe = running || inApp ? null : (writable ? await probeDataDir() : null);
 const runningSec = running ? (await getJson(`${running.url}/api/security`, 5000)).data : null;
 const secNow = runningSec || probe?.sec || null;
 const modeNames = { password: 'password (you type it to open Harness)', keychain: 'Keychain (opens without asking — weaker)', off: 'OFF — your data is stored unencrypted' };
@@ -204,6 +212,9 @@ if (running) {
   add(st === 'error' ? 'fail' : 'info', `Harness ${running.version} is running at ${running.url} — ${stText(st, runningSec)}`, `pid ${running.pid ?? '?'}${runningSec?.transport ? `, ${runningSec.transport}` : ''}`);
   if (runningSec?.unlock?.retryAfterMs > 0) add('warn', `Too many wrong passwords: the next attempt is accepted in ${Math.ceil(runningSec.unlock.retryAfterMs / 1000)} s`);
   if (runningSec?.unlock?.keychainError) add('warn', `The Keychain did not open Harness: ${runningSec.unlock.keychainError.message}`, 'Your password still opens it.');
+} else if (inApp) {
+  add('info', `Harness is open in the Harness app (pid ${inApp.pid})`,
+    'The app has no local address (by design), so this tool cannot ask it whether it is locked, run its internet self-test or see the loaded model.\n      In the app: Settings → Privacy & security shows the lock state and the blocker, with a "Test" button.');
 } else {
   add(probe?.sec?.state === 'error' ? 'fail' : 'info', `Harness is not running${probe?.sec ? ` — ${stText(probe.sec.state, probe.sec)}` : ''}`);
 }
@@ -229,7 +240,7 @@ let session = null;
 if (unlock && running) {
   session = await runningApi(running);
   if (session.error) { add('warn', `Could not look inside the running Harness: ${session.error.message}`); session = null; }
-} else if (unlock) add('info', '--unlock: Harness is not running, so there is nothing to unlock');
+} else if (unlock) add('info', inApp ? '--unlock: Harness is open in the Harness app, which this tool cannot talk to' : '--unlock: Harness is not running, so there is nothing to unlock');
 const tmpApi = await tempApi(launch);
 const api = session || tmpApi;
 const call = (p, o = {}) => (api ? getJson(`${api.url}${p}`, o.timeoutMs || 15000, { ...o, headers: { ...(api.headers || {}), ...(o.headers || {}) } }) : Promise.resolve({ ok: false }));
@@ -238,7 +249,7 @@ const call = (p, o = {}) => (api ? getJson(`${api.url}${p}`, o.timeoutMs || 1500
 const selfTest = running ? await selfTestOf(running.url) : probe?.test || { ok: false };
 const where = running ? 'in the running Harness' : 'in Harness with this folder\'s settings';
 if (!offline && !selfTest.ok) {
-  add('info', `Internet blocker: ${launch.offlineLock === false ? 'off' : 'on'} (launch.json); no self-test available`);
+  add('info', `Internet blocker: ${launch.offlineLock === false ? 'off' : 'on'} (launch.json); ${inApp ? 'run its self-test in the app (Settings → Privacy & security → Test)' : 'no self-test available'}`);
 } else {
   const o = { ...(offline || { enabled: launch.offlineLock !== false, blocked: launch.offlineLock !== false, osScope: 'none', externalOllama: false }), ...(typeof selfTest.data?.osEnforced === 'boolean' ? { osEnforced: selfTest.data.osEnforced } : {}) };
   const results = selfTest.data?.results || [];

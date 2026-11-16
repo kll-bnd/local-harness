@@ -13,8 +13,11 @@ export const LOCK_FILE = 'harness.lock';
 
 export class AlreadyRunningError extends Error {
   constructor(info, dataDir) {
-    super(info?.url ? `Harness is already running for this data folder at ${info.url}` : `Harness is already starting for this data folder (pid ${info?.pid})`);
+    super(info?.url ? `Harness is already running for this data folder at ${info.url}`
+      : info?.transport === 'bridge' ? `Harness is already open in the Harness app for this data folder (pid ${info?.pid})`
+        : `Harness is already starting for this data folder (pid ${info?.pid})`);
     this.code = 'HARNESS_ALREADY_RUNNING';
+    this.transport = info?.transport || null; // 'bridge': the native app's backend, which has no URL
     this.url = info?.url || null;
     this.pid = info?.pid ?? null;
     this.dataDir = dataDir;

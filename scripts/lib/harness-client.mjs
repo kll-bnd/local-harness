@@ -15,7 +15,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { findRunningHarness } = require('../../electron/lib/instance.cjs');
+const { findRunningHarness, findAppHarness } = require('../../electron/lib/instance.cjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -290,12 +290,31 @@ export class HarnessClient {
 }
 
 /**
+ * The native app holds the data folder. Its backend has no local address (no listening socket, by design), so a
+ * command-line tool can neither use it nor start a second backend on the same folder.
+ */
+export function inAppError(pid) {
+  const e = new Error(`Harness is open in the Harness app (pid ${pid ?? '?'}). The app has no local address this tool could talk to — that is by design. Do this step in the app, or quit the app (⌘Q) and run this again.`);
+  e.code = 'HARNESS_IN_APP';
+  e.pid = pid ?? null;
+  return e;
+}
+
+/** The native app's backend when it holds `dataDir` (see findAppHarness), else null. */
+export function appHarness(dataDir) {
+  return findAppHarness({ dataDir });
+}
+
+/**
  * The Harness that serves `dataDir`: the running one, or one started in this process (stopped by close()).
+ * Throws an error with code HARNESS_IN_APP when the native app holds the folder.
  * @returns {Promise<{ base: string, srv: object|null, running: object|null, close(): Promise<void> }>}
  */
 export async function reachHarness({ dataDir, port = 4747, start = true, startOptions = {}, log = () => {} }) {
   const running = await findRunningHarness({ dataDir, timeoutMs: 1500 });
   if (running) return { base: running.url, srv: null, running, close: async () => {} };
+  const app = findAppHarness({ dataDir });
+  if (app) throw inAppError(app.pid);
   if (!start) return null;
   const { startServer } = await import('../../server/index.mjs');
   try {
@@ -304,6 +323,7 @@ export async function reachHarness({ dataDir, port = 4747, start = true, startOp
     return { base: srv.url, srv, running: null, close: async () => { await srv.close().catch(() => {}); } };
   } catch (e) {
     if (e?.code === 'HARNESS_ALREADY_RUNNING' && e.url) return { base: e.url, srv: null, running: { url: e.url, pid: e.pid ?? null }, close: async () => {} };
+    if (e?.code === 'HARNESS_ALREADY_RUNNING' && e.transport === 'bridge') throw inAppError(e.pid);
     throw e;
   }
 }

@@ -55,8 +55,8 @@ about 4.5 GB).
    Harness so **you choose your password** there ([first start](#first-start-your-password)), downloads **the
    model file Harness recommends for your Mac's memory** — asking your password to allow internet access for
    that download only — and, on an 8 GB Mac, makes the **text-only copy** of it ([why](#models-on-an-8-gb-mac)),
-   explains how to switch on Draw Things' API server, and optionally builds the Electron app. Safe to run
-   again at any time.
+   explains how to switch on Draw Things' API server, and offers to build the **native app** and put it in
+   Applications (it needs Apple's Command Line Tools: `xcode-select --install`). Safe to run again at any time.
 
 3. **Start Harness** — whichever you prefer ([details](#ways-to-run-harness)):
    * open **Harness** from Applications (if you built an app), or
@@ -116,6 +116,12 @@ scripts/build-native.sh --install    # builds dist/native/Harness.app (ad-hoc si
 It uses the same data folder, password and settings as every other way of running Harness, the same menus and
 shortcuts (⌃⌘L locks; it also locks when the Mac sleeps or the screen locks), and idles at about 96 MB physical
 footprint against 108 MB for the Electron app (240 MB against 418 MB resident; 120 MB on disk against 309 MB).
+
+**The command-line tools and the app.** Because the app has no local address, `npm run get-model` and the live
+parts of `npm run doctor` cannot talk to it; while the app is open they say so instead of guessing. Download
+models in the app (**Models**: the recommended model, the Ollama library or Hugging Face), and look at
+**Settings → Privacy & security** for the lock state and the blocker's self-test. To use the command-line tools,
+quit the app first (⌘Q): they then start a short-lived Harness of their own on the same data folder.
 
 **Verified on GitHub's Apple Silicon runner** (macOS 26, driving the built app in a self-test mode): the build with
 the Command Line Tools only and a strict signature check; the page contract, all 15 menu actions, uploads up to
