@@ -39,8 +39,8 @@ for the 0.2 security model) have the detail if you need it.
   the owner: the fix is restoring `vault.json` from a backup of the data folder. Never set up a new password over
   existing data, and never delete or edit files in `~/Library/Application Support/Harness`.
 - Do not change the code unless a check below fails and you have found the cause. If you do, keep the
-  change small and tell the owner what and why. Do **not** run `npm test` on this Mac: on macOS the unit suite
-  currently touches the real Keychain (being fixed), and this Mac holds the owner's Harness data.
+  change small, run `npm test` (it uses temporary folders and a stand-in Keychain, never the owner's data), and
+  tell the owner what and why.
 
 ## Steps
 

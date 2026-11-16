@@ -492,8 +492,7 @@ npm run dev:fake             # real server + fake Ollama, Draw Things, ComfyUI, 
                              # with the real defaults (choose a password in the UI; internet blocked)
 npm run dev:fake -- --insecure   # …without password, API sessions or the blocker (explicit development opt-out)
 npm run dev:fake -- --ram 8  # …pretending the machine has 8 GB
-npm test                     # unit tests — NOT on a Mac that holds real Harness data: on macOS the suite
-                             # currently touches the real Keychain (being fixed)
+npm test                     # unit tests: temporary folders and a stand-in Keychain, never your real data
 npm run doctor               # environment check (--live, --json, --recommended-model, --version)
 npm run get-model            # download the recommended model (+ text-only copy on 8 GB) through Harness
 npm run live-check           # test Harness's assumptions against your real backends (docs/LIVE_CHECK.md)

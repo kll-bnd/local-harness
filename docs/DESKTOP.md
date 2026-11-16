@@ -261,9 +261,9 @@ run on a Mac:** all of the above, real sleep/screen-lock events, and the sandbox
   (`HARNESS_E2E_APP=…/Harness.app/Contents/MacOS/Harness`): window loads the server URL; preload contract
   with `desktop` and `desktop-mac`; menus Harness/File/Edit/View/Chat/Window/Help; ⌘⇧Space registered;
   the `desktop-fullscreen` class; attaching to an already-running server; clean quit; the error paths.
-* The 0.1 backend and desktop unit tests (`npm test`) passed on macOS, and the server boots with no `node_modules`.
-  (The 0.2 suite on the macOS runner: 297 of 298 passed; the failure showed the suite touching the real Keychain
-  on a Mac — being fixed. Until then, do not run `npm test` on a Mac that holds real Harness data.)
+* The backend and desktop unit tests (`npm test`) pass on macOS for 0.2, and the server boots with no
+  `node_modules`. An earlier 0.2 run there showed the suite reaching the real login Keychain; it now uses a
+  stand-in and is refused the real one, and a separate opt-in check exercises a throw-away Keychain item.
 * The UI test suite passes in WebKit (Safari's engine), except one Chromium-only assertion.
 
 **Verified on Linux** (development box, Electron 44 under Xvfb), in addition: everything in `npm test`
