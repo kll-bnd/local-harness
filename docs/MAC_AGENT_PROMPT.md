@@ -35,8 +35,9 @@ the 0.2 security model) have the detail if you need it.
   `brew services stop ollama`).
 - Do not use the model tags `nemotron-3.5-bolt:e4b` (7.9 GB, does not fit), any `:latest`, or tags without
   the `UD-` prefix. Use the tag Harness names.
-- Never delete, move or edit anything in `~/Library/Application Support/Harness` (the owner's chats live
-  there), and never touch the `local.harness` items in the login Keychain. If Harness or `npm run doctor`
+- Never delete, move or edit anything in `~/Library/Application Support/Harness` (the owner's chats and the
+  key files `vault.json`, `vault.json.bak`, `vault-seq.json` and `launch.json` live there; Harness notices and
+  reports edits to them), and never touch the `local.harness` items in the login Keychain. If Harness or `npm run doctor`
   reports a **damaged key store** (`vault_corrupt` / `vault_missing`), stop and tell the owner: the fix is
   restoring `vault.json` from a backup of that folder. Never set up a new password over existing data.
 - Run only what this prompt names. The scripts under `scripts/ci/`, `native/test/` and `native/ci/` are for the
@@ -88,6 +89,11 @@ through the browser first and switch to the native app at the end.
    ```bash
    npm run get-model
    ```
+   If it answers that Harness is running but locked, the owner unlocks it in the browser window first (the
+   tools check the password themselves and send it only to a Harness that proves it holds the owner's data
+   key; they never unlock a Harness they did not start). If it says the program at that address *could not
+   prove* that, stop and tell the owner — the password was not sent.
+
    On 8 GB the comfortable file is `UD-IQ3_XXS`. `UD-Q3_K_XL` is better quality but borderline on 8 GB; only
    switch to it if the owner asks and memory stays healthy:
    `npm run get-model -- --model hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL`.
@@ -129,6 +135,8 @@ through the browser first and switch to the native app at the end.
    - **Settings → Privacy & security → "Check that nothing can get out"**: it should answer *Nothing got out*,
      and the line above the button should say that macOS keeps the Ollama Harness started in a sandbox.
    - **Lock Harness** (⌃⌘L): the lock screen appears and the owner's password opens it again.
+   - If a notice says *Harness's security settings were changed from outside*, show it to the owner as it is:
+     it means a start-up file was edited while Harness was closed and Harness ignored the edit.
    - Send a short message; then, with Tools on, ask *"Draw me a red fox in the snow."* Expected on 8 GB: the
      first reply takes 10–60 s while the model loads; for the picture the app says it is unloading the chat
      model, generating, then reloading on the next message.

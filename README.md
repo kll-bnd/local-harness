@@ -159,6 +159,7 @@ hides it from any app (change or disable it in `desktop.json`, see [Your data](#
 **⌃⌘L** locks Harness, and it locks itself when the Mac sleeps or the screen locks;
 **⌘N** new chat, **⌘K** command palette, **⌘.** stop generating, **⌘,** settings, **⌘/** all shortcuts.
 The Electron app runs Harness's backend inside the app and talks to it over `127.0.0.1`, like the browser.
+It only ever shows that backend: if another Harness already has the data folder open, the app says so and quits.
 
 ### In your browser
 
@@ -330,8 +331,11 @@ other servers you manage those in the server itself.
 |---|---|
 | Someone gets your Mac, its disk or a copy of the data folder while Harness is **locked** or quit | **Yes.** Chats, memories, attachments, images, settings and indexes are encrypted (AES-256-GCM). The key is derived from your password (scrypt, 128 MiB per try, so guessing is slow) and exists only in Harness's memory while it is unlocked. |
 | Other programs running as you, while Harness is **locked** | **Yes** — they can read the folder but not decrypt it. (Not in "Keychain" mode, below: any program running as you can ask the Keychain for the key.) |
-| Other programs running as you, while Harness is **unlocked** | **No.** A malicious program running as you can read your screen, log what you type, use the browser's session cookie or tamper with Harness's files. Lock Harness when you step away; the apps lock on sleep and screen lock. |
+| Other programs running as you, while Harness is **unlocked** | **No.** A malicious program running as you can read your screen, log what you type, use the browser's session cookie, change Harness's own program files or show you a fake Harness window. Lock Harness when you step away; the apps lock on sleep and screen lock. |
+| Someone edits Harness's unencrypted start-up files (`vault.json`, `launch.json`) while it is locked — for example in a backup or a synced copy that you later open | **They cannot weaken the protection.** Whatever lowers it (no password, the blocker off, an allow window, decrypting the folder) counts only when it is recorded under your data key. Anything else is ignored and put back, and Harness tells you after you unlock ("Harness’s security settings were changed from outside"). A damaged key file is repaired from its copy or reported; Harness never writes over the last good copy of your key. |
+| Someone puts back an **older, complete copy** of the data folder | **Not detected.** They cannot read it, but Harness cannot tell an old valid folder from the current one, so you would see older chats and the settings you had then. An older copy of a single chat or settings file put back among current ones is not detected either (an older key file on its own is). |
 | Other user accounts on the Mac | **Yes.** The data folder is `700`, every file `600`, and the local API answers only callers with a session (the password) — not other accounts' programs. |
+| A program that pretends to be Harness to the command-line tools | **The tools check first.** `npm run get-model` and `npm run doctor -- --unlock` verify your password on their own and send it only to a Harness on this Mac that proves it holds your data key; a locked Harness is unlocked in its own window, not by a tool. The Electron app only ever shows the Harness it started itself, and the native app talks to its own backend over private pipes. |
 | You forget the password **and** lose the recovery key | **The data is gone.** There is no back door, by design. |
 | Harness reaching the internet | **Blocked by default** (below): Harness's own code refuses every non-local address, and the Ollama that Harness starts runs inside a macOS sandbox that blocks outbound connections and name lookups to anything but this Mac. |
 | An Ollama someone else started (menu-bar app, `brew services`), Draw Things, ComfyUI, LM Studio, your browser | **Not covered** by the blocker — they are separate programs. Harness tells you when the Ollama in use was not started by it. Draw Things may keep its own (unencrypted) copies of what it generates. |
@@ -362,7 +366,11 @@ and UDP packet to anything but this Mac is refused, lookups of outside names fai
 directly against that Ollama fails, while loopback, the GPU and chatting keep working. Allowing internet restarts
 that Ollama outside the sandbox (a download then works); **Block now** puts it back at once, and when the window
 ends on its own Harness puts it back as soon as nothing is running on it (or when Harness locks), never in the
-middle of a reply. The profile does not block
+middle of a reply. If macOS cannot start Ollama inside the sandbox at all, Harness starts it without, says so in
+**Settings → Privacy & security** (and in `npm run doctor`), and tries again the next time it locks; its own
+blocking stays on throughout. A slow start is not treated as a failure: when another app is busy on the graphics
+chip (Draw Things loading a model, for example) Ollama can need many seconds to come up, and Harness waits and
+shows "Waiting for the GPU…". The profile does not block
 *inbound* connections; Harness binds Ollama to 127.0.0.1, so nothing outside this Mac can reach it.
 
 To download a model, **Allow internet for 15 minutes** (1–120; asks your password). A download still running
@@ -394,11 +402,11 @@ Folder in Finder in the app.)
 | | encrypted? |
 |---|---|
 | `chats/`, `memories.json`, `attachments/`, `images/`, `index/`, `settings.json`, `presets.json`, `calibration.json`, `model-copies.json`, the UI state, sessions | **encrypted** (same names, unreadable contents) |
-| `vault.json` | plain, but holds only your data key *wrapped* under the password and the recovery key, plus the wrong-password counter |
-| `launch.json` | plain: the protection mode and whether the blocker is on — what a launcher must know before the data opens |
+| `vault.json`, `vault.json.bak`, `vault-seq.json` | plain, but hold only your data key *wrapped* under the password and the recovery key, your security settings sealed under that key (the protection mode, the blocker), the wrong-password counter, and a counter that reveals an older `vault.json` put back on its own. The `.bak` is Harness's own verified copy. **Back the whole folder up together: without `vault.json` the data cannot be opened** |
+| `launch.json` | plain: what a launcher must know before the data opens (the protection mode, whether the blocker is on). Only a hint — editing it cannot lower the protection |
 | `measurements.json` | plain: measured model memory use |
 | `harness.lock` | present while Harness runs (one Harness per data folder) |
-| `api-token` | only in Keychain/off mode: lets the launchers open the window without a prompt |
+| `api-token` | only in Keychain/off mode: lets `Harness.command` and the command-line tools get a session without a prompt (the apps do not use it). New at every start |
 | `desktop.json`, `Electron/` | Electron app: options (global shortcut, port, hide-on-close), window state, browser cache |
 | `logs/harness.log` | the app's log (Help → Show Log File) — never message text |
 
@@ -448,7 +456,9 @@ npm install && npm run dist && ditto dist/mac-arm64/Harness.app /Applications/Ha
 1. Run **`npm run doctor`**. It works while Harness is locked and never needs your password: it reports
    whether Harness is running and locked, the protection mode, the internet blocker and its self-test, Ollama
    and its memory protections, the installed and recommended models, Draw Things and the other local servers,
-   and how to fix each problem. `npm run doctor -- --unlock` also looks inside the running Harness.
+   and how to fix each problem. `npm run doctor -- --unlock` also looks inside the running Harness. (While the
+   native app is open, doctor can only say that it is open — the app has no local address; its **Settings →
+   Privacy & security** page shows the same facts, or quit the app and run doctor again.)
 2. Run **`npm run live-check`** (or `npm run doctor -- --live`). It tests what Harness assumes about your
    *real* Ollama (and Draw Things, ComfyUI, llama.cpp, LM Studio if they're running) and writes a Markdown
    report — `npm run live-check -- --markdown report.md`; `doctor --live` saves it to your Desktop. Details:
@@ -473,7 +483,13 @@ npm install && npm run dist && ditto dist/mac-arm64/Harness.app /Applications/Ha
 | Image generation finishes but no image comes back | keep a **project open** in Draw Things (a known Draw Things issue with some models), and make sure a model is selected there |
 | First reply after an image is slow | expected on 8 GB: the chat model was unloaded for the image and is loading again |
 | Port 4747 is busy | Harness uses the next free port automatically; the app/launcher shows the URL. Or set `HARNESS_PORT` |
-| "Harness is already running" | only one Harness runs per data folder; the app and `Harness.command` open the running one |
+| "Harness is already running" / "Harness is already open" | only one Harness uses a data folder at a time. `Harness.command` opens the running one in your browser; the apps show their own Harness only, so quit the other one first (⌘Q in the app, Ctrl+C in Terminal). If the message names another computer, quit Harness there — or, if it is not running there, delete the left-over `harness.lock` in the data folder |
+| A command-line tool says "Harness is open in the Harness app" | the native app has no local address the tools could use. Download models in the app (**Models**), or quit the app (⌘Q) and run the tool again |
+| "Harness is running … but it is locked" from `get-model` / `doctor --unlock` | unlock it in its own window (or quit it), then run the tool again. The tools do not unlock a Harness they did not start |
+| "… could not prove that it has this Harness data folder open … your password was NOT sent" | something other than your Harness answers at that address. Quit it (or restart the Mac if you do not know what it is), then `npm run doctor` |
+| "Harness's security settings were changed from outside" | while Harness was closed, one of its unencrypted start-up files claimed less protection than you had set. Harness ignored it and kept your settings. Expected after you restore an old copy of the folder yourself; otherwise something on this Mac tried to weaken it — see what else is running, and consider a new password and re-keying |
+| "Waiting for the GPU…" / "Ollama did not finish starting" | another app is busy on the graphics chip (Draw Things loading or generating, another Ollama). Harness waits up to two minutes; let the other app finish, then send the message again |
+| Settings says Ollama runs outside the macOS sandbox | either from the last download (Harness puts it back as soon as it is idle, at the latest when it locks) or macOS could not start it inside (the reason is shown; Harness tries again when it next locks). Harness's own blocking is on either way |
 | The app shows an error at start | Help → Show Log File, or `~/Library/Application Support/Harness/logs/harness.log` |
 | The Electron app won't open after downloading or copying it from another Mac | it is ad-hoc signed and not notarized: build it on this Mac (`npm run dist`), or see [The Electron app](#the-electron-app) for clearing the quarantine flag |
 | `Harness.command` "cannot be verified" | right-click it → Open once, or run `./Harness.command` in Terminal |
@@ -504,6 +520,7 @@ npm test                     # unit tests: temporary folders and a stand-in Keyc
 npm run doctor               # environment check (--live, --json, --recommended-model, --version)
 npm run get-model            # download the recommended model (+ text-only copy on 8 GB) through Harness
 npm run live-check           # test Harness's assumptions against your real backends (docs/LIVE_CHECK.md)
+scripts/build-native.sh      # the native Mac app → dist/native/Harness.app (--install copies it to /Applications)
 npm install && npm run app   # the Electron shell
 npm run test:e2e             # launches the real Electron app and smoke-tests it (uses Xvfb on Linux)
 npm run icons                # regenerate build/icon.icns + icon.png from build/icon.svg
