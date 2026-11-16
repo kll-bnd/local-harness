@@ -1,0 +1,17 @@
+{
+  "name": "harness",
+  "version": "0.1.0",
+  "description": "Harness: a local app for chatting with open-source LLMs (Ollama, llama.cpp, LM Studio, MLX) with long context, auto-summarization, long-term memory, tools and local image generation.",
+  "private": true,
+  "type": "module",
+  "main": "server/index.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "test": "node --test --test-concurrency=4 \"test/*.test.mjs\"",
+    "dev:fake": "node scripts/dev-fake.mjs"
+  },
+  "license": "UNLICENSED"
+}
