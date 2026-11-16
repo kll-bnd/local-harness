@@ -15,6 +15,9 @@ import { HarnessClient, reachHarness, safeFetch, loopbackBase } from '../lib/har
 import { startFakeSecurity, writeTestVault } from './fake-security.mjs';
 
 process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1';
+// The other computer's name. Fixed and short: the tools clip very long host names for display, and a name built from
+// os.hostname() overflowed that on CI runners whose own name has 60+ characters.
+const OTHER_HOST = 'studio-mac-elsewhere';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const recorder = path.join(root, 'scripts', 'test', 'net-recorder.mjs');
 const PW = 'owner password 1234';
@@ -66,7 +69,7 @@ function holder() {
 // Locks whose address must never be used. `bad(conn)` says whether a recorded socket went where it must not.
 const FORGED = [
   { name: 'another computer (hostname), naming a live local stand-in', far: true,
-    lock: (L, pid) => ({ hostname: `${os.hostname()}-elsewhere`, url: L.url, port: L.port, pid }), bad: (c, L) => c.port === L.port },
+    lock: (L, pid) => ({ hostname: OTHER_HOST, url: L.url, port: L.port, pid }), bad: (c, L) => c.port === L.port },
   { name: 'a non-loopback url', lock: (L, pid) => ({ url: 'http://203.0.113.7:4747', pid }), bad: (c) => c.host === '203.0.113.7' },
   { name: 'a host name in the url', lock: (L, pid) => ({ url: `http://evil.invalid:${L.port}`, pid }), bad: (c, L) => c.host === 'evil.invalid' || c.port === L.port },
   { name: 'an out-of-range port', lock: (L, pid) => ({ url: 'http://127.0.0.1:70000', port: 70000, pid }), bad: (c) => Number(c.port) === 70000 },
@@ -224,7 +227,7 @@ test('script 34: a relay on the SAME port at another loopback address — the fo
   const genuine = await startFakeSecurity({ state: 'unlocked', password: PW, prove: 'key', dataKey: dek });
   const relay = await relayTo(genuine.url, { host: alt, port: genuine.port });
   try {
-    writeLock(dir, { pid: process.pid, url: `http://${alt.includes(':') ? `[${alt}]` : alt}:${relay.port}`, port: 1, hostname: `${os.hostname()}-elsewhere` });
+    writeLock(dir, { pid: process.pid, url: `http://${alt.includes(':') ? `[${alt}]` : alt}:${relay.port}`, port: 1, hostname: OTHER_HOST });
     await assert.rejects(reachHarness({ dataDir: dir, port: 0 }), (e) => e.code === 'HARNESS_ELSEWHERE');
     assert.deepEqual(relay.seen, []);
     assert.equal(genuine.unlockBodies.length, 0);

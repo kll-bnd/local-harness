@@ -128,8 +128,8 @@ test('a lock from another computer: never contacted (not even /api/health), what
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const { port } = srv.address();
   try {
-    await fs.writeFile(path.join(dir, 'harness.lock'), JSON.stringify({ pid: process.pid, port, url: `http://127.0.0.1:${port}`, hostname: `${os.hostname()}-elsewhere`, dataDir: await fs.realpath(dir) }));
-    assert.deepEqual(lockElsewhere({ dataDir: dir }), { hostname: `${os.hostname()}-elsewhere`, pid: process.pid });
+    await fs.writeFile(path.join(dir, 'harness.lock'), JSON.stringify({ pid: process.pid, port, url: `http://127.0.0.1:${port}`, hostname: 'studio-mac-elsewhere', dataDir: await fs.realpath(dir) }));
+    assert.deepEqual(lockElsewhere({ dataDir: dir }), { hostname: 'studio-mac-elsewhere', pid: process.pid });
     assert.equal(await findRunningHarness({ dataDir: dir }), null);
     const r = await startOrRefuse({ dataDir: dir, port: 0, findElsewhere: lockElsewhere, findApp: findAppHarness, findRunning: findRunningHarness, startServer: async () => { throw new Error('not reached'); } });
     assert.equal(r.other.kind, 'elsewhere');
