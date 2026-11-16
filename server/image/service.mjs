@@ -190,7 +190,8 @@ export class ImageService {
     (async () => {
       for (const m of models) {
         this.app.bus.publish('model.status', { phase: 'loading', model: m, reason: 'reload_after_image' });
-        await ollama.load(m, { keepAlive }).catch(() => {});
+        const numCtx = this.app.engine.loadedCtxFor(ollama.id, m);
+        await ollama.load(m, { keepAlive, ...(numCtx ? { options: { num_ctx: numCtx } } : {}) }).catch(() => {});
       }
       this.app.modelState.markReloaded();
       this.app.bus.publish('model.status', { phase: 'ready', models });

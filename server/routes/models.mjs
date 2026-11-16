@@ -217,8 +217,33 @@ export function registerModelRoutes(r, app) {
     const s = app.engine.globalEffectiveSettings();
     const plan = await app.registry.contextPlan(provider, model, s);
     await provider.load(model, { keepAlive: s.keepAlive, options: { num_ctx: plan.numCtx } });
+    app.engine.loadedCtx.set(`${provider.id}/${model}`, plan.numCtx);
     app.modelState.markReloaded();
     return { ok: true, numCtx: plan.numCtx };
+  });
+
+  r.get('/api/models/measurements', async ({ query }) => {
+    const ref = modelParams(query);
+    const { provider, model } = await app.registry.resolve(ref);
+    const info = await app.registry.modelInfo(provider, model).catch(() => null);
+    const entry = app.measurements.get(provider.id, model);
+    const s = app.engine.globalEffectiveSettings();
+    const kvCacheType = app.registry.kvCacheType(s);
+    const valid = app.measurements.samplesFor(provider.id, model, { digest: info?.digest, sizeBytes: info?.sizeBytes, kvCacheType });
+    const plan = info ? await app.registry.contextPlan(provider, model, s, { info }) : null;
+    return {
+      providerId: provider.id, model, kvCacheType,
+      stale: !!entry && !!info && !app.measurements.matches(entry, { digest: info.digest, sizeBytes: info.sizeBytes }),
+      samples: entry?.samples || [], validSamples: valid.length,
+      loadedNumCtx: app.engine.loadedCtxFor(provider.id, model),
+      measurement: plan?.memory?.measurement || null, basis: plan?.memory?.basis || 'estimate',
+    };
+  });
+
+  r.delete('/api/models/measurements', async ({ query }) => {
+    const ref = modelParams(query);
+    const { provider, model } = await app.registry.resolve(ref);
+    return { ok: true, removed: app.measurements.reset(provider.id, model) };
   });
 
   r.get('/api/embeddings/status', async () => app.embedder.status());

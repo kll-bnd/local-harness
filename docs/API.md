@@ -238,7 +238,8 @@ From `GET /api/models/context`, `GET /api/models/info`, the `start` event (`cont
     "modelBytes": 6442450944, "overheadBytes": 461708984,
     "kvBytesPerToken": 14336, "kvFixedBytes": 29360128, "kvCacheType": "f16", "kvSource": "metadata+swa",
     "kvLayers": { "full": 7, "slidingWindow": 28, "window": 512 },
-    "kvBytes": 968884224, "otherModelsBytes": 620000000, "estimatedTotalBytes": 8493044152
+    "kvBytes": 968884224, "otherModelsBytes": 620000000, "estimatedTotalBytes": 8493044152,
+    "basis": "estimate", "measurement": null
   },
   "alternatives": { "max": { "numCtx": 65536, "estimatedTotalBytes": 8493044152, "fits": true, "overBudgetBytes": 0 }, "fitMax": 65536 },
   "warnings": [],
@@ -252,11 +253,28 @@ From `GET /api/models/context`, `GET /api/models/info`, the `start` event (`cont
 * `limitedBy`: `model` | `memory` | `user` | `setting` (`context.maxAuto`) | `low_ram_cap` (`context.lowRamCap`, ≤ 8 GB machines only) | `server`.
 * `modelMaxSource`: `override` (built-in table — e.g. Nemotron 3.5 Bolt E4B is 64K although metadata says 128K) | `metadata` | `catalog` | `unknown`.
 * `ramTier`: `low` (≤ 8 GB), `medium` (≤ 16 GB), `high`.
-* `warnings[]`: `{code, message}` — `model_exceeds_budget`, `exceeds_budget`, `clamped_to_model_max`, `context_unknown`.
+* `warnings[]`: `{code, message}` — `model_exceeds_budget`, `exceeds_budget`, `clamped_to_model_max`, `context_unknown`, and from real measurements (below) `measured_exceeds_budget`, `cpu_offload`.
 * Show `explanation` verbatim; it always says what limited the window and, when RAM-limited, what `max` would cost. 8 GB examples:
   * `"The model alone (6.0 GB) exceeds the safe memory budget (4.8 GB) on this 8 GB Mac; using the minimum 2K context. A smaller quantization is strongly recommended."`
   * `"4K of 64K context — limited by RAM; est. 4.7 GB of 8.0 GB RAM (safe budget 4.8 GB). Max mode (64K) would need ~5.6 GB and would likely swap."`
   * `"16K of 64K context — capped for responsiveness on this 8 GB Mac (RAM would allow ~52K; raise context.lowRamCap or use max mode for more); …"`
+
+**Self-correction from real memory use (`memory.basis`, `memory.measurement` — optional fields).** After each turn's first model call, Harness reads Ollama `GET /api/ps` for the chat model (`size` = total resident bytes, `size_vram` = bytes on the GPU, `context_length` when the Ollama version reports it, else the `num_ctx` we sent) and stores the sample per model build (digest + file size) and KV-cache precision (`measurements.json` in the data dir). Later plans for that model use the measurements instead of the architecture guess:
+
+* 1 measurement → the fixed part (weights + overhead) is corrected, bytes/token stays estimated (`method: "offset"`); measurements at ≥ 2 contexts ≥ 1K apart → bytes/token is fitted too (`"linear"`, or `"linear-clamped"` when the fit was limited to ¼–4× the estimate). Repeated readings at one context use the median; implausible readings (< 0.4× or > 3× the estimate, below half the weights, tiny contexts) are ignored and counted in `rejected`. A re-pulled/different build or another KV precision starts from the estimate again.
+* `memory.basis`: `"estimate" | "measured"`. When `"measured"`, `estimatedTotalBytes` is the measurement-corrected figure and the `explanation` says so (`"… measured-corrected 4.6 GB of 8.0 GB RAM … Memory use is calibrated from 1 measurement of this model (last: 4.9 GB at 14K)."`).
+* `memory.measurement` (or `null` when there are no samples):
+  ```json
+  { "method": "offset", "samples": 1, "distinctContexts": 1, "rejected": 0,
+    "fixedBytes": 3179830784, "perTokenBytes": 147456, "estimatedFixedBytes": 2843435456, "estimatedPerTokenBytes": 147456,
+    "gpuCapBytes": null,
+    "latest": { "numCtx": 14336, "totalBytes": 5293760000, "vramBytes": 5293760000, "at": "2026-11-16T02:49:05.813Z", "cpuSplit": false } }
+  ```
+  `method` is `"none"` (and `fixedBytes`/`perTokenBytes` are `null`) when every sample was rejected. `gpuCapBytes`: the GPU-resident size observed while the model was split between GPU and CPU (`size_vram < size`); auto mode then keeps the model within it.
+* **Auto mode** never repeats an over-commit: if the latest measurement was over the safe budget or partly on the CPU, the next plan comes down to what fits per the corrected estimate, and the `explanation` starts with e.g. `"Measured 4.9 GB at 14K (over the safe budget of 4.8 GB); auto mode reduced the window to 12K using that measurement. 12K of 40K context — limited by RAM; …"`.
+* **Explicit modes** (`max`, a number) are never changed; instead `warnings` get `measured_exceeds_budget` (`"Measured 4.9 GB for this model at 16K — over the safe memory budget of 4.8 GB on this 8 GB Mac; expect swapping. About 8K would fit: lower the context or switch to auto."`) and/or `cpu_offload` (`"Ollama placed only 3.6 GB of 3.8 GB on the GPU at 16K (5% runs on the CPU), which makes generation much slower. Use a smaller context window (about 8K fits on the GPU) or a smaller quantization."`).
+* A corrected plan only takes effect at the **start of the next turn** (changing `num_ctx` makes Ollama reload the model); every call within a turn — including the tool loop and auto-compaction — uses that turn's `num_ctx`, and background title / memory-extraction calls use the `num_ctx` the model is currently loaded with.
+* Disable with `settings.context.useMeasurements: false`; inspect/reset with `GET`/`DELETE /api/models/measurements`.
 
 ### 3.6 Memory
 
@@ -331,7 +349,7 @@ From `GET /api/models/context`, `GET /api/models/info`, the `start` event (`cont
   "systemPrompt": null,
   "params": { "temperature": null, "top_p": null, "top_k": null, "min_p": null, "repeat_penalty": null, "seed": null, "num_predict": null, "stop": null },
   "keepAlive": "30m",
-  "context": { "mode": "auto", "maxAuto": null, "lowRamCap": 16384, "kvCacheType": "auto", "memoryFraction": null, "replyReserve": "auto" },
+  "context": { "mode": "auto", "maxAuto": null, "lowRamCap": 16384, "kvCacheType": "auto", "memoryFraction": null, "replyReserve": "auto", "useMeasurements": true },
   "reasoning": { "think": "auto" },
   "compaction": { "enabled": true, "threshold": 0.75, "target": 0.45, "keepRecentFraction": 0.25, "minKeepMessages": 2, "maxSummaryTokens": "auto", "model": null },
   "memory": { "enabled": true, "autoExtract": true, "model": null, "topK": 6, "maxTokens": "auto", "minSimilarity": 0.5, "placement": "turn", "extractDelayMs": 4000 },
@@ -374,6 +392,7 @@ From `GET /api/models/context`, `GET /api/models/info`, the `start` event (`cont
 | `context.mode` | `"auto" \| "max" \| integer ≥ 512` | see ContextPlan |
 | `context.maxAuto` | int \| null | cap for auto mode |
 | `context.lowRamCap` | int \| null | cap for auto mode on ≤ 8 GB machines (prompt processing of very long contexts is slow there); `null` disables |
+| `context.useMeasurements` | bool | correct the RAM estimate from real Ollama `/api/ps` measurements of each model (see 3.5) |
 | `context.kvCacheType` | `auto \| f16 \| q8_0 \| q4_0` | KV precision assumed in the RAM estimate; `auto` = `q8_0` if Harness spawned Ollama, else `$OLLAMA_KV_CACHE_TYPE`, else `f16` |
 | `context.memoryFraction` | 0.1–1 \| null | override the safe RAM budget fraction |
 | `context.replyReserve` | int \| `"auto"` | auto = 15 % of the window (384–8192) |
@@ -441,7 +460,7 @@ failure:    start > … > error            (exactly one of done / error ends eve
 | `start` | `generationId, chatId, userMessage` (Message or `null` for regenerate), `assistantMessage` (placeholder, `status:"streaming"`), `model: {providerId, model, displayName, capabilities}`, `contextPlan` | first |
 | `retrieval` | `pinnedMemories: [{id, content}]`, `memories: [{id, content, score}]`, `documents: [{attachmentId, name, part, of, score}]`, `recall: [{chatId, chatTitle, date, score}]` | when anything was injected ("used 2 memories · 3 excerpts") |
 | `compaction` | `status: "started"` + `messages, tokens, keptMessages, usedBefore, threshold` · `"completed"` + `summary` (Summary), `messages, calls, usedBefore, usedAfter` · `"failed"` + `error, fallback: "truncate"` | auto-summarizer ran ("Summarizing earlier messages…") |
-| `notice` | `code, message` (+ details). Codes: `context_truncated` (`droppedMessages, truncatedMessages`), `tools_unsupported`, `thinking_unsupported`, `pinned_memories_large`, and ContextPlan warning codes (`model_exceeds_budget`, `exceeds_budget`, …) | non-fatal info for a toast |
+| `notice` | `code, message` (+ details). Codes: `context_truncated` (`droppedMessages, truncatedMessages`), `tools_unsupported`, `thinking_unsupported`, `pinned_memories_large`, ContextPlan warning codes (`model_exceeds_budget`, `exceeds_budget`, `measured_exceeds_budget`, `cpu_offload`, …), and right after the first model call of a turn, when the model's measured footprint is bad: `measured_exceeds_budget` (`measuredBytes, budgetBytes, numCtx, nextNumCtx`) / `cpu_offload` (`totalBytes, vramBytes, numCtx, nextNumCtx`) — not repeated when the turn's plan already carried that warning | non-fatal info for a toast |
 | `context` | ContextUsage + `summaryId`, `messageId`, and on the first one `contextPlan: {numCtx, limitedBy, explanation}` | before each model call |
 | `model_status` | `phase: "loading"` + `models, reason: "reload_after_image", message` · `phase: "ready"` | the chat model is being reloaded after an image job unloaded it |
 | `reasoning` | `messageId, delta` | thinking text |
@@ -599,6 +618,8 @@ Harness auto-starts an installed-but-stopped Ollama at boot (`settings.ollama.au
 | `POST /api/models/load` | `{ model, providerId? }` preload with the planned `num_ctx` → `{ ok: true, numCtx }` |
 | `POST /api/models/unload` | `{ model, providerId? }` (`keep_alive: 0`) → `{ ok: true }` |
 | `GET /api/models/loaded` | → `{ models: [{providerId, model, name, sizeBytes, vramBytes, expiresAt, contextLength, digest}], modelState }` |
+| `GET /api/models/measurements?model=…[&providerId=…]` | memory measurements of a model → `{ providerId, model, kvCacheType, stale, samples: [{numCtx, sentNumCtx, reportedContext, totalBytes, vramBytes, kvCacheType, at}], validSamples, loadedNumCtx, measurement, basis }` (`stale`: recorded for a different build; `loadedNumCtx`: the `num_ctx` it is currently loaded with, or `null`) |
+| `DELETE /api/models/measurements?model=…[&providerId=…]` | forget them (plans go back to the estimate) → `{ ok: true, removed }` |
 | `GET /api/embeddings/status` | → EmbeddingsStatus (below) |
 
 ModelListItem: `{ providerId, providerName, model, name, sizeBytes, digest, modifiedAt, family, families, parameterSize, quantization, format, embedding, loaded }` + with `details=1`: `capabilities`, `contextLength`.
@@ -809,6 +830,7 @@ RAM coordination: before generating, Harness may unload Ollama models (`image_st
 | `model.pull` | `{ pullId, providerId, model, status, digest?, total?, completed?, percent?, error? }` (throttled progress; `status`: `started`, Ollama status text, `success`, `error`, `aborted`) |
 | `model.deleted` | `{ providerId, model }` |
 | `model.status` | `{ phase: "unloaded"\|"loading"\|"ready", models, reason? }` |
+| `model.measured` | `{ providerId, model, sample: {numCtx, sentNumCtx, reportedContext, totalBytes, vramBytes, kvCacheType, at} }` |
 | `attachment.indexed` | `{ attachmentId, embedded }` |
 | `image.job` · `image.status` · `image.progress` · `image.done` · `image.error` | same payloads as the image SSE events (from any source, incl. the tool) |
 | `image.added` / `image.deleted` | `{ image }` / `{ imageId }` |

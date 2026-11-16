@@ -199,6 +199,11 @@ export class ProviderRegistry {
   async contextPlan(provider, model, s, { info, otherModelsBytes = 0, modeOverride } = {}) {
     info ||= await this.modelInfo(provider, model);
     const mode = modeOverride ?? s.context?.mode ?? 'auto';
+    const kvCacheType = this.kvCacheType(s);
+    // Real /api/ps measurements of this exact model build (digest + size) at this KV precision.
+    const measurements = provider.kind === 'ollama' && this.measurements && s.context?.useMeasurements !== false
+      ? this.measurements.samplesFor(provider.id, model, { digest: info.digest, sizeBytes: info.sizeBytes, kvCacheType })
+      : null;
     const plan = computeContextPlan({
       providerKind: provider.kind,
       serverCtx: info.serverContext,
@@ -213,8 +218,9 @@ export class ProviderRegistry {
       lowRamCap: s.context?.lowRamCap ?? null,
       system: this.system,
       memoryFraction: s.context?.memoryFraction ?? null,
-      kvCacheType: this.kvCacheType(s),
+      kvCacheType,
       otherModelsBytes,
+      measurements,
     });
     plan.providerId = provider.id;
     plan.model = model;

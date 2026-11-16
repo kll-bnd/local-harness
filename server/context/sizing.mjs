@@ -93,16 +93,94 @@ export function kvCacheModel(arch = {}, profile = {}, kvCacheType = 'f16') {
   return { perToken, fixedFor, fullLayers, swaLayers, window: swaLayers ? window : null, source: swaLayers ? 'metadata+swa' : 'metadata' };
 }
 
-function roundCtx(n) {
+export function roundCtx(n) {
   if (n >= 8192) return Math.floor(n / 2048) * 2048;
   if (n >= 4096) return Math.floor(n / 1024) * 1024;
   return Math.floor(n / 512) * 512;
+}
+
+const median = (arr) => {
+  const a = [...arr].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+};
+
+/** True when a sample shows part of the model resident outside the GPU (Ollama `size_vram < size`). */
+export function isCpuSplit(sample) {
+  return Number.isFinite(sample?.vramBytes) && sample.vramBytes >= 0 && sample.vramBytes < sample.totalBytes * 0.97;
+}
+
+/**
+ * Fit measured resident sizes (Ollama /api/ps `size` at a given num_ctx) to `total(ctx) = fixed + perToken·ctx`.
+ * - 1 distinct context  → keep the estimated bytes/token, correct the fixed part (offset).
+ * - ≥2 distinct contexts (≥1K apart) → least-squares slope too, clamped to ¼–4× the estimate.
+ * Samples are sanity-checked against the estimate (0.4×–3×, ≥ half the weights) and repeated samples at the
+ * same context are reduced to their median, so a single odd reading cannot swing the plan.
+ * @param {Array<{numCtx, totalBytes, vramBytes?, at?}>} samples (already filtered to this model/digest/KV type)
+ * @param {{ estModelOnly: (ctx:number)=>number, perToken: number, modelBytes?: number }} est
+ * @returns {null | { usable, method, fixedBytes, perTokenBytes, samples, distinctContexts, rejected, latest, gpuCapBytes }}
+ */
+export function fitMeasurements(samples, { estModelOnly, perToken, modelBytes = 0 }) {
+  if (!samples?.length) return null;
+  const ok = [];
+  let rejected = 0;
+  for (const smp of samples) {
+    const n = Number(smp.numCtx);
+    const M = Number(smp.totalBytes);
+    if (!Number.isFinite(n) || !Number.isFinite(M) || n < 256 || M <= 0) { rejected++; continue; }
+    const est = estModelOnly(n);
+    const r = est > 0 ? M / est : 1;
+    if (r < 0.4 || r > 3 || (modelBytes > 0 && M < modelBytes * 0.5)) { rejected++; continue; }
+    const v = Number(smp.vramBytes);
+    ok.push({ ...smp, numCtx: n, totalBytes: M, vramBytes: Number.isFinite(v) && v >= 0 && v <= M * 1.05 ? v : null });
+  }
+  if (!ok.length) return { usable: false, method: 'none', samples: 0, distinctContexts: 0, rejected, latest: null, gpuCapBytes: null };
+  const byCtx = new Map();
+  for (const smp of ok) {
+    if (!byCtx.has(smp.numCtx)) byCtx.set(smp.numCtx, []);
+    byCtx.get(smp.numCtx).push(smp.totalBytes);
+  }
+  const groups = [...byCtx.entries()].map(([n, ms]) => ({ n, M: median(ms) })).sort((a, b) => a.n - b.n);
+  const latest = ok.reduce((a, b) => (String(b.at || '') >= String(a.at || '') ? b : a));
+  let B = perToken;
+  let A;
+  let method;
+  const spread = groups.length ? groups[groups.length - 1].n - groups[0].n : 0;
+  if (groups.length >= 2 && spread >= 1024) {
+    const nBar = groups.reduce((a, g) => a + g.n, 0) / groups.length;
+    const mBar = groups.reduce((a, g) => a + g.M, 0) / groups.length;
+    let num = 0;
+    let den = 0;
+    for (const g of groups) { num += (g.n - nBar) * (g.M - mBar); den += (g.n - nBar) ** 2; }
+    const raw = den > 0 ? num / den : NaN;
+    const lo = perToken > 0 ? perToken * 0.25 : 0;
+    const hi = perToken > 0 ? perToken * 4 : 1024 * 1024;
+    B = Number.isFinite(raw) && raw > 0 ? clamp(raw, lo, hi) : (perToken > 0 ? perToken : 0);
+    method = Number.isFinite(raw) && raw > 0 && B === raw ? 'linear' : 'linear-clamped';
+    A = groups.reduce((a, g) => a + (g.M - B * g.n), 0) / groups.length;
+  } else {
+    const g = byCtx.has(latest.numCtx) ? { n: latest.numCtx, M: median(byCtx.get(latest.numCtx)) } : groups[groups.length - 1];
+    A = g.M - B * g.n;
+    method = 'offset';
+  }
+  A = Math.max(A, modelBytes * 0.5);
+  // GPU capacity: the smallest GPU-resident size seen while the model was split across CPU/GPU,
+  // unless a later fully-GPU sample proves more fits.
+  const splits = ok.filter(isCpuSplit);
+  let gpuCapBytes = splits.length ? Math.min(...splits.map((x) => x.vramBytes)) : null;
+  if (gpuCapBytes !== null && ok.some((x) => !isCpuSplit(x) && x.totalBytes >= gpuCapBytes && String(x.at || '') > String(splits.find((y) => y.vramBytes === gpuCapBytes).at || ''))) gpuCapBytes = null;
+  return {
+    usable: true, method, fixedBytes: Math.round(A), perTokenBytes: Math.round(B), samples: ok.length, distinctContexts: groups.length, rejected,
+    latest: { numCtx: latest.numCtx, totalBytes: latest.totalBytes, vramBytes: latest.vramBytes, at: latest.at || null, cpuSplit: isCpuSplit(latest) },
+    gpuCapBytes,
+  };
 }
 
 /**
  * Decide num_ctx for a model.
  * @param {object} p
  * @param {'auto'|'max'|number} p.mode
+ * @param {Array} [p.measurements] Ollama /api/ps samples for this model (same digest + KV type) — see fitMeasurements
  * @returns ContextPlan (see docs/API.md)
  */
 export function computeContextPlan(p) {
@@ -113,6 +191,7 @@ export function computeContextPlan(p) {
     mode = 'auto', maxAuto = null, lowRamCap = null,
     system = {}, memoryFraction = null, kvCacheType = 'f16',
     otherModelsBytes = 0,
+    measurements = null,
   } = p;
   const totalMem = system.totalMem;
   const budget = memoryBudget({ totalMem, platform: system.platform, arch: system.arch, memoryFraction });
@@ -127,7 +206,7 @@ export function computeContextPlan(p) {
     if (!known) warnings.push({ code: 'context_unknown', message: `The server did not report its context size; assuming ${formatTokensK(numCtx)}.` });
     return {
       numCtx, mode: 'server', modelMax: modelMaxIn || null, modelMaxSource, advertisedMax, limitedBy: 'server', fits: null, fitMax: null,
-      memory: { ...memBase, modelBytes: modelBytes || null, overheadBytes: null, kvBytesPerToken: null, kvFixedBytes: null, kvCacheType: null, kvSource: null, kvBytes: null, otherModelsBytes, estimatedTotalBytes: null },
+      memory: { ...memBase, modelBytes: modelBytes || null, overheadBytes: null, kvBytesPerToken: null, kvFixedBytes: null, kvCacheType: null, kvSource: null, kvBytes: null, otherModelsBytes, estimatedTotalBytes: null, basis: 'estimate', measurement: null },
       alternatives: null, warnings,
       explanation: known ? `Context is fixed by the server at ${formatTokensK(numCtx)} (set when the server/model was loaded).` : `Context size unknown; assuming ${formatTokensK(numCtx)}.`,
     };
@@ -137,14 +216,33 @@ export function computeContextPlan(p) {
   if (!modelMaxIn) warnings.push({ code: 'context_unknown', message: `Model metadata has no context length; assuming ${formatTokensK(modelMax)}.` });
   const kv = kvCacheModel(arch, profile, kvCacheType);
   const overhead = overheadBytes(modelBytes);
-  const estimate = (ctx) => modelBytes + overhead + kv.perToken * ctx + kv.fixedFor(ctx) + otherModelsBytes;
-  const available = budget.budgetBytes - modelBytes - overhead - otherModelsBytes;
-  // Solve perToken*ctx + fixedFor(ctx) <= available (fixedFor saturates at window, so subtract its max).
-  const fixedMax = kv.fixedFor(Number.MAX_SAFE_INTEGER);
-  let fitMax = kv.perToken > 0 ? Math.floor((available - fixedMax) / kv.perToken) : modelMax;
+  const estModelOnly = (ctx) => modelBytes + overhead + kv.perToken * ctx + kv.fixedFor(ctx);
+  const fit = measurements?.length ? fitMeasurements(measurements, { estModelOnly, perToken: kv.perToken, modelBytes }) : null;
+  const corr = fit?.usable ? fit : null;
+  const modelOnly = corr ? (ctx) => corr.fixedBytes + corr.perTokenBytes * ctx : estModelOnly;
+  const estimate = (ctx) => modelOnly(ctx) + otherModelsBytes;
+
+  let fitMax;
+  let modelFits;
+  let gpuFitMax = null;
+  if (corr) {
+    const avail = budget.budgetBytes - otherModelsBytes;
+    const solve = (cap) => (corr.perTokenBytes > 0 ? Math.floor((cap - corr.fixedBytes) / corr.perTokenBytes) : modelMax);
+    fitMax = solve(avail);
+    if (corr.gpuCapBytes) {
+      gpuFitMax = Math.max(0, solve(corr.gpuCapBytes));
+      fitMax = Math.min(fitMax, gpuFitMax);
+    }
+    modelFits = Math.min(avail, corr.gpuCapBytes ?? Infinity) > corr.fixedBytes + corr.perTokenBytes * MIN_CTX;
+  } else {
+    const available = budget.budgetBytes - modelBytes - overhead - otherModelsBytes;
+    // Solve perToken*ctx + fixedFor(ctx) <= available (fixedFor saturates at window, so subtract its max).
+    const fixedMax = kv.fixedFor(Number.MAX_SAFE_INTEGER);
+    fitMax = kv.perToken > 0 ? Math.floor((available - fixedMax) / kv.perToken) : modelMax;
+    modelFits = available > fixedMax + kv.perToken * MIN_CTX;
+  }
   if (!Number.isFinite(fitMax)) fitMax = 0;
   fitMax = Math.max(0, fitMax);
-  const modelFits = available > fixedMax + kv.perToken * MIN_CTX;
 
   let numCtx;
   let limitedBy;
@@ -175,22 +273,48 @@ export function computeContextPlan(p) {
   const total = estimate(numCtx);
   const fits = total <= budget.budgetBytes;
   if (!modelFits) {
-    warnings.push({ code: 'model_exceeds_budget', message: `The model (${formatBytes(modelBytes)}) leaves no room for a useful context within the safe memory budget (${formatBytes(budget.budgetBytes)}) on this ${machine}. Expect swapping or CPU offload; consider a smaller quantization.` });
+    warnings.push({ code: 'model_exceeds_budget', message: `The model (${formatBytes(corr ? corr.fixedBytes : modelBytes)}${corr ? ' measured' : ''}) leaves no room for a useful context within the safe memory budget (${formatBytes(budget.budgetBytes)}) on this ${machine}. Expect swapping or CPU offload; consider a smaller quantization.` });
   } else if (!fits) {
-    warnings.push({ code: 'exceeds_budget', message: `Estimated ${formatBytes(total)} exceeds the safe memory budget of ${formatBytes(budget.budgetBytes)}; generation may swap or offload to CPU.` });
+    warnings.push({ code: 'exceeds_budget', message: `${corr ? 'Measurement-corrected estimate' : 'Estimated'} ${formatBytes(total)} exceeds the safe memory budget of ${formatBytes(budget.budgetBytes)}; generation may swap or offload to CPU.` });
   }
+
+  // Bad outcomes seen in the latest real measurement.
+  let autoNote = '';
+  if (corr?.latest) {
+    const L = corr.latest;
+    const over = L.totalBytes + otherModelsBytes > budget.budgetBytes;
+    const split = L.cpuSplit;
+    const atOrAbove = numCtx >= L.numCtx;
+    const fitK = formatTokensK(Math.max(MIN_CTX, roundCtx(Math.min(fitMax, modelMax))));
+    if (effMode === 'auto' && (over || split) && !atOrAbove) {
+      const what = [over ? `over the safe budget of ${formatBytes(budget.budgetBytes)}` : null, split ? `${formatBytes(L.totalBytes - L.vramBytes)} of it on the CPU` : null].filter(Boolean).join(', ');
+      autoNote = `Measured ${formatBytes(L.totalBytes)} at ${formatTokensK(L.numCtx)} (${what}); auto mode reduced the window to ${formatTokensK(numCtx)} using that measurement. `;
+    } else if (atOrAbove) {
+      const explicit = effMode !== 'auto';
+      if (over) {
+        warnings.push({ code: 'measured_exceeds_budget', message: `Measured ${formatBytes(L.totalBytes)} for this model at ${formatTokensK(L.numCtx)} — over the safe memory budget of ${formatBytes(budget.budgetBytes)} on this ${machine}; expect swapping. ${explicit ? `About ${fitK} would fit: lower the context or switch to auto.` : 'Use a smaller quantization.'}` });
+      }
+      if (split) {
+        const pct = Math.round(((L.totalBytes - L.vramBytes) / L.totalBytes) * 100);
+        const gpuK = gpuFitMax !== null ? formatTokensK(Math.max(MIN_CTX, roundCtx(Math.min(gpuFitMax, modelMax)))) : null;
+        warnings.push({ code: 'cpu_offload', message: `Ollama placed only ${formatBytes(L.vramBytes)} of ${formatBytes(L.totalBytes)} on the GPU at ${formatTokensK(L.numCtx)} (${pct}% runs on the CPU), which makes generation much slower. ${explicit && gpuK ? `Use a smaller context window (about ${gpuK} fits on the GPU) or a smaller quantization.` : 'Use a smaller quantization.'}` });
+      }
+    }
+  }
+
   const maxTotal = estimate(modelMax);
   const alternatives = {
     max: { numCtx: modelMax, estimatedTotalBytes: maxTotal, fits: maxTotal <= budget.budgetBytes, overBudgetBytes: Math.max(0, maxTotal - budget.budgetBytes) },
     fitMax: Math.min(fitMax, modelMax),
   };
 
-  const est = `est. ${formatBytes(total)} of ${formatBytes(totalMem)} RAM (safe budget ${formatBytes(budget.budgetBytes)})`;
+  const est = `${corr ? 'measured-corrected' : 'est.'} ${formatBytes(total)} of ${formatBytes(totalMem)} RAM (safe budget ${formatBytes(budget.budgetBytes)})`;
+  const modelSize = corr ? corr.fixedBytes : modelBytes;
   let explanation;
   if (!modelFits && effMode === 'auto') {
-    explanation = `The model alone (${formatBytes(modelBytes)}) exceeds the safe memory budget (${formatBytes(budget.budgetBytes)}) on this ${machine}; using the minimum ${formatTokensK(numCtx)} context. A smaller quantization is strongly recommended.`;
+    explanation = `The model alone (${formatBytes(modelSize)}${corr ? ' measured' : ''}) exceeds the safe memory budget (${formatBytes(budget.budgetBytes)}) on this ${machine}; using the minimum ${formatTokensK(numCtx)} context. A smaller quantization is strongly recommended.`;
   } else if (limitedBy === 'memory') {
-    explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — limited by RAM; ${est}. Max mode (${formatTokensK(modelMax)}) would need ~${formatBytes(maxTotal)}${alternatives.max.fits ? '' : ' and would likely swap'}.`;
+    explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context — limited by RAM${corr?.gpuCapBytes && gpuFitMax !== null && gpuFitMax <= fitMax ? ' (what fits on the GPU)' : ''}; ${est}. Max mode (${formatTokensK(modelMax)}) would need ~${formatBytes(maxTotal)}${alternatives.max.fits ? '' : ' and would likely swap'}.`;
   } else if (limitedBy === 'user') {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context (manual); ${est}.`;
   } else if (limitedBy === 'low_ram_cap') {
@@ -200,6 +324,10 @@ export function computeContextPlan(p) {
   } else {
     explanation = `${formatTokensK(numCtx)} of ${formatTokensK(modelMax)} context (model max); ${est}.${!fits && effMode === 'max' ? ' Over budget: may swap.' : ''}`;
   }
+  explanation = autoNote + explanation;
+  if (corr) {
+    explanation += ` Memory use is calibrated from ${corr.samples} measurement${corr.samples === 1 ? '' : 's'} of this model (last: ${formatBytes(corr.latest.totalBytes)} at ${formatTokensK(corr.latest.numCtx)}).`;
+  }
 
   return {
     numCtx, mode: effMode, modelMax, modelMaxSource, advertisedMax, limitedBy, fits, fitMax: Math.min(fitMax, 10_000_000),
@@ -207,6 +335,13 @@ export function computeContextPlan(p) {
       ...memBase, modelBytes, overheadBytes: overhead, kvBytesPerToken: kv.perToken, kvFixedBytes: kv.fixedFor(numCtx), kvCacheType, kvSource: kv.source,
       kvLayers: { full: kv.fullLayers, slidingWindow: kv.swaLayers, window: kv.window },
       kvBytes: kv.perToken * numCtx + kv.fixedFor(numCtx), otherModelsBytes, estimatedTotalBytes: total,
+      basis: corr ? 'measured' : 'estimate',
+      measurement: fit ? {
+        method: fit.method, samples: fit.samples, distinctContexts: fit.distinctContexts, rejected: fit.rejected,
+        fixedBytes: fit.usable ? fit.fixedBytes : null, perTokenBytes: fit.usable ? fit.perTokenBytes : null,
+        estimatedFixedBytes: Math.round(modelBytes + overhead + kv.fixedFor(Number.MAX_SAFE_INTEGER)), estimatedPerTokenBytes: kv.perToken,
+        gpuCapBytes: fit.gpuCapBytes, latest: fit.latest,
+      } : null,
     },
     alternatives, warnings, explanation,
   };

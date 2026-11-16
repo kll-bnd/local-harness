@@ -63,6 +63,13 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
     clear() { this.requests.length = 0; this.unloads.length = 0; this.failures.length = 0; },
     installed,
     chatRequests() { return this.requests.filter((r) => r.path === '/api/chat').map((r) => r.body); },
+    /**
+     * What /api/ps reports per model: size = sizeBytes ?? baseBytes + perTokenBytes·num_ctx,
+     * size_vram = min(size, vramCapBytes) (CPU split when smaller), context_length only if reportContext.
+     * Defaults: baseBytes = model file size, perTokenBytes = 1000, no VRAM cap, reportContext = true.
+     */
+    psProfiles: new Map(),
+    setPsProfile(name, profile) { if (profile) this.psProfiles.set(name, profile); else this.psProfiles.delete(name); },
   };
 
   const find = (name) => installed.get(name) || installed.get(norm(name)) || null;
@@ -101,7 +108,15 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
         return sendJson(res, 200, { models: [...installed.entries()].map(([name, m]) => ({ name, model: name, modified_at: m.modified, size: m.size, digest: m.digest, details: { parent_model: '', format: 'gguf', family: m.family, families: [m.family], parameter_size: m.params, quantization_level: m.quant } })) });
       }
       if (req.method === 'GET' && url.pathname === '/api/ps') {
-        return sendJson(res, 200, { models: [...fake.loaded.entries()].filter(([n]) => find(n)).map(([name, l]) => { const m = find(name); return { name, model: name, size: m.size + l.numCtx * 1000, digest: m.digest, details: { family: m.family, parameter_size: m.params, quantization_level: m.quant }, expires_at: l.expires, size_vram: m.size, context_length: l.numCtx }; }) });
+        return sendJson(res, 200, {
+          models: [...fake.loaded.entries()].filter(([n]) => find(n)).map(([name, l]) => {
+            const m = find(name);
+            const pr = fake.psProfiles.get(name) || {};
+            const size = pr.sizeBytes ?? Math.round((pr.baseBytes ?? m.size) + (pr.perTokenBytes ?? 1000) * l.numCtx);
+            const vram = pr.vramCapBytes != null ? Math.min(size, pr.vramCapBytes) : size;
+            return { name, model: name, size, digest: m.digest, details: { family: m.family, parameter_size: m.params, quantization_level: m.quant }, expires_at: l.expires, size_vram: vram, ...(pr.reportContext === false ? {} : { context_length: l.numCtx }) };
+          }),
+        });
       }
       if (req.method === 'POST' && url.pathname === '/api/show') {
         const name = body.model || body.name;

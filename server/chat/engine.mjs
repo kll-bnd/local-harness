@@ -1,7 +1,7 @@
 // The chat turn runner: settings resolution → retrieval → assembly (+ auto-compaction) → streaming
 // agent loop with tools → persistence → background follow-ups (title, memory extraction, recall index).
 import { newId } from '../lib/ids.mjs';
-import { nowIso, deepMerge, clone } from '../lib/util.mjs';
+import { nowIso, deepMerge, clone, formatBytes, formatTokensK } from '../lib/util.mjs';
 import { HttpError, isAbortError, ProviderError } from '../lib/errors.mjs';
 import { log } from '../lib/log.mjs';
 import { addMessage, pathTo, setActiveLeaf, activePath } from './tree.mjs';
@@ -14,7 +14,7 @@ import { chatSummary, publicMessage } from '../store/chats.mjs';
 import { extractMemories } from '../memory/extractor.mjs';
 import { generateTitle, provisionalTitle } from './titles.mjs';
 import { embeddingProfileFor } from '../providers/catalog.mjs';
-import { ramTier } from '../context/sizing.mjs';
+import { ramTier, isCpuSplit, roundCtx } from '../context/sizing.mjs';
 
 const nonNull = (o) => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v !== null && v !== undefined));
 
@@ -40,6 +40,40 @@ export class ChatEngine {
   constructor(app) {
     this.app = app;
     this.active = new Map();
+    // num_ctx each model is currently loaded with (last chat request). Background calls for the same model
+    // reuse it so Ollama does not reload; a corrected plan only takes effect at the start of the next turn.
+    this.loadedCtx = new Map();
+  }
+
+  loadedCtxFor(providerId, model) { return this.loadedCtx.get(`${providerId}/${model}`) ?? null; }
+
+  /**
+   * After a real request loaded the model: read its actual footprint from Ollama /api/ps, store it, and
+   * surface bad outcomes (over the safe budget / partly on CPU). The current turn keeps its num_ctx;
+   * the corrected plan applies from the next turn.
+   */
+  async measureLoaded(chat, t, emit) {
+    if (t.provider.kind !== 'ollama' || t.s.context?.useMeasurements === false) return null;
+    const sample = await this.app.measurements.measure(t.provider, t.model, { numCtx: t.plan.numCtx, kvCacheType: t.plan.memory.kvCacheType, digest: t.info.digest, sizeBytes: t.info.sizeBytes });
+    if (!sample) return null;
+    const mem = t.plan.memory;
+    const over = sample.totalBytes + (mem.otherModelsBytes || 0) > mem.budgetBytes;
+    const split = isCpuSplit(sample);
+    if (!over && !split) return sample;
+    const already = new Set((t.plan.warnings || []).map((w) => w.code));
+    const next = await this.app.registry.contextPlan(t.provider, t.model, t.s, { info: t.info, otherModelsBytes: mem.otherModelsBytes || 0 });
+    const auto = t.plan.mode === 'auto';
+    const tail = auto
+      ? (next.numCtx < t.plan.numCtx ? ` From the next message the context window will be ${formatTokensK(next.numCtx)} (it is not changed mid-answer because that reloads the model).` : ' A smaller quantization is recommended.')
+      : ` Your context setting (${formatTokensK(t.plan.numCtx)}) was kept; about ${formatTokensK(Math.max(2048, roundCtx(Math.min(next.alternatives?.fitMax ?? 0, next.modelMax))))} would fit.`;
+    if (over && !already.has('measured_exceeds_budget')) {
+      emit('notice', { code: 'measured_exceeds_budget', message: `${t.model} measured ${formatBytes(sample.totalBytes)} at ${formatTokensK(sample.numCtx)} — over the safe memory budget of ${formatBytes(mem.budgetBytes)}.${tail}`, measuredBytes: sample.totalBytes, budgetBytes: mem.budgetBytes, numCtx: sample.numCtx, nextNumCtx: next.numCtx });
+    }
+    if (split && !already.has('cpu_offload')) {
+      const cpu = sample.totalBytes - sample.vramBytes;
+      emit('notice', { code: 'cpu_offload', message: `Ollama could only place ${formatBytes(sample.vramBytes)} of ${t.model} (${formatBytes(sample.totalBytes)}) on the GPU at ${formatTokensK(sample.numCtx)}; ${formatBytes(cpu)} runs on the CPU, which is much slower.${tail}`, totalBytes: sample.totalBytes, vramBytes: sample.vramBytes, numCtx: sample.numCtx, nextNumCtx: next.numCtx });
+    }
+    return sample;
   }
 
   globalEffectiveSettings() {
@@ -335,6 +369,7 @@ export class ChatEngine {
       let think = resolveThink(s, t.info, t.provider);
       const maxIter = s.tools?.maxIterations ?? 6;
       let iteration = 0;
+      let measured = false;
       for (;;) {
         const offerTools = tools.length && iteration < maxIter ? tools : undefined;
         if (this.app.modelState.unloadedForImage) emit('model_status', { phase: 'loading', models: this.app.modelState.models, reason: 'reload_after_image', message: 'Reloading the chat model…' });
@@ -354,6 +389,11 @@ export class ChatEngine {
             if (cal) t.counter = this.app.calibrator.counter(t.provider.id, t.model, { imageTokens: t.info.profile?.imageTokens || 576 });
           }
           emit('stats', statsPayload(asst.id, iteration, r.usage, t.plan.numCtx));
+        }
+        if (t.provider.kind === 'ollama') this.loadedCtx.set(`${t.provider.id}/${t.model}`, t.plan.numCtx);
+        if (iteration === 0 && r.usage && !measured) {
+          measured = true;
+          await this.measureLoaded(chat, t, emit).catch((e) => log.debug('measure failed', e.message));
         }
         if (r.doneReason === 'length') finalReason = 'length';
         if (r.toolCalls.length && offerTools) {

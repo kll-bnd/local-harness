@@ -10,6 +10,7 @@ import { PresetStore } from './store/presets.mjs';
 import { ChatStore } from './store/chats.mjs';
 import { AttachmentStore } from './store/attachments.mjs';
 import { Calibrator } from './context/tokens.mjs';
+import { MeasurementStore } from './context/measurements.mjs';
 import { ProviderRegistry } from './providers/registry.mjs';
 import { OllamaProcess } from './providers/ollama-process.mjs';
 import { Embedder } from './memory/embedder.mjs';
@@ -74,8 +75,10 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.settings = await new SettingsStore(dataDir, bus).load();
   app.presets = await new PresetStore(dataDir, bus).load();
   app.calibrator = await new Calibrator(dataDir).load();
+  app.measurements = await new MeasurementStore(dataDir, bus).load();
   app.ollamaProcess = new OllamaProcess({ getSettings: () => app.settings.get(), getProvider: () => app.registry.ollama() || { baseUrl: 'http://127.0.0.1:11434', status: async () => ({ ok: false }) }, bus, totalMem: app.system.totalMem });
   app.registry = new ProviderRegistry({ settings: app.settings, bus, system: app.system, autodetect, ollamaProcess: app.ollamaProcess });
+  app.registry.measurements = app.measurements;
   app.embedder = new Embedder({ registry: app.registry, settings: app.settings, system: app.system });
   app.chats = await new ChatStore(dataDir, bus).load();
   app.memories = await new MemoryStore({ dataDir, embedder: app.embedder, bus }).load();
@@ -93,7 +96,7 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
     app.background.stop();
     for (const g of app.engine.active.values()) g.controller.abort();
     await app.chats.flush();
-    await Promise.allSettled([app.calibrator.save(), app.memories.index.save(), app.recall.index.save(), app.attachments.docIndex.save()]);
+    await Promise.allSettled([app.calibrator.save(), app.measurements.save(), app.memories.index.save(), app.recall.index.save(), app.attachments.docIndex.save()]);
     if (app.settings.get().ollama?.stopOnExit !== false) await app.ollamaProcess.stop().catch(() => {});
     await flushWrites();
   };

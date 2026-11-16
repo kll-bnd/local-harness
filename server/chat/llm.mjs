@@ -13,7 +13,16 @@ export class LLM {
     const info = await this.app.registry.modelInfo(r.provider, r.model);
     if (info.capabilities.includes('embedding') && !info.capabilities.includes('completion')) throw new HttpError(400, 'not_chat_model', `${r.model} is an embedding model and cannot chat`);
     const plan = await this.app.registry.contextPlan(r.provider, r.model, s, { info });
-    return { ...r, info, plan, numCtx: plan.numCtx, settings: s };
+    // Use the num_ctx the model is loaded with right now (set by the last chat request) so internal calls
+    // never force Ollama to reload it; a corrected plan only applies at the next chat turn.
+    let loaded = r.provider.kind === 'ollama' ? this.app.engine.loadedCtxFor(r.provider.id, r.model) : null;
+    if (!loaded && r.provider.kind === 'ollama') {
+      // Nothing sent in this process yet (e.g. after a restart): if Ollama reports the loaded context, keep it.
+      const ps = await r.provider.ps().catch(() => []);
+      const e = ps.find((m) => m.model === r.model || m.name === r.model || m.model === `${r.model}:latest`);
+      if (Number.isFinite(e?.contextLength) && e.contextLength >= 512) loaded = e.contextLength;
+    }
+    return { ...r, info, plan, numCtx: loaded || plan.numCtx, settings: s };
   }
 
   async complete({ ref = null, chat = null, messages, maxTokens, temperature = 0.2, format, signal }) {
