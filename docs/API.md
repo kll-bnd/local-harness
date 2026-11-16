@@ -846,7 +846,7 @@ RAM coordination: before generating, Harness may unload Ollama models (`image_st
 * **Memory UX**: list/edit/pin under settings; toast on `memory` (tool) and `memory.extracted` (bus); a per-chat incognito toggle (`PATCH {incognito:true}`).
 * **Images**: in chat, render `image` events inline at the tool call (`toolCallId`), then the final text. Show `image_status.message` and `image_progress` (progress bar) and, on 8 GB, the unload/reload phases ("Unloading chat model… Generating… Reloading…"). Gallery: `GET /api/images`; image detail shows prompt/seed/params with "Use as init image" (`initImage: {imageId}`) and "Reuse seed".
 * **First run**: if `GET /api/models` is empty, offer `GET /api/models/recommended` (`suggestedVariant`) + `POST /api/models/pull`; if Ollama is `unreachable` and `system.ollama.installed`, offer `POST /api/providers/ollama/start`; if not installed, link to ollama.com. If `GET /api/embeddings/status` has a `suggestion`, offer to pull it (not on 8 GB).
-* **Electron**: load `url` from `startServer()`; if you serve the UI from a custom protocol, add it to `HARNESS_ALLOWED_ORIGINS`. Call `close()` on quit.
+* **Electron**: load `url` from `startServer()`; if you serve the UI from a custom protocol, add it to `HARNESS_ALLOWED_ORIGINS`. Call `close()` on quit. The shipped shell (`electron/`) does exactly that over `http://127.0.0.1:<port>`; its preload API (`window.harnessDesktop`), `<html>` classes, menu actions and lock-down rules are documented in [`docs/DESKTOP.md`](DESKTOP.md).
 
 ## 8. Fake backends for development
 

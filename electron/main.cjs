@@ -31,7 +31,23 @@ const headless = !!E2E_SCRIPT;
 app.setName('Harness');
 const dataDir = resolveDataDir();
 const paths = desktopPaths(dataDir);
-try { fs.mkdirSync(paths.sessionData, { recursive: true }); } catch { /* reported when the server starts */ }
+let dataDirError = null;
+try {
+  fs.mkdirSync(paths.sessionData, { recursive: true });
+  fs.accessSync(dataDir, fs.constants.R_OK | fs.constants.W_OK);
+} catch (e) {
+  dataDirError = e;
+}
+
+if (dataDirError) {
+  // Without a usable data dir there is no single-instance lock and no server: explain and exit.
+  app.whenReady().then(async () => {
+    await reportStartupError(Object.assign(new Error(`Cannot use the data folder ${dataDir}: ${dataDirError.message}`), { code: dataDirError.code }));
+    app.exit(1);
+  });
+  return; // CommonJS top-level return: wire nothing else in this process
+}
+
 // One location regardless of how Harness is launched: Electron's userData IS the backend data dir
 // (~/Library/Application Support/Harness on macOS); Chromium's caches go to a sub-folder.
 app.setPath('userData', dataDir);
@@ -64,6 +80,7 @@ let registeredShortcut = null;
 const hooks = {
   // Replaced by the E2E script so tests never launch a real browser.
   openExternal: (url) => shell.openExternal(url),
+  showItemInFolder: (p) => shell.showItemInFolder(p),
 };
 
 // ---------------------------------------------------------------------------------------------- helpers
@@ -262,7 +279,7 @@ function registerIpc() {
     if (!fromApp(e)) return false;
     const resolved = security.resolveInsideDir(p, dataDir);
     if (!resolved) return false;
-    shell.showItemInFolder(resolved);
+    hooks.showItemInFolder(resolved);
     return true;
   });
   ipcMain.handle('harness:set-badge', (e, text) => {

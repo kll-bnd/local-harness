@@ -60,7 +60,8 @@ function fitToDisplays(state, displays, primary) {
     return { x: Math.round(pa.x + (pa.width - s.width) / 2), y: Math.round(pa.y + (pa.height - s.height) / 2), ...s };
   };
   if (!state) return { ...centred(DEFAULT_SIZE.width, DEFAULT_SIZE.height), maximized: false };
-  if (state.x === undefined) return { ...centred(state.width, state.height), maximized: state.maximized };
+  const maximized = state.maximized === true;
+  if (state.x === undefined) return { ...centred(state.width, state.height), maximized };
   const rect = { x: state.x, y: state.y, width: state.width, height: state.height };
   let best = null;
   for (const d of displays || []) {
@@ -69,14 +70,14 @@ function fitToDisplays(state, displays, primary) {
   }
   // Visible enough: at least 120×60 px of the window (incl. its title bar region) on some display.
   if (!best || best.i.width < 120 || best.i.height < 60 || state.y < best.d.workArea.y - 10) {
-    return { ...centred(state.width, state.height), maximized: state.maximized };
+    return { ...centred(state.width, state.height), maximized };
   }
   const area = best.d.workArea;
   const s = clampSize(state.width, state.height, area);
   // Keep the window inside the work area of the display it is mostly on.
   const x = Math.min(Math.max(state.x, area.x), area.x + area.width - s.width);
   const y = Math.min(Math.max(state.y, area.y), area.y + area.height - s.height);
-  return { x, y, ...s, maximized: state.maximized };
+  return { x, y, ...s, maximized };
 }
 
 /** Snapshot of a BrowserWindow worth persisting (normal bounds, so a maximized window restores sensibly). */
