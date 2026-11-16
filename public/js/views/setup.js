@@ -109,7 +109,7 @@ export class SetupView {
 
   recommendations(rec, hasModel) {
     const list = rec.models || [];
-    const top = this.showAll ? list : list.slice(0, hasModel ? 2 : 3);
+    const top = this.showAll || !hasModel ? list : list.slice(0, 2);
     return h('div.stack',
       h('div.rec-list', top.map((r) => recCard(r, rec.machine))),
       list.length > top.length ? h('button.btn-link.small', { type: 'button', on: { click: () => { this.showAll = true; this.render(); } } }, `Show ${list.length - top.length} more`) : null,

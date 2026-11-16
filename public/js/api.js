@@ -24,9 +24,9 @@ async function parseError(res) {
   return new ApiError(res.status, e.code || `http_${res.status}`, e.message || res.statusText, e.details || null);
 }
 
-async function request(method, path, { body, signal, headers = {}, raw = false } = {}) {
+async function request(method, path, { body, signal, headers = {}, raw = false, keepalive = false } = {}) {
   let res;
-  const init = { method, signal, headers: { ...headers } };
+  const init = { method, signal, headers: { ...headers }, keepalive };
   if (body !== undefined) {
     if (body instanceof Blob || body instanceof ArrayBuffer) init.body = body;
     else { init.body = JSON.stringify(body); init.headers['content-type'] = 'application/json'; }
@@ -116,7 +116,8 @@ export const system = {
 // ------------------------------------------------------------------------------------------------ 5.2
 export const settings = {
   get: () => get('/api/settings'),
-  patch: (partial) => patch('/api/settings', partial),
+  /** keepalive: the request survives a reload/quit right after the change (small bodies only). */
+  patch: (partial, { keepalive = false } = {}) => patch('/api/settings', partial, { keepalive }),
   reset: () => post('/api/settings/reset'),
 };
 

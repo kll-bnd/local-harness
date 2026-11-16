@@ -92,7 +92,15 @@ export class OllamaProcess {
     }
     this.env = managedOllamaEnv(s, { baseUrl: provider.baseUrl, totalMem: this.totalMem });
     log.info(`Starting ${bin} serve`, this.env);
-    const child = spawn(bin, ['serve'], { env: { ...process.env, ...this.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+    let child;
+    try {
+      child = spawn(bin, ['serve'], { env: { ...process.env, ...this.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+    } catch (e) {
+      this.lastError = `Could not start ${bin}: ${e.message}`;
+      return { started: false, error: this.lastError, code: 'spawn_failed' };
+    }
+    // Attach the error listener before anything else: a spawn ENOENT/EACCES must never become an uncaught error.
+    child.on('error', (e) => { this.lastError = `Could not start ${bin}: ${e.code || e.message}`; if (this.child === child) this.child = null; });
     this.child = child;
     const onData = (d) => {
       for (const line of String(d).split('\n')) if (line.trim()) this.logTail.push(line.slice(0, 500));
@@ -100,13 +108,14 @@ export class OllamaProcess {
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
+    child.stdout.on('error', () => {});
+    child.stderr.on('error', () => {});
     child.on('exit', (code, signal) => {
       if (this.child === child) {
         this.child = null;
         this.bus?.publish('ollama.status', { managed: false, running: false, exitCode: code, signal });
       }
     });
-    child.on('error', (e) => { this.lastError = e.message; });
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await sleep(200);

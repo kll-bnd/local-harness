@@ -13,29 +13,32 @@ import { truncateEnd } from '../lib/util.mjs';
 
 const MAX_BYTES = 3 * 1024 * 1024;
 
-const blocked = new net.BlockList();
+// Two lists: Node's BlockList also matches IPv4 addresses against IPv4-mapped IPv6 rules, so mixing them in one
+// list would make "::ffff:0:0/96" block every IPv4 address.
+const blocked4 = new net.BlockList();
+const blocked6 = new net.BlockList();
 for (const [a, p] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
   ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.31.196.0', 24], ['192.52.193.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16],
   ['192.175.48.0', 24], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
-]) blocked.addSubnet(a, p, 'ipv4');
+]) blocked4.addSubnet(a, p, 'ipv4');
 for (const [a, p] of [
   ['::', 128], ['::1', 128], ['::', 96] /* IPv4-compatible */, ['::ffff:0:0', 96] /* IPv4-mapped */, ['::ffff:0:0:0', 96] /* SIIT */,
   ['64:ff9b::', 96], ['64:ff9b:1::', 48] /* NAT64 */, ['100::', 64] /* discard */, ['2001::', 23] /* IETF special incl. Teredo */,
   ['2001:db8::', 32], ['2002::', 16] /* 6to4 */, ['3fff::', 20], ['5f00::', 16], ['fc00::', 7] /* ULA */, ['fe80::', 10] /* link-local */,
   ['fec0::', 10] /* site-local */, ['ff00::', 8] /* multicast */,
-]) blocked.addSubnet(a, p, 'ipv6');
+]) blocked6.addSubnet(a, p, 'ipv6');
 
 /** True for any address that is not a normal public unicast address. Unparseable input counts as private. */
 export function isPrivateAddress(ip) {
   const s = String(ip || '').replace(/^\[|\]$/g, '').split('%')[0];
   const family = net.isIP(s);
-  if (family === 4) return blocked.check(s, 'ipv4');
+  if (family === 4) return blocked4.check(s, 'ipv4');
   if (family === 6) {
-    if (blocked.check(s, 'ipv6')) return true;
+    if (blocked6.check(s, 'ipv6')) return true;
     // Embedded IPv4 written in dotted form (::ffff:127.0.0.1 and friends) — check the IPv4 part as well.
     const m = s.match(/(\d+\.\d+\.\d+\.\d+)$/);
-    return m ? blocked.check(m[1], 'ipv4') : false;
+    return m ? blocked4.check(m[1], 'ipv4') : false;
   }
   return true;
 }

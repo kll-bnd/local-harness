@@ -81,24 +81,29 @@ export async function patchSettings(partial) {
   return settings;
 }
 
-/** settings.ui is free-form; merge a few keys without clobbering the rest. Debounced writes. */
+/** settings.ui is free-form; merge a few keys without clobbering the rest. Layout toggles are debounced;
+ *  appearance changes are sent at once. Requests use keepalive so a reload or quit doesn't drop them. */
 let pendingUi = {};
-const flushUi = debounce(() => {
+const IMMEDIATE_UI = new Set(['theme', 'textSize', 'proseFont', 'sendKey']);
+function sendUi() {
   const patch = pendingUi;
   pendingUi = {};
-  api.settings.patch({ ui: { ...(store.get('settings')?.ui || {}), ...patch } }).then(({ settings }) => {
+  if (!Object.keys(patch).length) return;
+  api.settings.patch({ ui: { ...(store.get('settings')?.ui || {}), ...patch } }, { keepalive: true }).then(({ settings }) => {
     // Keep any local changes made while the request was in flight.
     store.set('settings', { ...settings, ui: { ...settings.ui, ...pendingUi } });
   }).catch(() => {});
-}, 350);
+}
+const flushUi = debounce(sendUi, 350);
 export function setUiPref(key, value) {
   const s = store.get('settings');
   if (!s) return;
   pendingUi[key] = value;
   store.set('settings', { ...s, ui: { ...(s.ui || {}), [key]: value } });
   try { localStorage.setItem(`harness.ui.${key}`, JSON.stringify(value)); } catch { /* storage unavailable */ }
-  flushUi();
+  if (IMMEDIATE_UI.has(key)) { flushUi.cancel(); sendUi(); } else flushUi();
 }
+export function flushUiPrefs() { flushUi.cancel(); sendUi(); }
 
 export function localPref(key, fallback) {
   try { const v = localStorage.getItem(`harness.ui.${key}`); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }

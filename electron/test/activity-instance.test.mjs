@@ -72,10 +72,13 @@ test('findRunningHarness finds a server with the same data dir only', async () =
     assert.equal(found?.url, srv.url);
     assert.equal(found.pid, process.pid);
     assert.equal(await findRunningHarness({ dataDir: other, ports: [srv.port] }), null);
-    // A port with nothing listening is just skipped.
-    assert.equal(await findRunningHarness({ dataDir: dir, ports: [1] }), null);
+    // The data-dir lock names the running URL, so the instance is found even outside the probed ports
+    // (e.g. after the server fell back to a random port); a port with nothing listening is just skipped.
+    assert.equal((await findRunningHarness({ dataDir: dir, ports: [1] }))?.url, srv.url);
   } finally {
     await srv.close();
+    // Lock released on close: nothing is found any more.
+    assert.equal(await findRunningHarness({ dataDir: dir, ports: [1] }), null);
     await fs.rm(dir, { recursive: true, force: true });
     await fs.rm(other, { recursive: true, force: true });
   }

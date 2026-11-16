@@ -19,14 +19,21 @@ function stem(w) {
 
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
+const ASCII_ONLY = /^[\x00-\x7f]*$/;
+const ASCII_WORD = /[a-z0-9][a-z0-9_'-]*/g;
+const UNI_WORD = /[\p{L}\p{N}][\p{L}\p{N}_'-]*/gu;
+
 export function tokenize(text) {
   if (!text) return [];
-  const norm = text.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase();
+  const ascii = ASCII_ONLY.test(text);
+  const norm = ascii ? text.toLowerCase() : text.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase();
   const out = [];
-  for (const raw of norm.match(/[\p{L}\p{N}][\p{L}\p{N}_'-]*/gu) || []) {
-    if (CJK.test(raw)) { for (const ch of raw) if (CJK.test(ch)) out.push(ch); continue; }
-    const w = raw.replace(/['-]+$/g, '').replace(/'s$/, '');
-    if (w.length < 2 && !/\d/.test(w)) continue;
+  for (const raw of norm.match(ascii ? ASCII_WORD : UNI_WORD) || []) {
+    if (!ascii && CJK.test(raw)) { for (const ch of raw) if (CJK.test(ch)) out.push(ch); continue; }
+    let w = raw;
+    if (w.endsWith("'") || w.endsWith('-')) w = w.replace(/['-]+$/g, '');
+    if (w.endsWith("'s")) w = w.slice(0, -2);
+    if (w.length < 2 && !(w >= '0' && w <= '9')) continue;
     if (STOPWORDS.has(w)) continue;
     out.push(stem(w));
   }
@@ -37,86 +44,133 @@ export function tokenize(text) {
 export const MAX_QUERY_TERMS = 48;
 
 export class BM25Index {
+  // Inverted index with integer doc numbers and flat posting arrays [docNum, tf, docNum, tf, …]; removed
+  // documents are tombstoned and the postings compacted once they make up half of the index. Building and
+  // searching cost ∝ matching postings, never ∝ (all docs × query terms).
   constructor({ k1 = 1.2, b = 0.75 } = {}) {
     this.k1 = k1;
     this.b = b;
-    this.docs = new Map(); // id -> { tf: Map, len }
-    this.postings = new Map(); // term -> Map(id -> tf)   (inverted index)
+    this.ids = []; // docNum -> id | null (removed)
+    this.num = new Map(); // id -> docNum
+    this.lens = []; // docNum -> token count
+    this.terms = []; // docNum -> distinct terms (for df bookkeeping on removal)
+    this.postings = new Map(); // term -> [docNum, tf, ...]
+    this.dfs = new Map(); // term -> live document frequency
     this.totalLen = 0;
+    this.dead = 0;
   }
 
-  get size() { return this.docs.size; }
+  get size() { return this.num.size; }
 
-  /** Document frequency (kept for callers that used the old `df` map). */
-  get df() {
+  /** { has(id), get(id) → {len} } — compatibility view used by callers. */
+  get docs() {
     const self = this;
-    return { get: (t) => self.postings.get(t)?.size || 0, has: (t) => self.postings.has(t) };
+    return { has: (id) => self.num.has(id), get: (id) => (self.num.has(id) ? { len: self.lens[self.num.get(id)] } : undefined), get size() { return self.num.size; } };
   }
 
   add(id, text) {
-    if (this.docs.has(id)) this.remove(id);
+    if (this.num.has(id)) this.remove(id);
     const toks = tokenize(text);
     const tf = new Map();
     for (const t of toks) tf.set(t, (tf.get(t) || 0) + 1);
-    this.docs.set(id, { tf, len: toks.length });
+    const n = this.ids.length;
+    this.ids.push(id);
+    this.num.set(id, n);
+    this.lens.push(toks.length);
+    this.terms.push([...tf.keys()]);
     for (const [t, f] of tf) {
       let p = this.postings.get(t);
-      if (!p) { p = new Map(); this.postings.set(t, p); }
-      p.set(id, f);
+      if (!p) { p = []; this.postings.set(t, p); }
+      p.push(n, f);
+      this.dfs.set(t, (this.dfs.get(t) || 0) + 1);
     }
     this.totalLen += toks.length;
   }
 
   remove(id) {
-    const d = this.docs.get(id);
-    if (!d) return;
-    for (const t of d.tf.keys()) {
-      const p = this.postings.get(t);
-      if (!p) continue;
-      p.delete(id);
-      if (!p.size) this.postings.delete(t);
+    const n = this.num.get(id);
+    if (n === undefined) return;
+    for (const t of this.terms[n]) {
+      const d = (this.dfs.get(t) || 1) - 1;
+      if (d <= 0) this.dfs.delete(t); else this.dfs.set(t, d);
     }
-    this.totalLen -= d.len;
-    this.docs.delete(id);
+    this.totalLen -= this.lens[n];
+    this.ids[n] = null;
+    this.terms[n] = [];
+    this.num.delete(id);
+    if (++this.dead > 1000 && this.dead > this.num.size) this._compact();
+  }
+
+  _compact() {
+    const ids = [];
+    const lens = [];
+    const terms = [];
+    const remap = new Int32Array(this.ids.length).fill(-1);
+    this.ids.forEach((id, n) => { if (id !== null) { remap[n] = ids.length; ids.push(id); lens.push(this.lens[n]); terms.push(this.terms[n]); } });
+    for (const [t, p] of this.postings) {
+      const q = [];
+      for (let i = 0; i < p.length; i += 2) { const m = remap[p[i]]; if (m >= 0) q.push(m, p[i + 1]); }
+      if (q.length) this.postings.set(t, q); else this.postings.delete(t);
+    }
+    this.ids = ids;
+    this.lens = lens;
+    this.terms = terms;
+    this.num = new Map(ids.map((id, i) => [id, i]));
+    this.dead = 0;
   }
 
   idf(t) {
-    const N = this.docs.size;
-    const n = this.postings.get(t)?.size || 0;
+    const N = this.num.size;
+    const n = this.dfs.get(t) || 0;
     return Math.log(1 + (N - n + 0.5) / (n + 0.5));
   }
 
   /** The distinct query terms actually used (present in the index, rarest first, capped). */
   queryTerms(query) {
-    const qt = [...new Set(tokenize(query))].filter((t) => this.postings.has(t));
+    const qt = [...new Set(tokenize(query))].filter((t) => this.dfs.has(t));
     if (qt.length <= MAX_QUERY_TERMS) return qt;
-    return qt.sort((a, b) => this.postings.get(a).size - this.postings.get(b).size).slice(0, MAX_QUERY_TERMS);
+    return qt.sort((a, b) => this.dfs.get(a) - this.dfs.get(b)).slice(0, MAX_QUERY_TERMS);
   }
 
-  /** @returns {Array<{id, score}>} sorted desc; `filter(id)` restricts candidates. Cost ∝ matching postings. */
-  search(query, { k = 10, filter } = {}) {
-    if (!this.docs.size) return [];
-    const qt = this.queryTerms(query);
-    if (!qt.length) return [];
-    const avg = this.totalLen / this.docs.size || 1;
+  /**
+   * Score matching documents. Returns { hits: [{id, score}] (top k), matched: Map(id → Σ idf of matched terms) }.
+   */
+  searchDetailed(query, { k = 10, filter, terms } = {}) {
+    const matched = new Map();
+    if (!this.num.size) return { hits: [], matched };
+    const qt = terms || this.queryTerms(query);
+    if (!qt.length) return { hits: [], matched };
+    const avg = this.totalLen / this.num.size || 1;
     const scores = new Map();
     for (const t of qt) {
+      const p = this.postings.get(t);
+      if (!p) continue;
       const idf = this.idf(t);
-      for (const [id, f] of this.postings.get(t)) {
+      for (let i = 0; i < p.length; i += 2) {
+        const id = this.ids[p[i]];
+        if (id === null) continue;
         if (filter && !filter(id)) continue;
-        const d = this.docs.get(id);
-        const sc = idf * ((f * (this.k1 + 1)) / (f + this.k1 * (1 - this.b + (this.b * d.len) / avg)));
+        const f = p[i + 1];
+        const sc = idf * ((f * (this.k1 + 1)) / (f + this.k1 * (1 - this.b + (this.b * this.lens[p[i]]) / avg)));
         scores.set(id, (scores.get(id) || 0) + sc);
+        matched.set(id, (matched.get(id) || 0) + idf);
       }
     }
-    return [...scores.entries()].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score).slice(0, k);
+    const hits = [...scores.entries()].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score).slice(0, k);
+    return { hits, matched };
   }
 
-  /** Fraction of distinct query terms present in a doc (0..1) — a corpus-independent relevance signal. */
+  /** @returns {Array<{id, score}>} sorted desc; `filter(id)` restricts candidates. */
+  search(query, { k = 10, filter } = {}) {
+    return this.searchDetailed(query, { k, filter }).hits;
+  }
+
+  /** Fraction of distinct query terms present in a doc (0..1). */
   coverage(query, id) {
     const qt = [...new Set(tokenize(query))];
-    const d = this.docs.get(id);
-    if (!qt.length || !d) return 0;
-    return qt.filter((t) => d.tf.has(t)).length / qt.length;
+    const n = this.num.get(id);
+    if (!qt.length || n === undefined) return 0;
+    const set = new Set(this.terms[n]);
+    return qt.filter((t) => set.has(t)).length / qt.length;
   }
 }

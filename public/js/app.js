@@ -4,7 +4,7 @@ import { h, isTypingTarget, pickFiles, download, mount, add } from './lib/dom.js
 import { icon } from './lib/icons.js';
 import { truncate } from './lib/format.js';
 import * as api from './api.js';
-import { store, bus, loadSettings, loadPresets, loadSystem, loadModels, loadChats, loadArchived, refreshSystemSoon, refreshModelsSoon, refreshChatsSoon, setUiPref, uiPrefs, chatModels, dropModelInfo } from './state.js';
+import { store, bus, loadSettings, loadPresets, loadSystem, loadModels, loadChats, loadArchived, refreshSystemSoon, refreshModelsSoon, refreshChatsSoon, setUiPref, uiPrefs, chatModels, dropModelInfo, flushUiPrefs } from './state.js';
 import { defineAction, runAction, runActionFrom, chordOf, actionForChord, allActions } from './actions.js';
 import { Shell } from './shell.js';
 import { startRouter, navigate } from './router.js';
@@ -156,7 +156,7 @@ bus.on('activity', (info) => {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && unread) { unread = 0; try { desktop?.setBadge?.(''); } catch { /* ignore */ } }
 });
-window.addEventListener('pagehide', () => shell.flushPendingDeletes());
+window.addEventListener('pagehide', () => { shell.flushPendingDeletes(); flushUiPrefs(); });
 
 // ------------------------------------------------------------------------------------------------ event bus
 let es = null;

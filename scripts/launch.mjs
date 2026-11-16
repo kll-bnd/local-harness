@@ -42,6 +42,12 @@ let srv;
 try {
   srv = await startServer({ port, dataDir, openBrowser: false });
 } catch (e) {
+  if (e?.code === 'HARNESS_ALREADY_RUNNING') {
+    // Another process holds this data folder's lock (it started between our check and now): use it.
+    console.log(e.url ? `Harness is already running at ${e.url} — opening it.` : 'Harness is already starting for this data folder.');
+    if (e.url) openBrowser(e.url);
+    process.exit(0);
+  }
   console.error(`\nHarness could not start: ${e.message}\nData folder: ${dataDir}\nRun "npm run doctor" for a full check.`);
   process.exit(1);
 }

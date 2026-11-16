@@ -125,11 +125,16 @@ export class ImagesView {
 
     const num = (name, label, val, placeholder, attrs = {}) => {
       const input = h('input.input.input-small.num', { name, type: 'number', value: val ?? '', placeholder: placeholder ?? '', ...attrs, attrs: { 'aria-label': label } });
-      input.addEventListener('change', () => { f[name] = input.value === '' ? null : Number(input.value); if (name === 'width' || name === 'height') this.renderWarnings(); });
+      // Commit on every keystroke: the form may re-render when defaults arrive, and typed values must survive.
+      const commit = () => { f[name] = input.value === '' ? null : Number(input.value); };
+      input.addEventListener('input', commit);
+      input.addEventListener('change', () => { commit(); if (name === 'width' || name === 'height') this.renderWarnings(); if (name === 'count') this.renderForm(); });
       return h('label.studio-num', h('span.small.muted', label), input);
     };
     const seedInput = h('input.input.input-small.num', { name: 'seed', type: 'number', value: f.seed ?? '', placeholder: 'auto', attrs: { 'aria-label': 'Seed (empty = random)' } });
-    seedInput.addEventListener('change', () => { f.seed = seedInput.value === '' ? null : Number(seedInput.value); });
+    const commitSeed = () => { f.seed = seedInput.value === '' ? null : Number(seedInput.value); };
+    seedInput.addEventListener('input', commitSeed);
+    seedInput.addEventListener('change', commitSeed);
 
     const caps = p?.capabilities || {};
     const init = f.initImage;

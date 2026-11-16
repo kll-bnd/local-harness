@@ -1712,4 +1712,797 @@ async function ollamaGroup(run, B) {
   }, { timeoutMs: 700000 });
 }
 
+// =============================================================================================== OpenAI-compatible
+function parseOaiStream(r) {
+  const out = { events: 0, chunks: [], bad: [], done: false, afterDone: 0, content: '', reasoning: '', reasoningKeys: new Set(), otherReasoningKeys: new Set(), deltaKeys: new Set(), finish: null, usage: null, timings: null, toolDeltas: [], errorObj: null, errorText: null };
+  const evs = sseEvents(r.lines || []);
+  out.events = evs.length;
+  for (const e of evs) {
+    if (out.done) { out.afterDone++; continue; }
+    if (e.data === '[DONE]') { out.done = true; continue; }
+    let j;
+    try { j = JSON.parse(e.data); } catch { out.bad.push(e.data); continue; }
+    out.chunks.push(j);
+    if (j.error) out.errorObj = j.error;
+    if (j.usage) out.usage = j.usage;
+    if (j.timings) out.timings = j.timings;
+    const ch = j.choices?.[0];
+    if (!ch) continue;
+    const d = ch.delta || ch.message || {};
+    for (const k of Object.keys(d)) out.deltaKeys.add(k);
+    if (typeof d.content === 'string') out.content += d.content;
+    for (const k of ['reasoning_content', 'reasoning']) if (typeof d[k] === 'string' && d[k]) { out.reasoning += d[k]; out.reasoningKeys.add(k); }
+    for (const k of Object.keys(d)) if (/reason|think/i.test(k) && !['reasoning_content', 'reasoning'].includes(k) && d[k]) out.otherReasoningKeys.add(k);
+    for (const tc of d.tool_calls || []) out.toolDeltas.push(tc);
+    if (ch.finish_reason) out.finish = ch.finish_reason;
+  }
+  if (!r.ok) {
+    const j = r.json;
+    const m = j?.error?.message || j?.error || j?.message || r.bodyText || r.error || `HTTP ${r.status}`;
+    out.errorText = typeof m === 'string' ? m : JSON.stringify(m);
+  }
+  return out;
+}
+/** Assemble tool-call deltas exactly like OpenAICompatProvider.chat. */
+function assembleToolCalls(deltas) {
+  const calls = new Map();
+  for (const tc of deltas) {
+    const idx = tc.index ?? calls.size;
+    const cur = calls.get(idx) || { id: null, name: '', args: '' };
+    if (tc.id) cur.id = tc.id;
+    if (tc.function?.name) cur.name += tc.function.name;
+    if (tc.function?.arguments) cur.args += typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments);
+    calls.set(idx, cur);
+  }
+  return [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, c]) => {
+    let args = {};
+    let parsed = true;
+    if (c.args.trim()) { try { args = JSON.parse(c.args); } catch { args = { _raw: c.args }; parsed = false; } }
+    return { ...c, arguments: args, parsed };
+  });
+}
+function oaiSample(body, r, s) {
+  const chunks = s.chunks.length > 8 ? [...s.chunks.slice(0, 4), `…(${s.chunks.length - 6} more chunks)…`, ...s.chunks.slice(-2)] : s.chunks;
+  return { request: body, status: r.status, contentType: r.contentType, ...(r.ok ? { chunks, done: s.done } : { body: r.json ?? r.bodyText }), error: r.error || undefined };
+}
+
+function pickOaiModel(run, S, models, lm) {
+  const ids = models.map((m) => m.id).filter((x) => typeof x === 'string');
+  const chatIds = ids.filter((x) => !H.EMBEDDING_NAME_RE.test(x));
+  if (run.opts.openaiModel) return { model: run.opts.openaiModel, why: `--openai-model${ids.includes(run.opts.openaiModel) ? '' : ' (not listed by /v1/models!)'}` };
+  if (S.flavor === 'lmstudio') {
+    const loaded = (lm?.data || []).filter((m) => ['llm', 'vlm'].includes(m.type) && m.state === 'loaded');
+    if (loaded[0]) return { model: loaded[0].id, why: 'the LLM currently loaded in LM Studio' };
+    return { model: null, why: 'no LLM is loaded in LM Studio (asking for one would JIT-load it: pass --openai-model to allow that)' };
+  }
+  if (S.flavor === 'llamacpp' && chatIds[0]) return { model: chatIds[0], why: 'the model llama-server serves' };
+  if (chatIds.length === 1) return { model: chatIds[0], why: 'the only model listed' };
+  return { model: null, why: `${chatIds.length} models listed and the server may load on demand — pass --openai-model` };
+}
+
+async function openaiGroup(run, S) {
+  const T = (ms) => run.T(ms);
+  const key = run.opts.apiKey;
+  const id = (s) => `openai.${S.sid}.${s}`;
+  run.section('raw', `OpenAI-compatible "${S.sid}" (${S.flavor}) ${S.url}`);
+  const oaiChat = async (body, { timeoutMs = 300000 } = {}) => {
+    const r = await streamLines(`${S.url}/v1/chat/completions`, { body, timeoutMs: T(timeoutMs), apiKey: key });
+    return { r, s: parseOaiStream(r), body };
+  };
+  let models = [];
+  await run.check(id('models'), async ({ sample }) => {
+    const r = await http(S.url, '/v1/models', { timeoutMs: T(10000), apiKey: key });
+    sample(`${S.sid} GET /v1/models`, { status: r.status, body: r.json ?? r.text ?? r.error });
+    if (!r.ok || !Array.isArray(r.json?.data)) return FAIL(`/v1/models: ${httpSummary(r)}`, { expected: '{"data":[{"id":…}]}', fix: 'OpenAICompatProvider.status() treats this server as down.' });
+    models = r.json.data;
+    if (models.some((m) => typeof m.id !== 'string')) return FAIL('entries without a string id', { actual: excerpt(models, 300) });
+    const info = models.slice(0, 6).map((m) => `${m.id}${m.meta ? ` meta ${excerpt(m.meta, 160)}` : ''}`);
+    if (r.ms > 1500) return WARN(`answered after ${fmtMs(r.ms)}; status() gives up after 1.5 s`, { info });
+    return PASS(`${models.length} model(s)`, { info });
+  });
+  const lmr = S.flavor === 'lmstudio' ? await http(S.url, '/api/v0/models', { timeoutMs: T(5000), apiKey: key }) : null;
+  const pick = pickOaiModel(run, S, models, lmr?.json);
+  (run.picks.openai ||= {})[S.sid] = pick;
+  run.print(`    picked: ${pick.model || '—'} (${pick.why})`);
+  const M = pick.model;
+
+  await run.check(id('context_source'), async ({ sample }) => {
+    need(models.length, 'no models listed', `${id('models')} to pass`);
+    const props = await http(S.url, '/props', { timeoutMs: T(5000), apiKey: key });
+    sample(`${S.sid} GET /props`, { status: props.status, body: props.json ? shrink({ ...props.json, chat_template: props.json.chat_template ? `${String(props.json.chat_template).slice(0, 200)}…` : undefined }) : props.text ?? props.error });
+    if (lmr) sample(`${S.sid} GET /api/v0/models`, { status: lmr.status, body: lmr.json ?? lmr.text });
+    const prov = new H.OpenAICompatProvider({ id: S.sid, name: S.sid, baseUrl: S.url, apiKey: key, flavor: S.flavor });
+    await prov.status().catch(() => null);
+    const si = await prov.serverInfo({ refresh: true }).catch((e) => ({ error: e.message, models: {} }));
+    const list = await prov.listModels().catch(() => []);
+    const entry = list.find((m) => m.model === M) || list[0] || { model: M };
+    const info = H.normalizeOpenAIModel(prov, entry, si);
+    const plan = H.computeContextPlan({ providerKind: 'openai', serverCtx: info.serverContext, modelMax: info.contextLength, modelMaxSource: info.contextLengthSource, advertisedMax: info.advertisedContextLength, modelBytes: info.sizeBytes || 0, system: { totalMem: os.totalmem(), platform: process.platform, arch: process.arch } });
+    const lines = [`flavor after status(): ${prov.flavor}; /props → HTTP ${props.status}${props.json?.default_generation_settings?.n_ctx ? ` n_ctx ${props.json.default_generation_settings.n_ctx}` : ''}${props.json?.n_ctx ? ` top-level n_ctx ${props.json.n_ctx}` : ''}`,
+      `Harness: serverContext ${info.serverContext ?? 'unknown'}, model max ${info.contextLength ?? 'unknown'} (${info.contextLengthSource}), plan num_ctx ${plan.numCtx} — "${plan.explanation}"`];
+    if (lmr) lines.push(`LM Studio /api/v0/models → HTTP ${lmr.status}${lmr.json?.data ? `: ${lmr.json.data.slice(0, 4).map((m) => `${m.id} ${m.type} ${m.state} max ${m.max_context_length} loaded ${m.loaded_context_length ?? 'absent'}`).join(' | ')}` : ''}`);
+    if (info.serverContext) return PASS(`server context ${info.serverContext} tokens`, { info: lines });
+    if (info.contextLength) return WARN(`no loaded-context figure; Harness plans with the trained maximum ${info.contextLength} (requests beyond the real -c / load setting fail with a context error)`, { info: lines, fix: S.flavor === 'lmstudio' ? 'LM Studio did not report loaded_context_length for the model; read it from another field.' : 'Read the server context from /props (llama.cpp) or ask the user.' });
+    return FAIL('neither the server context nor the model maximum is exposed — Harness assumes 8K', { info: lines, fix: 'Add a source for the context size of this server.' });
+  });
+
+  const chatBody = (extra = {}) => ({ model: M, messages: [{ role: 'user', content: 'In one short sentence: what colour is the sky on a clear day?' }], stream: true, stream_options: { include_usage: true }, max_tokens: 48, temperature: 0, ...extra });
+  let base = null;
+  await run.check(id('chat.stream'), async ({ sample }) => {
+    need(M, 'no model to chat with', pick.why);
+    base = await oaiChat(chatBody());
+    const { r, s } = base;
+    sample(`${S.sid} POST /v1/chat/completions stream`, oaiSample(base.body, r, s));
+    if (!r.ok) return FAIL(`HTTP ${r.status}: ${excerpt(s.errorText, 300)}`, { fix: 'Every chat turn through this provider would fail.' });
+    const problems = [];
+    if (r.error) problems.push(`stream broke: ${r.error}`);
+    if (s.bad.length) problems.push(`${s.bad.length} data line(s) are not JSON`);
+    if (s.errorObj) problems.push(`error chunk: ${excerpt(s.errorObj, 200)}`);
+    if (!s.content && !s.reasoning) problems.push('no delta.content');
+    const info = [`${s.chunks.length} chunks, delta keys {${[...s.deltaKeys].join(', ')}}, finish_reason ${s.finish}, [DONE] ${s.done ? 'yes' : 'NO'}, content-type ${r.contentType}`, `reply: ${excerpt(s.content, 160)}`];
+    if (problems.length) return FAIL(problems[0], { info, actual: problems.join('; ') });
+    if (!s.done) return WARN('no "data: [DONE]" terminator (Harness also stops at end of stream, so this is harmless)', { info });
+    if (!s.finish) return WARN('no finish_reason in any chunk (truncation would be reported as "stop")', { info });
+    return PASS(info[0], { info: info.slice(1) });
+  }, { timeoutMs: 360000 });
+
+  await run.check(id('chat.usage'), async () => {
+    need(base?.r.ok, 'no successful stream', `${id('chat.stream')} to pass`);
+    const { usage, timings } = base.s;
+    const info = [`usage ${usage ? excerpt(usage, 200) : 'absent'}; timings ${timings ? excerpt(timings, 200) : 'absent'}`];
+    if (isInt(usage?.prompt_tokens) && usage.prompt_tokens > 0) return PASS(`usage.prompt_tokens ${usage.prompt_tokens}, completion_tokens ${usage.completion_tokens}`, { info });
+    if (isInt(timings?.prompt_n) && timings.prompt_n > 0) return PASS(`no usage, but llama.cpp timings.prompt_n ${timings.prompt_n} (Harness falls back to it)`, { info });
+    return FAIL('no prompt token count in the stream (neither usage nor timings)', { info, expected: 'stream_options.include_usage → a chunk with usage{prompt_tokens}', fix: 'Calibration and the context meter never get real numbers for this provider.' });
+  });
+
+  await run.check(id('chat.finish_length'), async ({ sample }) => {
+    need(M, 'no model to chat with', pick.why);
+    const q = await oaiChat(chatBody({ messages: [{ role: 'user', content: 'Write a long story about a dragon who bakes bread.' }], max_tokens: 3 }));
+    sample(`${S.sid} chat max_tokens 3 (last chunks)`, { status: q.r.status, chunks: q.s.chunks.slice(-2), body: q.r.ok ? undefined : q.r.json ?? q.r.bodyText });
+    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.s.errorText}`);
+    if (q.s.finish === 'length') return PASS('finish_reason "length"');
+    return FAIL(`finish_reason "${q.s.finish}"`, { expected: '"length"', fix: 'Truncated answers would not be marked (finishReason "length").' });
+  }, { timeoutMs: 300000 });
+
+  await run.check(id('chat.reasoning'), async ({ sample }) => {
+    const R = run.opts.openaiThinkModel || M;
+    need(R, 'no model to chat with', pick.why);
+    let s = base?.s;
+    let q = null;
+    if (R !== M || !s || (!s.reasoning && !/<think>/i.test(s.content))) {
+      q = await oaiChat(chatBody({ model: R, messages: [{ role: 'user', content: 'What is 12 + 30? Think step by step, then answer.' }], max_tokens: 400 }));
+      s = q.s;
+      sample(`${S.sid} chat reasoning (${R})`, oaiSample(q.body, q.r, s));
+      if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${s.errorText}`);
+    }
+    const info = [`delta keys {${[...s.deltaKeys].join(', ')}}`];
+    if (s.otherReasoningKeys.size) return FAIL(`reasoning arrives in delta.${[...s.otherReasoningKeys].join('/')}, which Harness ignores`, { info, expected: 'reasoning_content or reasoning', fix: 'Read this field in OpenAICompatProvider.chat.' });
+    if (s.reasoning) return PASS(`reasoning in delta.${[...s.reasoningKeys].join('/')} (${s.reasoning.length} chars)`, { info });
+    if (/<think>/i.test(s.content)) return PASS('reasoning arrives inline as <think>…</think> in content (ThinkTagParser handles it)', { info });
+    return SKIP(`${R} produced no reasoning`, 'a reasoning model via --openai-think-model', { info });
+  }, { timeoutMs: 360000 });
+
+  await run.check(id('chat.think_off'), async ({ sample }) => {
+    need(S.flavor === 'llamacpp', `only sent to llama.cpp (flavor here: ${S.flavor})`, 'a llama.cpp server');
+    need(M, 'no model to chat with', pick.why);
+    const q = await oaiChat(chatBody({ chat_template_kwargs: { enable_thinking: false }, max_tokens: 16 }));
+    sample(`${S.sid} chat chat_template_kwargs enable_thinking:false`, oaiSample(q.body, q.r, q.s));
+    if (!q.r.ok) return FAIL(`rejected: HTTP ${q.r.status} ${excerpt(q.s.errorText, 200)}`, { fix: 'Every turn with reasoning "off" would fail on llama.cpp; drop chat_template_kwargs.' });
+    return PASS(`accepted${q.s.reasoning ? ` (but ${q.s.reasoning.length} chars of reasoning still came)` : ''}`);
+  }, { timeoutMs: 300000 });
+
+  let oaiCall = null;
+  let toolsRejected = null;
+  const toolMsgs = [{ role: 'system', content: 'You are a helpful assistant. Use the provided tools when they help.' }, { role: 'user', content: 'Use a tool to calculate 17*23' }];
+  await run.check(id('tools.deltas'), async ({ sample }) => {
+    need(M, 'no model to chat with', pick.why);
+    const q = await oaiChat(chatBody({ messages: toolMsgs, tools: toolsSchema(), tool_choice: 'auto', max_tokens: 300 }));
+    sample(`${S.sid} chat with tools`, oaiSample(q.body, q.r, q.s));
+    if (!q.r.ok) {
+      toolsRejected = { status: q.r.status, text: q.s.errorText };
+      return SKIP(`the server rejected tools: HTTP ${q.r.status} "${excerpt(q.s.errorText, 160)}" (classification in ${id('tools.unsupported_error')})`, 'a server started with tool support (llama.cpp: --jinja)');
+    }
+    const calls = assembleToolCalls(q.s.toolDeltas);
+    const info = [`${q.s.toolDeltas.length} tool_call delta(s); finish_reason ${q.s.finish}; first delta ${excerpt(q.s.toolDeltas[0], 200)}`];
+    if (!calls.length) {
+      if (/"name"\s*:\s*"calculate"|<tool_call>/i.test(q.s.content)) return FAIL('the tool call came back as TEXT in content, not as delta.tool_calls', { actual: q.s.content, fix: 'The server does not parse tool calls for this model (llama.cpp: --jinja / a tool-capable chat template).' });
+      return WARN('the model answered without calling the tool (model behaviour)', { info: [...info, `content: ${excerpt(q.s.content, 160)}`] });
+    }
+    const c = calls[0];
+    oaiCall = c;
+    info.push(`assembled: ${c.name}(${c.parsed ? JSON.stringify(c.arguments) : c.args}) id ${c.id ?? 'absent'}`);
+    if (q.s.toolDeltas.some((d) => d.index === undefined)) info.push('some deltas lack "index" (Harness then uses arrival order)');
+    if (!c.parsed) return FAIL('concatenated arguments are not valid JSON', { info, actual: c.args, fix: 'Harness passes {_raw} to the tool.' });
+    if (c.name !== 'calculate') return WARN(`called "${c.name}"`, { info });
+    if (q.s.finish !== 'tool_calls') return WARN(`finish_reason "${q.s.finish}" instead of "tool_calls" (Harness does not depend on it)`, { info });
+    return PASS(`calculate(${JSON.stringify(c.arguments)})`, { info });
+  }, { timeoutMs: 360000 });
+
+  await run.check(id('tools.result_roundtrip'), async ({ sample }) => {
+    need(oaiCall, 'no tool call to answer', `${id('tools.deltas')} to produce a call`);
+    const msgs = [...toolMsgs, H.toOpenAIMessage({ role: 'assistant', content: '', toolCalls: [{ id: oaiCall.id || 'call_0', name: oaiCall.name, arguments: oaiCall.arguments }] }), H.toOpenAIMessage({ role: 'tool', toolCallId: oaiCall.id || 'call_0', content: '17*23 = 391' })];
+    const q = await oaiChat(chatBody({ messages: msgs, tools: toolsSchema(), tool_choice: 'auto', max_tokens: 160 }));
+    sample(`${S.sid} chat tool result round trip`, oaiSample(q.body, q.r, q.s));
+    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${excerpt(q.s.errorText, 200)}`, { fix: 'toOpenAIMessage() output is rejected (content null with tool_calls? tool_call_id?).' });
+    if (!q.s.content) return WARN(`no text answer (finish ${q.s.finish}, ${q.s.toolDeltas.length} new tool deltas)`);
+    return q.s.content.includes('391') ? PASS(`"${excerpt(q.s.content, 100)}"`) : WARN(`answer ignores the result: "${excerpt(q.s.content, 140)}"`);
+  }, { timeoutMs: 300000 });
+
+  await run.check(id('tools.unsupported_error'), async ({ sample }) => {
+    let rej = toolsRejected;
+    if (run.opts.openaiNoToolsModel) {
+      const q = await oaiChat(chatBody({ model: run.opts.openaiNoToolsModel, messages: [{ role: 'user', content: 'hi' }], tools: toolsSchema(), max_tokens: 1 }));
+      sample(`${S.sid} tools on ${run.opts.openaiNoToolsModel}`, { status: q.r.status, body: q.r.ok ? q.s.chunks.slice(-1) : q.r.json ?? q.r.bodyText });
+      if (q.r.ok) return WARN(`${run.opts.openaiNoToolsModel} accepted tools silently — Harness cannot detect missing tool support here`, { fix: 'Tool calls may come back as plain text; nothing retries.' });
+      rej = { status: q.r.status, text: q.s.errorText };
+    }
+    need(rej, 'tools were accepted', '--openai-notools-model NAME (a model/server that rejects tools)');
+    const code = H.classifyOpenAIError(rej.status, rej.text).code;
+    if (code === 'tools_unsupported') return PASS(`HTTP ${rej.status} "${excerpt(rej.text, 160)}" → tools_unsupported`);
+    return FAIL(`HTTP ${rej.status} "${excerpt(rej.text, 160)}" → ${code}`, { expected: 'tools_unsupported (retry without tools)', fix: 'Extend the pattern in classifyOpenAIError to this text.' });
+  }, { timeoutMs: 120000 });
+
+  await run.check(id('embeddings'), async ({ sample }) => {
+    need(M || models.length, 'no model', pick.why);
+    const em = models.map((m) => m.id).find((x) => H.EMBEDDING_NAME_RE.test(x)) || M;
+    const r = await http(S.url, '/v1/embeddings', { method: 'POST', body: { model: em, input: ['The cat sat on the mat.', 'A dog runs in the park.'] }, timeoutMs: T(120000), apiKey: key });
+    sample(`${S.sid} POST /v1/embeddings (${em})`, { status: r.status, body: r.json ?? r.text ?? r.error });
+    if (!r.ok) return WARN(`not available for ${em}: HTTP ${r.status} "${excerpt(errorOf(r), 160)}"`, { info: ['Harness uses this provider for embeddings only when configured (settings.embeddings.model)'], fix: S.flavor === 'llamacpp' ? 'llama-server needs --embeddings (and an embedding model) for this.' : undefined });
+    const data = r.json?.data;
+    if (!Array.isArray(data) || data.length !== 2 || !data.every((d) => Array.isArray(d.embedding))) return FAIL('unexpected shape', { actual: excerpt(r.json, 300), expected: 'data:[{index, embedding:[…]}×2]' });
+    return PASS(`2 × ${data[0].embedding.length} dims (model ${em})${data.some((d) => d.index === undefined) ? '; no index fields (order assumed)' : ''}`);
+  }, { timeoutMs: 180000 });
+
+  await run.check(id('errors.unknown_model'), async ({ sample }) => {
+    need(S.flavor !== 'generic', 'skipped for generic servers (MLX/vLLM may try to download an unknown model)', 'a llama.cpp or LM Studio server');
+    const q = await oaiChat(chatBody({ model: 'livecheck-no-such-model', max_tokens: 1 }), { timeoutMs: 120000 });
+    sample(`${S.sid} chat unknown model`, { status: q.r.status, body: q.r.ok ? q.s.chunks.slice(-1) : q.r.json ?? q.r.bodyText });
+    if (q.r.ok) return PASS('the server ignores the model name and serves its loaded model');
+    const code = H.classifyOpenAIError(q.r.status, q.s.errorText).code;
+    if (code === 'model_not_found') return PASS(`HTTP ${q.r.status} "${excerpt(q.s.errorText, 120)}" → model_not_found`);
+    return WARN(`HTTP ${q.r.status} "${excerpt(q.s.errorText, 160)}" → ${code}`, { fix: 'The UI would show a generic provider error instead of "model not found".' });
+  }, { timeoutMs: 150000 });
+}
+
+// =============================================================================================== recording proxy
+/** Local pass-through proxy that records every exchange, so the real provider code can be exercised and the raw answers captured. */
+async function startRecordingProxy(target) {
+  const httpMod = await import('node:http');
+  const log = [];
+  const server = httpMod.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const reqBuf = Buffer.concat(chunks);
+    const entry = { method: req.method, path: req.url, at: Date.now() };
+    try { entry.reqBody = reqBuf.length ? JSON.parse(reqBuf.toString('utf8')) : null; } catch { entry.reqBody = `(${reqBuf.length} bytes)`; }
+    log.push(entry);
+    try {
+      const headers = {};
+      for (const [k, v] of Object.entries(req.headers)) if (!['host', 'content-length', 'connection'].includes(k)) headers[k] = v;
+      const r = await fetch(target + req.url, { method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : reqBuf });
+      const buf = Buffer.from(await r.arrayBuffer());
+      entry.status = r.status;
+      entry.ms = Date.now() - entry.at;
+      entry.resBuf = buf;
+      res.writeHead(r.status, { 'content-type': r.headers.get('content-type') || 'application/octet-stream', 'content-length': buf.length });
+      res.end(buf);
+    } catch (e) {
+      entry.error = errText(e);
+      if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: entry.error }));
+    }
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  return { url, log, json: (e) => { try { return JSON.parse(e.resBuf.toString('utf8')); } catch { return null; } }, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }) };
+}
+function decodeImage(b64OrBuf) {
+  const buf = Buffer.isBuffer(b64OrBuf) ? b64OrBuf : base64Image(b64OrBuf);
+  const mime = H.sniffImageMime(buf);
+  const real = buf[0] === 0x89 && buf[1] === 0x50 ? 'png' : buf[0] === 0xff && buf[1] === 0xd8 ? 'jpeg' : buf.subarray(0, 4).toString('latin1') === 'RIFF' ? 'webp' : null;
+  const dims = H.imageSize(buf, mime);
+  return { buf, mime, recognized: !!real, width: dims.width, height: dims.height, bytes: buf.length };
+}
+
+// =============================================================================================== A1111 / Draw Things
+async function a1111Group(run, B) {
+  const url = B.a1111.url;
+  const T = (ms) => run.T(ms);
+  const A = run.a1111 = { url, minSize: null };
+  run.section('raw', `A1111-compatible image API ${url} (detected via ${B.a1111.via})`);
+  let current = null;
+  await run.check('a1111.options', async ({ sample }) => {
+    const r = await http(url, '/sdapi/v1/options', { timeoutMs: T(10000) });
+    sample('a1111 GET /sdapi/v1/options (selected keys)', { status: r.status, keys: isObj(r.json) ? Object.keys(r.json).length : null, sd_model_checkpoint: r.json?.sd_model_checkpoint, model: r.json?.model, samples_format: r.json?.samples_format, body: isObj(r.json) ? undefined : r.text ?? r.error });
+    if (r.status === 200 && isObj(r.json)) {
+      current = r.json.sd_model_checkpoint || r.json.model || null;
+      if (current) return PASS(`current checkpoint "${current}" (from ${r.json.sd_model_checkpoint ? 'sd_model_checkpoint' : 'model'})`);
+      return WARN('options has neither sd_model_checkpoint nor model', { info: [`keys: ${Object.keys(r.json).slice(0, 20).join(', ')}`], fix: 'currentModel stays null → image family "unknown" defaults (20 steps, cfg 6, 768 px base) unless settings.image.model is set.' });
+    }
+    if (r.status === 404) return WARN('GET /sdapi/v1/options → 404: Harness cannot learn the current checkpoint', { expected: 'HTTP 200 JSON object', actual: r.text, fix: 'status() falls back to other probes (see a1111.detect_fallbacks); without a current model the family defaults are "unknown" (20 steps, cfg 6, 768 px) — set settings.image.model, or read the model from Draw Things\' GET / config.' });
+    return WARN(`GET /sdapi/v1/options → ${httpSummary(r)}`, { fix: 'status() then relies on the fallback probes.' });
+  });
+
+  await run.check('a1111.detect_fallbacks', async ({ sample }) => {
+    const res = {};
+    for (const p of ['/sdapi/v1/sd-models', '/sdapi/v1/samplers', '/sdapi/v1/txt2img', '/']) {
+      const r = await http(url, p, { timeoutMs: T(5000) });
+      res[p] = { status: r.status, json: r.json === undefined ? 'not JSON' : Array.isArray(r.json) ? `array(${r.json.length})` : isObj(r.json) ? `object{${Object.keys(r.json).slice(0, 8).join(',')}}` : typeof r.json };
+    }
+    sample('a1111 detection probes', res);
+    const info = Object.entries(res).map(([p, v]) => `GET ${p} → ${v.status} ${v.json}`);
+    const via = [];
+    if (res['/sdapi/v1/sd-models'].status === 200 && res['/sdapi/v1/sd-models'].json.startsWith('array')) via.push('sd-models');
+    if (res['/sdapi/v1/samplers'].status === 200 && res['/sdapi/v1/samplers'].json.startsWith('array')) via.push('samplers');
+    if ([405, 422].includes(res['/sdapi/v1/txt2img'].status) && res['/sdapi/v1/txt2img'].json.startsWith('object')) via.push('txt2img GET');
+    if (res['/'].status === 200 && res['/'].json.startsWith('object')) via.push('GET / (only counts if it has "steps")');
+    return PASS(`detected via ${B.a1111.via}; other probes that would also work: ${via.join(', ') || 'none'}`, { info });
+  });
+
+  await run.check('a1111.sd_models', async ({ sample }) => {
+    const r = await http(url, '/sdapi/v1/sd-models', { timeoutMs: T(10000) });
+    sample('a1111 GET /sdapi/v1/sd-models', { status: r.status, body: r.json ?? r.text ?? r.error });
+    if (r.status === 404) return WARN('no /sdapi/v1/sd-models: the model picker shows only the current checkpoint', { info: [`current: ${current ?? 'unknown'}`] });
+    if (!r.ok || !Array.isArray(r.json)) return WARN(`GET /sdapi/v1/sd-models → ${httpSummary(r)}`);
+    const bad = r.json.filter((m) => !(m.title || m.model_name || m.filename));
+    const match = current && r.json.some((m) => m.title === current || m.model_name === current);
+    const info = [r.json.slice(0, 6).map((m) => m.title || m.model_name).join(', ')];
+    if (bad.length) return FAIL(`${bad.length} entries without title/model_name/filename`, { info });
+    if (current && !match) return WARN(`current checkpoint "${current}" matches no title/model_name → no model is marked current`, { info, fix: 'Compare against filename too, or strip the [hash] suffix.' });
+    return PASS(`${r.json.length} checkpoint(s)${current ? '; current one matched' : ''}`, { info });
+  });
+
+  await run.check('a1111.samplers', async ({ sample }) => {
+    const r = await http(url, '/sdapi/v1/samplers', { timeoutMs: T(10000) });
+    sample('a1111 GET /sdapi/v1/samplers', { status: r.status, body: r.json ?? r.text ?? r.error });
+    if (!r.ok || !Array.isArray(r.json)) return WARN(`GET /sdapi/v1/samplers → ${httpSummary(r)} (informational: Harness sends sampler names verbatim)`);
+    return PASS(`${r.json.length} sampler(s): ${r.json.slice(0, 8).map((s) => s.name).join(', ')}`);
+  });
+
+  await run.check('a1111.progress', async ({ sample }) => {
+    const r = await http(url, '/sdapi/v1/progress?skip_current_image=true', { timeoutMs: T(5000) });
+    sample('a1111 GET /sdapi/v1/progress (idle)', { status: r.status, body: r.json ?? r.text ?? r.error });
+    if (r.status === 404) return WARN('no /sdapi/v1/progress: no progress bar during generation (polling stops after 3 misses)');
+    if (!r.ok || !isObj(r.json)) return WARN(`→ ${httpSummary(r)}`);
+    const bad = [];
+    if (!isNum(r.json.progress)) bad.push('progress');
+    if (!isObj(r.json.state)) bad.push('state');
+    if (bad.length) return WARN(`fields missing: ${bad.join(', ')}`, { actual: r.text });
+    return PASS(`progress ${r.json.progress}, eta_relative ${r.json.eta_relative}, state {${Object.keys(r.json.state).join(', ')}}`);
+  });
+
+  let interruptGet = null;
+  { const r = await http(url, '/sdapi/v1/interrupt', { timeoutMs: T(5000) }); interruptGet = r.status; }
+
+  const genChecks = ['a1111.txt2img.min_size', 'a1111.txt2img.response', 'a1111.txt2img.count2', 'a1111.txt2img.seeds', 'a1111.txt2img.unknown_fields', 'a1111.progress_during', 'a1111.interrupt_during', 'a1111.img2img'];
+  let interruptPost = null;
+  if (!run.opts.allowImages) {
+    for (const id of genChecks) await run.check(id, async () => SKIP('image generation is off by default', '--allow-images (a few tiny 1-step images)'));
+  } else {
+    const proxy = await startRecordingProxy(url);
+    const prov = new H.A1111Provider({ id: 'a1111', name: 'A1111 (live-check)', baseUrl: proxy.url });
+    const baseP = { prompt: 'a red circle on a white background', negativePrompt: '', steps: 1, cfg: 1.5, seed: 4242, count: 1, sampler: null, model: null, denoise: 0.6 };
+    const gen = async (p, signal) => {
+      const from = proxy.log.length;
+      const t0 = nowMs();
+      try {
+        const result = await p.__raw ? null : await prov.generate(p, { signal: anySignal(signal, T(600000)) });
+        return { ok: true, result, ms: nowMs() - t0, calls: proxy.log.slice(from) };
+      } catch (e) { return { ok: false, error: e.message, ms: nowMs() - t0, calls: proxy.log.slice(from) }; }
+    };
+    const genCall = (g) => g.calls.find((c) => c.method === 'POST' && /\/sdapi\/v1\/(txt2img|img2img)/.test(c.path));
+    let first = null;
+    try {
+      await run.check('a1111.txt2img.min_size', async ({ sample }) => {
+        const tries = [];
+        for (const size of [64, 128, 256, 512]) {
+          const g = await gen({ ...baseP, width: size, height: size });
+          tries.push(`${size}×${size}: ${g.ok ? `ok in ${fmtMs(g.ms)}` : `failed (${excerpt(g.error, 120)})`}`);
+          if (g.ok) { first = { ...g, size }; break; }
+        }
+        const c = first ? genCall(first) : null;
+        if (c) sample('a1111 POST /sdapi/v1/txt2img — exact Harness request body', c.reqBody);
+        if (!first) return FAIL('no tiny txt2img succeeded with the body Harness sends', { info: tries, fix: 'See a1111.txt2img.unknown_fields for whether the extra field names are the problem.' });
+        A.minSize = first.size;
+        A.perImageMs = first.ms;
+        const img = first.result.images[0];
+        const d = decodeImage(img.buffer);
+        return PASS(`smallest accepted: ${first.size}×${first.size}, 1 step, in ${fmtMs(first.ms)} → ${d.width}×${d.height} ${d.mime}`, { info: tries, observed: { minSize: first.size, ms: Math.round(first.ms) } });
+      }, { timeoutMs: 1200000 });
+
+      await run.check('a1111.txt2img.response', async ({ sample }) => {
+        need(first, 'no successful txt2img', 'a1111.txt2img.min_size');
+        const c = genCall(first);
+        const j = proxy.json(c);
+        sample('a1111 txt2img response (images shortened)', j ? { ...j, images: (j.images || []).map((s) => `${String(s).slice(0, 40)}…(${String(s).length} chars)`) } : c?.resBuf?.toString('utf8').slice(0, 500));
+        if (!isObj(j) || !Array.isArray(j.images)) return FAIL('no images array', { actual: c?.resBuf?.toString('utf8').slice(0, 300) });
+        const imgs = j.images.map(decodeImage);
+        const problems = [];
+        if (j.images.some((s) => typeof s !== 'string')) problems.push('images are not base64 strings');
+        if (imgs.some((d) => !d.recognized)) problems.push('an image is neither PNG, JPEG nor WebP');
+        if (j.images.some((s) => /^data:/.test(s))) problems.push('data: URL prefix (Harness strips it)');
+        let info = j.info;
+        const infoType = typeof info;
+        if (typeof info === 'string') { try { info = JSON.parse(info); } catch { problems.push('info is a string but not JSON'); info = null; } }
+        const lines = [`${j.images.length} image(s): ${imgs.map((d) => `${d.width}×${d.height} ${d.mime} ${fmtBytes(d.bytes)}`).join(', ')}; info is ${infoType}${isObj(info) ? ` with {${Object.keys(info).slice(0, 14).join(', ')}}` : ''}; parameters ${j.parameters ? 'echoed' : 'absent'}`];
+        if (problems.some((p) => !p.startsWith('data:'))) return FAIL(problems.join('; '), { info: lines });
+        if (!isObj(info)) return WARN('no usable info object: Harness assumes seeds seed, seed+1 … and the image count it asked for', { info: lines });
+        if (!Number.isFinite(info.seed) && !Array.isArray(info.all_seeds)) return WARN('info has neither seed nor all_seeds', { info: lines });
+        return PASS(lines[0]);
+      });
+
+      let c2 = null;
+      await run.check('a1111.txt2img.count2', async ({ sample }) => {
+        need(first, 'no successful txt2img', 'a1111.txt2img.min_size');
+        const g = await gen({ ...baseP, width: first.size, height: first.size, count: 2, seed: 5000 });
+        c2 = g;
+        const c = genCall(g);
+        const j = c ? proxy.json(c) : null;
+        const raw = (j?.images || []).map(decodeImage);
+        let info = j?.info;
+        if (typeof info === 'string') { try { info = JSON.parse(info); } catch { info = null; } }
+        sample('a1111 txt2img count 2 (request + response summary)', { request: c?.reqBody, images: raw.map((d) => `${d.width}×${d.height} ${d.mime}`), info });
+        if (!g.ok) return FAIL(`generation failed: ${g.error}`);
+        const want = decodeImage(first.result.images[0].buffer);
+        const got = g.result.images.map((x) => decodeImage(x.buffer));
+        const gridIdx = raw.findIndex((d) => d.width !== want.width || d.height !== want.height);
+        const lines = [`backend returned ${raw.length} image(s) [${raw.map((d) => `${d.width}×${d.height}`).join(', ')}], index_of_first_image ${info?.index_of_first_image ?? 'absent'}; Harness kept ${got.length} [${got.map((d) => `${d.width}×${d.height}`).join(', ')}]`];
+        if (got.length < 2) return FAIL(`only ${got.length} image(s) for count 2: the backend ignored n_iter/batch_count`, { info: lines, fix: 'Find the batch-count field this backend honours and set it in A1111Provider.generate.' });
+        if (got.some((d) => d.width !== want.width || d.height !== want.height)) return FAIL('Harness kept the contact-sheet grid instead of a real image', { info: lines, fix: 'The grid is not where A1111Provider.generate expects it (index_of_first_image / last `count` images).' });
+        if (gridIdx >= 0 && !Number.isInteger(info?.index_of_first_image)) return WARN(`a grid was returned (position ${gridIdx}) without info.index_of_first_image; Harness got it right only through the "last count images" fallback`, { info: lines });
+        return PASS(`${gridIdx >= 0 ? `grid at ${gridIdx} skipped via index_of_first_image; ` : 'no grid; '}2 real images kept`, { info: lines });
+      }, { timeoutMs: 1200000 });
+
+      await run.check('a1111.txt2img.seeds', async () => {
+        need(c2?.ok, 'count-2 generation did not succeed', 'a1111.txt2img.count2');
+        const j = proxy.json(genCall(c2));
+        let info = j?.info;
+        if (typeof info === 'string') { try { info = JSON.parse(info); } catch { info = null; } }
+        const seeds = c2.result.seeds;
+        const lines = [`info.seed ${info?.seed ?? 'absent'}, all_seeds ${JSON.stringify(info?.all_seeds ?? null)}; Harness stores ${JSON.stringify(seeds)}`];
+        if (!Array.isArray(info?.all_seeds)) return WARN('no all_seeds: Harness assumes seed+i, which may not be what the backend used', { info: lines });
+        if (info.all_seeds.length < 2) return WARN(`all_seeds has ${info.all_seeds.length} entr(y/ies) for 2 images`, { info: lines });
+        if (seeds[0] !== 5000 || seeds[1] !== 5001) return WARN(`seeds ${JSON.stringify(seeds)} instead of [5000, 5001] (reproducing an image from the gallery would use these)`, { info: lines });
+        return PASS(`seeds ${JSON.stringify(seeds)}`, { info: lines });
+      });
+
+      await run.check('a1111.txt2img.unknown_fields', async ({ sample }) => {
+        need(A.minSize || true, '', '');
+        const s = A.minSize || 64;
+        const common = { prompt: 'a red circle on a white background', negative_prompt: '', width: s, height: s, steps: 1, seed: 77 };
+        const variants = { a1111Only: { ...common, cfg_scale: 1.5, batch_size: 1, n_iter: 1 }, drawThingsOnly: { ...common, guidance_scale: 1.5, batch_size: 1, batch_count: 1 } };
+        const res = {};
+        for (const [k, body] of Object.entries(variants)) {
+          const r = await http(url, '/sdapi/v1/txt2img', { method: 'POST', body, timeoutMs: T(600000) });
+          res[k] = { status: r.status, images: Array.isArray(r.json?.images) ? r.json.images.length : 0, error: r.ok ? null : excerpt(errorOf(r), 160) };
+        }
+        res.harnessBody = first ? { status: 200, images: first.result.images.length } : { status: 'failed' };
+        sample('a1111 txt2img field-name variants', res);
+        const lines = Object.entries(res).map(([k, v]) => `${k}: HTTP ${v.status}${v.images ? `, ${v.images} image(s)` : ''}${v.error ? ` "${v.error}"` : ''}`);
+        if (!first && (res.a1111Only.status === 200 || res.drawThingsOnly.status === 200)) return FAIL('the canonical body works but the body Harness sends does not — the extra field names break this backend', { info: lines, fix: 'Send only the fields of the detected dialect in A1111Provider.generate.' });
+        if (!first) return FAIL('no variant works', { info: lines });
+        return PASS('unknown/duplicate field names are ignored', { info: lines });
+      }, { timeoutMs: 1300000 });
+
+      let longJob = null;
+      await run.check('a1111.progress_during', async ({ sample }) => {
+        need(first, 'no successful txt2img', 'a1111.txt2img.min_size');
+        const s = Math.max(first.size, 256);
+        const body = { prompt: 'a detailed landscape with mountains and a lake', negative_prompt: '', width: s, height: s, steps: 30, cfg_scale: 5, guidance_scale: 5, seed: 99, batch_size: 1, n_iter: 1, batch_count: 1 };
+        const t0 = nowMs();
+        const job = http(url, '/sdapi/v1/txt2img', { method: 'POST', body, timeoutMs: T(900000) }).then((r) => ({ r, endMs: nowMs() - t0 }));
+        let finished = null;
+        job.then((x) => { finished = x; });
+        const polls = [];
+        let seen = null;
+        while (!finished && nowMs() - t0 < T(120000)) {
+          await sleep(150);
+          const p = await http(url, '/sdapi/v1/progress?skip_current_image=true', { timeoutMs: T(3000) });
+          polls.push({ t: Math.round(nowMs() - t0), status: p.status, progress: p.json?.progress, step: p.json?.state?.sampling_step });
+          if (isNum(p.json?.progress) && p.json.progress > 0) { seen = { t: nowMs() - t0, ...p.json }; break; }
+          if (p.status === 404) break;
+        }
+        let interrupt = null;
+        if (!finished) {
+          const ir = await http(url, '/sdapi/v1/interrupt', { method: 'POST', timeoutMs: T(5000) });
+          interrupt = { status: ir.status, at: nowMs() - t0 };
+          interruptPost = ir.status;
+          for (let i = 0; i < 5 && !finished; i++) {
+            const p = await http(url, '/sdapi/v1/progress?skip_current_image=true', { timeoutMs: T(3000) });
+            if (p.json?.state?.interrupted) { interrupt.flag = true; break; }
+            await sleep(100);
+          }
+        }
+        const done = await job;
+        longJob = { done, interrupt, seen, steps: 30 };
+        sample('a1111 progress polls during a 30-step job', { polls: polls.slice(0, 20), interrupt, endMs: Math.round(done.endMs) });
+        if (seen) return PASS(`progress ${seen.progress.toFixed(2)} at step ${seen.state?.sampling_step}/${seen.state?.sampling_steps} after ${fmtMs(seen.t)}`);
+        if (polls.some((p) => p.status === 404)) return WARN('/progress is 404 during generation: no progress bar');
+        return WARN(`no progress > 0 observed in ${polls.length} polls (job took ${fmtMs(done.endMs)})`, { info: [excerpt(polls.slice(-3))] });
+      }, { timeoutMs: 1000000 });
+
+      await run.check('a1111.interrupt_during', async () => {
+        need(longJob, 'no long job ran', 'a1111.progress_during');
+        const { done, interrupt } = longJob;
+        if (!interrupt) return WARN(`the 30-step job finished (${fmtMs(done.endMs)}) before an interrupt could be sent`);
+        const after = done.endMs - interrupt.at;
+        const lines = [`POST /interrupt → HTTP ${interrupt.status} at ${fmtMs(interrupt.at)}; txt2img returned HTTP ${done.r.status} ${fmtMs(after)} later${interrupt.flag ? '; /progress showed state.interrupted' : ''}`];
+        if (![200, 204].includes(interrupt.status)) return FAIL(`POST /sdapi/v1/interrupt → HTTP ${interrupt.status}`, { info: lines, fix: 'A1111Provider.interrupt ignores errors, so cancelling would not stop the backend.' });
+        if (after > T(15000) && !interrupt.flag) return WARN('the job kept running after the interrupt', { info: lines });
+        return PASS(`stopped ${fmtMs(after)} after the interrupt`, { info: lines });
+      }, { timeoutMs: 60000 });
+
+      await run.check('a1111.img2img', async ({ sample }) => {
+        need(first, 'no successful txt2img', 'a1111.txt2img.min_size');
+        const src = first.result.images[0];
+        const g = await gen({ ...baseP, width: first.size, height: first.size, initImage: { buffer: src.buffer, mime: src.mime }, denoise: 0.5 });
+        const c = genCall(g);
+        sample('a1111 POST /sdapi/v1/img2img request (init image shortened)', c ? { ...c.reqBody, init_images: (c.reqBody?.init_images || []).map((s) => `${String(s).slice(0, 30)}…(${String(s).length} chars)`) } : null);
+        if (!g.ok) return FAIL(`img2img failed: ${g.error}`, { fix: 'Check init_images (raw base64, no data: prefix) and denoising_strength/strength.' });
+        const d = decodeImage(g.result.images[0].buffer);
+        return PASS(`${d.width}×${d.height} ${d.mime} in ${fmtMs(g.ms)} via ${c?.path}`);
+      }, { timeoutMs: 900000 });
+    } finally {
+      await proxy.close();
+    }
+  }
+
+  await run.check('a1111.interrupt', async () => {
+    if (interruptPost != null) {
+      if ([200, 204].includes(interruptPost)) return PASS(`POST /sdapi/v1/interrupt → HTTP ${interruptPost} (sent during this run's own job)`);
+      return FAIL(`POST /sdapi/v1/interrupt → HTTP ${interruptPost}`, { fix: 'Aborting an image job would not stop the backend.' });
+    }
+    if ([405, 422].includes(interruptGet)) return PASS(`GET → HTTP ${interruptGet}: the POST-only route exists`);
+    if (interruptGet === 200) return PASS('GET → HTTP 200 (route exists)');
+    return WARN(`GET /sdapi/v1/interrupt → HTTP ${interruptGet}; not verified with POST (that could cancel someone's running job)`, { need: '--allow-images (then it is POSTed during this run\'s own job)' });
+  });
+}
+
+// =============================================================================================== ComfyUI
+function openWs(url, clientId, firstMsgTimeoutMs) {
+  return new Promise((resolve) => {
+    if (typeof WebSocket !== 'function') return resolve({ unavailable: true, msgs: [] });
+    const msgs = [];
+    let ws;
+    try { ws = new WebSocket(`${url.replace(/^http/, 'ws')}/ws?clientId=${encodeURIComponent(clientId)}`); } catch (e) { return resolve({ error: e.message, msgs }); }
+    let settled = false;
+    const settle = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const t = setTimeout(() => settle({ ws, msgs, timeout: true }), firstMsgTimeoutMs);
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') { try { msgs.push({ t: Date.now(), m: JSON.parse(ev.data) }); } catch { msgs.push({ t: Date.now(), raw: ev.data.slice(0, 200) }); } } else msgs.push({ t: Date.now(), binary: true });
+      clearTimeout(t);
+      settle({ ws, msgs });
+    };
+    ws.onerror = (e) => { clearTimeout(t); settle({ error: e?.message || 'WebSocket error', msgs }); };
+  });
+}
+function comboOptions(spec) {
+  if (Array.isArray(spec?.[0])) return spec[0];
+  if (spec?.[0] === 'COMBO' && Array.isArray(spec?.[1]?.options)) return spec[1].options;
+  return null;
+}
+async function waitHistory(url, promptId, run, { maxMs }) {
+  const t0 = nowMs();
+  let last = null;
+  while (nowMs() - t0 < maxMs) {
+    const r = await http(url, `/history/${encodeURIComponent(promptId)}`, { timeoutMs: run.T(10000) });
+    last = r;
+    const e = r.json?.[promptId];
+    if (e && (e.status?.completed || e.status?.status_str === 'error' || Object.keys(e.outputs || {}).length)) return { entry: e, r, ms: nowMs() - t0 };
+    await sleep(300);
+  }
+  return { entry: null, r: last, ms: nowMs() - t0 };
+}
+
+async function comfyGroup(run, B) {
+  const url = B.comfyui.url;
+  const T = (ms) => run.T(ms);
+  run.section('raw', `ComfyUI ${url} (${B.comfyui.version || 'version ?'})`);
+  let ckpts = null;
+  await run.check('comfyui.system_stats', async ({ sample }) => {
+    const r = await http(url, '/system_stats', { timeoutMs: T(10000) });
+    sample('comfyui GET /system_stats', { status: r.status, body: r.json ?? r.text ?? r.error });
+    if (!r.ok || !isObj(r.json?.system)) return FAIL(`→ ${httpSummary(r)}`, { fix: 'ComfyUIProvider.status() would report it unreachable.' });
+    const dev = (r.json.devices || []).map((d) => `${d.name} (${d.type}) vram ${fmtBytes(d.vram_total)} free ${fmtBytes(d.vram_free)}`).join('; ');
+    if (!r.json.system.comfyui_version) return WARN('no system.comfyui_version (version shows as null)', { info: [dev] });
+    return PASS(`ComfyUI ${r.json.system.comfyui_version}, python ${r.json.system.python_version ?? '?'}; ${dev}`);
+  });
+  await run.check('comfyui.checkpoints', async ({ sample }) => {
+    const r = await http(url, '/object_info/CheckpointLoaderSimple', { timeoutMs: T(15000) });
+    sample('comfyui GET /object_info/CheckpointLoaderSimple', { status: r.status, body: r.json ?? r.text ?? r.error });
+    const spec = r.json?.CheckpointLoaderSimple?.input?.required?.ckpt_name;
+    const opts = comboOptions(spec);
+    if (!r.ok || !opts) return FAIL(`ckpt_name options not found (${httpSummary(r)})`, { actual: excerpt(spec ?? r.json, 300), expected: '[[…names], {…}] or ["COMBO", {options:[…]}]', fix: 'comboOptions() would return [] → "no checkpoints found".' });
+    ckpts = opts;
+    const fmt = Array.isArray(spec[0]) ? 'classic [[…]]' : 'COMBO';
+    if (!opts.length) return WARN('no checkpoints installed → Harness cannot generate (default workflow needs one)', { fix: 'Put a model in ComfyUI/models/checkpoints.' });
+    return PASS(`${opts.length} checkpoint(s) (${fmt} format): ${opts.slice(0, 5).join(', ')}`);
+  });
+  await run.check('comfyui.nodes', async ({ sample }) => {
+    const classes = [...new Set([...Object.values(H.DEFAULT_TXT2IMG_WORKFLOW), ...Object.values(H.DEFAULT_IMG2IMG_WORKFLOW)].map((n) => n.class_type))];
+    const res = {};
+    for (const c of classes) {
+      const r = await http(url, `/object_info/${c}`, { timeoutMs: T(15000) });
+      res[c] = r.status === 200 && isObj(r.json) ? (r.json[c] ? 'present' : 'MISSING') : `HTTP ${r.status}`;
+    }
+    sample('comfyui node classes used by the default workflows', res);
+    const missing = Object.entries(res).filter(([, v]) => v === 'MISSING').map(([k]) => k);
+    const unverifiable = Object.entries(res).filter(([, v]) => v.startsWith('HTTP')).map(([k, v]) => `${k} (${v})`);
+    if (missing.length) return FAIL(`node class(es) missing: ${missing.join(', ')}`, { fix: 'The built-in workflow cannot run on this ComfyUI; adjust DEFAULT_*_WORKFLOW.' });
+    if (unverifiable.length) return WARN(`could not verify: ${unverifiable.join(', ')} (/object_info/<class> did not answer with JSON)`);
+    return PASS(`all ${classes.length} present: ${classes.join(', ')}`);
+  });
+  await run.check('comfyui.samplers', async ({ sample }) => {
+    const r = await http(url, '/object_info/KSampler', { timeoutMs: T(15000) });
+    const req = r.json?.KSampler?.input?.required;
+    const samplers = comboOptions(req?.sampler_name);
+    const scheds = comboOptions(req?.scheduler);
+    sample('comfyui KSampler sampler/scheduler options', { status: r.status, samplers, schedulers: scheds });
+    if (!samplers || !scheds) return WARN(`could not read KSampler options (${httpSummary(r)})`);
+    const wantS = new Set(['euler', ...H.IMAGE_FAMILIES.map((f) => f.comfy?.sampler), H.DEFAULT_FAMILY.comfy?.sampler].filter(Boolean));
+    const wantK = new Set(['normal', ...H.IMAGE_FAMILIES.map((f) => f.comfy?.scheduler), H.DEFAULT_FAMILY.comfy?.scheduler].filter(Boolean));
+    const ms = [...wantS].filter((x) => !samplers.includes(x));
+    const mk = [...wantK].filter((x) => !scheds.includes(x));
+    if (ms.length || mk.length) return FAIL(`unknown to this ComfyUI: ${[...ms.map((x) => `sampler ${x}`), ...mk.map((x) => `scheduler ${x}`)].join(', ')}`, { fix: 'Prompts for the affected model families fail validation; update IMAGE_FAMILIES[].comfy in defaults.mjs.' });
+    return PASS(`all ${wantS.size} samplers and ${wantK.size} schedulers Harness may send exist`);
+  });
+  let interruptGet = null;
+  await run.check('comfyui.queue_routes', async ({ sample }) => {
+    const q = await http(url, '/queue', { timeoutMs: T(10000) });
+    const i = await http(url, '/interrupt', { timeoutMs: T(10000) });
+    interruptGet = i.status;
+    sample('comfyui GET /queue and GET /interrupt', { queue: { status: q.status, body: q.json ?? q.text }, interruptGet: { status: i.status, body: i.json ?? i.text } });
+    const lines = [`GET /queue → ${q.status} ${isObj(q.json) ? `{${Object.keys(q.json).join(', ')}}` : ''}; GET /interrupt → ${i.status}`];
+    if (!q.ok || !Array.isArray(q.json?.queue_running)) return WARN('GET /queue does not answer {queue_running, queue_pending}', { info: lines });
+    if (i.status === 404) return WARN('GET /interrupt → 404 (a POST-only route usually answers 405); not verified with POST without --allow-images', { info: lines });
+    return PASS(lines[0]);
+  });
+  await run.check('comfyui.websocket', async ({ sample }) => {
+    if (typeof WebSocket !== 'function') return WARN(`Node ${process.version} has no global WebSocket: Harness shows no ComfyUI progress`, { fix: 'Run Harness on Node ≥ 22 (or the Electron app) for progress.' });
+    const s = await openWs(url, `livecheck-${crypto.randomUUID()}`, T(8000));
+    try { s.ws?.close(); } catch { /* ignore */ }
+    sample('comfyui WebSocket first message', s.msgs[0] || s.error || 'none');
+    if (s.error) return FAIL(`WebSocket failed: ${s.error}`, { fix: 'No progress events for ComfyUI jobs.' });
+    const m = s.msgs[0]?.m;
+    if (!m) return WARN('connected, but no message within 8 s');
+    if (m.type !== 'status') return WARN(`first message type "${m.type}" (expected "status")`, { actual: excerpt(m) });
+    return PASS(`status message received (sid ${m.data?.sid ?? '?'})`);
+  });
+  await run.check('comfyui.validation_error', async ({ sample }) => {
+    const wf = H.fillWorkflow(H.DEFAULT_TXT2IMG_WORKFLOW, { prompt: 'x', negative_prompt: '', seed: 1, steps: 1, cfg: 1, width: 64, height: 64, count: 1, denoise: 1, model: 'livecheck-no-such-checkpoint.safetensors', sampler: 'euler', scheduler: 'normal', image: '' });
+    const raw = await http(url, '/prompt', { method: 'POST', body: { prompt: wf, client_id: 'livecheck' }, timeoutMs: T(30000) });
+    sample('comfyui POST /prompt with an invalid checkpoint', { status: raw.status, body: raw.json ?? raw.text ?? raw.error });
+    let harnessMsg = null;
+    try { await H.imageJson({ baseUrl: url, name: 'ComfyUI', id: 'comfyui', apiKey: '' }, '/prompt', { method: 'POST', body: { prompt: wf, client_id: 'livecheck' }, timeoutMs: T(30000) }); } catch (e) { harnessMsg = e.message; }
+    const detail = JSON.stringify(raw.json?.node_errors || {});
+    const lines = [`HTTP ${raw.status}; node_errors ${excerpt(raw.json?.node_errors ?? 'absent', 250)}`, `Harness would show: ${harnessMsg ? `"${excerpt(harnessMsg, 200)}"` : '(no error from imageJson — then comfyui.mjs checks node_errors itself)'}`];
+    if (raw.ok && raw.json?.prompt_id && !Object.keys(raw.json?.node_errors || {}).length) return FAIL('an invalid checkpoint was accepted and queued', { info: lines });
+    if (raw.ok) return PASS('HTTP 200 with node_errors (Harness throws "workflow error …" with the details)', { info: lines });
+    const hasDetail = harnessMsg && /ckpt_name|not in list|livecheck-no-such/i.test(harnessMsg);
+    if (!hasDetail && detail.length > 2) return WARN('rejected with HTTP 400; Harness keeps only error.message, so the user does not see which input is wrong', { info: lines, fix: 'In imageRequest (image/http.mjs) or ComfyUIProvider.generate, append node_errors[*].errors[*].message/details for POST /prompt failures.' });
+    return PASS('rejected; the reason reaches the user', { info: lines });
+  });
+
+  const genIds = ['comfyui.prompt', 'comfyui.ws_progress', 'comfyui.history', 'comfyui.view', 'comfyui.interrupt_during'];
+  if (!run.opts.allowImages) {
+    for (const id of genIds) await run.check(id, async () => SKIP('image generation is off by default', '--allow-images'));
+    return;
+  }
+  const ckpt = ckpts?.[0];
+  const clientId = `livecheck-${crypto.randomUUID()}`;
+  const sock = await openWs(url, clientId, T(8000));
+  const fill = (over) => H.fillWorkflow(H.DEFAULT_TXT2IMG_WORKFLOW, { prompt: 'a red circle on a white background', negative_prompt: '', seed: Math.floor(Math.random() * 2 ** 31), steps: 2, cfg: 1.5, width: 64, height: 64, count: 1, denoise: 1, model: ckpt, sampler: 'euler', scheduler: 'normal', image: '', ...over });
+  let promptId = null;
+  let tSubmit = 0;
+  try {
+    await run.check('comfyui.prompt', async ({ sample }) => {
+      need(ckpt, 'no checkpoint installed', 'a checkpoint in ComfyUI/models/checkpoints');
+      const wf = fill({});
+      tSubmit = Date.now();
+      const r = await http(url, '/prompt', { method: 'POST', body: { prompt: wf, client_id: clientId }, timeoutMs: T(30000) });
+      sample('comfyui POST /prompt (Harness default workflow, 64×64, 2 steps)', { request: { prompt: wf, client_id: clientId }, status: r.status, body: r.json ?? r.text ?? r.error });
+      if (!r.ok) return FAIL(`HTTP ${r.status}: ${excerpt(r.json ?? r.text, 300)}`, { fix: 'The built-in workflow is rejected by this ComfyUI.' });
+      if (!r.json?.prompt_id) return FAIL('no prompt_id', { actual: r.text });
+      promptId = r.json.prompt_id;
+      return PASS(`prompt_id ${promptId}, number ${r.json.number}, node_errors ${JSON.stringify(r.json.node_errors ?? null)}`);
+    });
+    let hist = null;
+    await run.check('comfyui.history', async ({ sample }) => {
+      need(promptId, 'nothing queued', 'comfyui.prompt');
+      hist = await waitHistory(url, promptId, run, { maxMs: T(600000) });
+      sample('comfyui GET /history/{id}', hist.r?.json ?? hist.r?.text);
+      const e = hist.entry;
+      if (!e) return FAIL(`no finished history entry after ${fmtMs(hist.ms)}`, { actual: hist.r?.text?.slice(0, 300) });
+      const imgs = Object.values(e.outputs || {}).flatMap((o) => o.images || []);
+      const lines = [`status ${excerpt(e.status, 200)}; outputs ${Object.keys(e.outputs || {}).join(', ')}; images ${excerpt(imgs, 200)}; took ${fmtMs(Date.now() - tSubmit)}`];
+      if (e.status?.status_str === 'error') return FAIL(`execution failed: ${excerpt(e.status.messages, 300)}`, { info: lines });
+      if (!imgs.length) return FAIL('no images in outputs', { info: lines });
+      if (!imgs.every((i) => typeof i.filename === 'string' && 'type' in i)) return FAIL('image entries lack filename/type', { info: lines });
+      if (!e.status?.completed) return WARN('outputs present but status.completed is not true', { info: lines });
+      return PASS(`completed, ${imgs.length} image(s) in ${fmtMs(Date.now() - tSubmit)}`, { info: lines, data: imgs });
+    }, { timeoutMs: 700000 });
+    await run.check('comfyui.ws_progress', async ({ sample }) => {
+      need(promptId, 'nothing queued', 'comfyui.prompt');
+      if (sock.unavailable) return SKIP('no global WebSocket in this Node', 'Node ≥ 22');
+      if (sock.error) return FAIL(`WebSocket failed: ${sock.error}`);
+      const mine = sock.msgs.filter((x) => x.m && (!x.m.data?.prompt_id || x.m.data.prompt_id === promptId));
+      const types = [...new Set(mine.map((x) => x.m.type))];
+      const prog = mine.filter((x) => x.m.type === 'progress');
+      sample('comfyui WebSocket messages during the run', mine.slice(0, 20).map((x) => x.m));
+      const lines = [`types: ${types.join(', ')}; ${prog.length} progress message(s)${prog[0] ? `, e.g. ${excerpt(prog[0].m.data, 120)}` : ''}; ${sock.msgs.filter((x) => x.binary).length} binary preview frame(s)`];
+      if (!prog.length) return WARN('no "progress" messages (Harness shows no progress bar)', { info: lines });
+      if (!prog.every((x) => isNum(x.m.data?.value) && isNum(x.m.data?.max))) return FAIL('progress messages without numeric value/max', { info: lines });
+      return PASS(lines[0]);
+    });
+    await run.check('comfyui.view', async ({ sample }) => {
+      const imgs = Object.values(hist?.entry?.outputs || {}).flatMap((o) => o.images || []);
+      need(imgs.length, 'no output image', 'comfyui.history');
+      const f = imgs.find((i) => i.type !== 'temp') || imgs[0];
+      const qs = new URLSearchParams({ filename: f.filename, subfolder: f.subfolder || '', type: f.type || 'output' });
+      const r = await http(url, `/view?${qs}`, { timeoutMs: T(60000), binary: true });
+      const d = r.buf ? decodeImage(r.buf) : null;
+      sample('comfyui GET /view', { status: r.status, headers: r.headers, image: d && { mime: d.mime, width: d.width, height: d.height, bytes: d.bytes } });
+      if (!r.ok || !d?.recognized) return FAIL(`→ HTTP ${r.status}, ${d ? `${d.bytes} bytes, not an image` : r.error}`);
+      return PASS(`${d.width}×${d.height} ${d.mime} (${fmtBytes(d.bytes)})`);
+    });
+    await run.check('comfyui.interrupt_during', async ({ sample }) => {
+      need(ckpt, 'no checkpoint installed', 'a checkpoint');
+      const from = sock.msgs.length;
+      const r = await http(url, '/prompt', { method: 'POST', body: { prompt: fill({ steps: 40, width: 256, height: 256 }), client_id: clientId }, timeoutMs: T(30000) });
+      if (!r.ok || !r.json?.prompt_id) return FAIL(`could not queue: HTTP ${r.status}`);
+      const id = r.json.prompt_id;
+      const t0 = nowMs();
+      while (nowMs() - t0 < T(60000)) {
+        if (sock.msgs.slice(from).some((x) => x.m?.type === 'progress' && x.m.data?.prompt_id === id)) break;
+        const h = await http(url, `/history/${encodeURIComponent(id)}`, { timeoutMs: T(5000) });
+        if (h.json?.[id]) break;
+        if (sock.unavailable && nowMs() - t0 > 1500) break;
+        await sleep(100);
+      }
+      const ir = await http(url, '/interrupt', { method: 'POST', body: {}, timeoutMs: T(10000) });
+      const h = await waitHistory(url, id, run, { maxMs: T(300000) });
+      sample('comfyui interrupt during a job', { interrupt: { status: ir.status, body: ir.json ?? ir.text }, history: h.entry?.status });
+      const lines = [`POST /interrupt → HTTP ${ir.status} after ${fmtMs(nowMs() - t0)}; history status ${excerpt(h.entry?.status, 200)}`];
+      if (!ir.ok) return FAIL(`POST /interrupt → HTTP ${ir.status}`, { info: lines, fix: 'Cancelling a ComfyUI job would not stop it.' });
+      const msgs = JSON.stringify(h.entry?.status?.messages || []);
+      if (h.entry?.status?.status_str === 'error' || /interrupt/i.test(msgs)) return PASS('the run was interrupted', { info: lines });
+      return WARN('the job finished normally (too fast to interrupt, or interrupt ignored)', { info: lines });
+    }, { timeoutMs: 420000 });
+  } finally {
+    try { sock.ws?.close(); } catch { /* ignore */ }
+  }
+}
+
+// =============================================================================================== OpenAI-style images
+async function openaiImagesGroup(run, B) {
+  const url = B.openaiImages.url;
+  const T = (ms) => run.T(ms);
+  run.section('raw', `OpenAI-style image server ${url}`);
+  await run.check('openai-images.models', async ({ sample }) => {
+    const r = await http(url, '/v1/models', { timeoutMs: T(10000), apiKey: run.opts.apiKey });
+    sample('openai-images GET /v1/models', { status: r.status, body: r.json ?? r.text ?? r.error });
+    if (!r.ok) return FAIL(`→ ${httpSummary(r)}`, { fix: 'OpenAIImagesProvider.status() would report it unreachable.' });
+    return PASS(`${(r.json?.data || []).length} model(s): ${(r.json?.data || []).slice(0, 5).map((m) => m.id).join(', ')}`);
+  });
+  await run.check('openai-images.generate', async ({ sample }) => {
+    need(run.opts.allowImages, 'image generation is off by default', '--allow-images');
+    const proxy = await startRecordingProxy(url);
+    try {
+      const prov = new H.OpenAIImagesProvider({ id: 'oimg', name: 'images (live-check)', baseUrl: proxy.url, apiKey: run.opts.apiKey });
+      let res = null;
+      let err = null;
+      const t0 = nowMs();
+      try { res = await prov.generate({ prompt: 'a red circle on a white background', width: 256, height: 256, count: 1, seed: 42, steps: 2, cfg: 1.5 }, { signal: AbortSignal.timeout(T(600000)) }); } catch (e) { err = e; }
+      const c = proxy.log.find((x) => x.path.startsWith('/v1/images/generations'));
+      const j = c ? proxy.json(c) : null;
+      sample('openai-images POST /v1/images/generations', { request: c?.reqBody, status: c?.status, body: j ? { ...j, data: (j.data || []).map((d) => ({ ...d, b64_json: d.b64_json ? `${d.b64_json.slice(0, 30)}…(${d.b64_json.length} chars)` : undefined })) } : c?.resBuf?.toString('utf8').slice(0, 400) });
+      if (err) return FAIL(`Harness provider failed: ${err.message}`, { actual: c?.resBuf?.toString('utf8').slice(0, 300) });
+      const d = decodeImage(res.images[0].buffer);
+      return PASS(`${res.images.length} image(s), ${d.width}×${d.height} ${d.mime} via ${j?.data?.[0]?.b64_json ? 'b64_json' : 'url'} in ${fmtMs(nowMs() - t0)}`);
+    } finally {
+      await proxy.close();
+    }
+  }, { timeoutMs: 700000 });
+}
+
 // @@CONTINUE@@

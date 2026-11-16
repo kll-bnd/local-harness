@@ -3,10 +3,24 @@
 // the active path. Paths are unique (tree), so any data keyed by a message id is valid on every branch
 // that passes through it — compaction summaries rely on this.
 
+const byAge = (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+
+/** parentId (null for roots) → sorted children; built once per operation so tree walks stay O(n). */
+export function childIndex(chat) {
+  const idx = new Map();
+  for (const m of Object.values(chat.messages)) {
+    const k = m.parentId ?? null;
+    if (!idx.has(k)) idx.set(k, []);
+    idx.get(k).push(m);
+  }
+  for (const arr of idx.values()) arr.sort(byAge);
+  return idx;
+}
+
 export function children(chat, parentId) {
   const out = [];
   for (const m of Object.values(chat.messages)) if ((m.parentId ?? null) === (parentId ?? null)) out.push(m);
-  return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  return out.sort(byAge);
 }
 
 export function siblings(chat, id) {
@@ -33,12 +47,12 @@ export function activePath(chat) {
 }
 
 /** From `id`, descend via activeChildId (or newest child) to a leaf. */
-export function deepestLeaf(chat, id) {
+export function deepestLeaf(chat, id, idx = childIndex(chat)) {
   let cur = chat.messages[id];
   const seen = new Set();
   while (cur && !seen.has(cur.id)) {
     seen.add(cur.id);
-    const kids = children(chat, cur.id);
+    const kids = idx.get(cur.id) || [];
     if (!kids.length) return cur.id;
     const next = (cur.activeChildId && chat.messages[cur.activeChildId]) || kids[kids.length - 1];
     cur = next;
@@ -66,12 +80,13 @@ export function addMessage(chat, msg) {
 export function deleteSubtree(chat, id) {
   const target = chat.messages[id];
   if (!target) return [];
+  const idx = childIndex(chat);
   const doomed = [];
   const stack = [id];
   while (stack.length) {
     const cur = stack.pop();
     doomed.push(cur);
-    for (const c of children(chat, cur)) stack.push(c.id);
+    for (const c of idx.get(cur) || []) stack.push(c.id);
   }
   const activeIds = new Set(activePath(chat).map((m) => m.id));
   const affectsActive = doomed.some((d) => activeIds.has(d));
@@ -79,12 +94,13 @@ export function deleteSubtree(chat, id) {
   for (const d of doomed) delete chat.messages[d];
   for (const m of Object.values(chat.messages)) if (m.activeChildId && !chat.messages[m.activeChildId]) m.activeChildId = null;
   if (affectsActive) {
-    const sibs = children(chat, parentId);
-    if (sibs.length) setActiveLeaf(chat, deepestLeaf(chat, sibs[sibs.length - 1].id));
+    const after = childIndex(chat);
+    const sibs = after.get(parentId) || [];
+    if (sibs.length) setActiveLeaf(chat, deepestLeaf(chat, sibs[sibs.length - 1].id, after));
     else if (parentId && chat.messages[parentId]) setActiveLeaf(chat, parentId);
     else {
-      const roots = children(chat, null);
-      if (roots.length) setActiveLeaf(chat, deepestLeaf(chat, roots[roots.length - 1].id));
+      const roots = after.get(null) || [];
+      if (roots.length) setActiveLeaf(chat, deepestLeaf(chat, roots[roots.length - 1].id, after));
       else { chat.activeLeafId = null; chat.activeRootId = null; }
     }
   }

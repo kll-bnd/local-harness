@@ -123,6 +123,7 @@ export function documentAttachmentIds(path, attachments, inlineMaxTokens) {
  */
 export function normalizeMessages(list, { providerKind = 'ollama' } = {}) {
   const out = [];
+  let lastNonTool = null;
   // pass 1: tool-call integrity
   for (let i = 0; i < list.length; i++) {
     const m = list[i];
@@ -135,13 +136,15 @@ export function normalizeMessages(list, { providerKind = 'ollama' } = {}) {
       if (kept.length) mm.toolCalls = kept; else delete mm.toolCalls;
       if (!mm.toolCalls && !mm.content) continue;
       out.push(mm);
+      lastNonTool = mm;
       continue;
     }
     if (m.role === 'tool') {
-      const prevAsst = [...out].reverse().find((x) => x.role !== 'tool');
+      const prevAsst = lastNonTool;
       if (!prevAsst || prevAsst.role !== 'assistant' || !prevAsst.toolCalls?.some((c) => c.id === m.toolCallId)) continue;
     }
     out.push(m);
+    if (m.role !== 'tool') lastNonTool = m;
   }
   // pass 2: merge consecutive user messages, fix leading role
   const merged = [];

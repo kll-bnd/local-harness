@@ -95,13 +95,21 @@ export class HybridIndex {
     }
     if (this.persistItems) {
       const txt = await fs.readFile(this.itemsFile, 'utf8').catch(() => '');
+      let lines = 0;
       for (const line of txt.split('\n')) {
         if (!line) continue;
         let r;
         try { r = JSON.parse(line); } catch { continue; }
         this._logRecords++;
-        if (r.op === 'put' && typeof r.id === 'string' && typeof r.text === 'string') this._put(r.id, r.text, r.meta || {});
-        else if (r.op === 'del' && typeof r.id === 'string') { this.items.delete(r.id); this.bm25.remove(r.id); }
+        if (r.op === 'put' && typeof r.id === 'string' && typeof r.text === 'string') this.items.set(r.id, { id: r.id, text: r.text, meta: r.meta || {} });
+        else if (r.op === 'del' && typeof r.id === 'string') this.items.delete(r.id);
+        if (++lines % 2000 === 0) await new Promise((res) => setImmediate(res));
+      }
+      // Build the lexical index without blocking the event loop for long (yields every 500 documents).
+      let n = 0;
+      for (const it of this.items.values()) {
+        this.bm25.add(it.id, it.text);
+        if (++n % 500 === 0) await new Promise((res) => setImmediate(res));
       }
     }
     const bin = await fs.readFile(this.vectorsFile).catch(() => null);
@@ -184,21 +192,12 @@ export class HybridIndex {
    */
   search(query, { k = 5, filter, queryVector = null, minSimilarity = 0.5, minLexical = 0.12 } = {}) {
     const f = filter ? (id) => filter(this.items.get(id)) : null;
-    const lexHits = this.bm25.search(query, { k: Math.max(50, k * 5), filter: f });
-    const allTerms = [...new Set(tokenize(query))];
-    const used = new Set(this.bm25.queryTerms(query));
-    // Unseen terms still count towards the denominator (a query about things never discussed scores low),
-    // but only the capped, matched set is scanned per document.
-    const qTerms = [...used];
-    const unseen = allTerms.filter((t) => !used.has(t) && !this.bm25.postings.has(t)).slice(0, 200);
-    const idfSum = (qTerms.reduce((a, t) => a + this.bm25.idf(t), 0) + unseen.reduce((a, t) => a + this.bm25.idf(t), 0)) || 1;
-    const lexScore = (id) => {
-      const d = this.bm25.docs.get(id);
-      if (!d) return 0;
-      let s = 0;
-      for (const t of qTerms) if (d.tf.has(t)) s += this.bm25.idf(t);
-      return s / idfSum;
-    };
+    const allTerms = [...new Set(tokenize(query))].slice(0, 2000);
+    const used = this.bm25.queryTerms(query);
+    // lexical = Σ idf(matched terms) / Σ idf(query terms); unseen terms count in the denominator only.
+    const idfSum = allTerms.reduce((a, t) => a + this.bm25.idf(t), 0) || 1;
+    const { hits: lexHits, matched } = this.bm25.searchDetailed(query, { k: Math.max(50, k * 5), filter: f, terms: used });
+    const lexScore = (id) => (matched.get(id) || 0) / idfSum;
     const cands = new Map();
     for (const h of lexHits) cands.set(h.id, { lexical: lexScore(h.id), semantic: null });
     const useVec = queryVector && queryVector.vec;
@@ -207,10 +206,10 @@ export class HybridIndex {
         if (v.model !== queryVector.model) continue;
         if (f && !f(id)) continue;
         if (!this.items.has(id)) continue;
-        const s = dot(queryVector.vec, v.vec);
-        const c = cands.get(id) || { lexical: lexScore(id), semantic: null };
-        c.semantic = s;
-        cands.set(id, c);
+        const sim = dot(queryVector.vec, v.vec);
+        const c = cands.get(id);
+        if (c) c.semantic = sim;
+        else if (sim >= minSimilarity) cands.set(id, { lexical: lexScore(id), semantic: sim });
       }
     }
     const out = [];

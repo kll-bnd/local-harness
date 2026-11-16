@@ -56,6 +56,7 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
     requests: [],
     loaded: new Map(),
     unloads: [],
+    unloadDelayMs: 0,
     delayMs,
     failures: [],
     setDelay(ms) { this.delayMs = ms; },
@@ -84,9 +85,17 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
   }
 
   function markLoaded(name, keepAlive, numCtx) {
+    if (typeof keepAlive === 'string' && !/^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(keepAlive)) {
+      // Real Ollama parses string durations with Go's time.ParseDuration ("-1" / "30" are rejected).
+      const e = new Error(`time: missing unit in duration "${keepAlive}"`);
+      e.status = 400;
+      throw e;
+    }
     if (keepAlive === 0 || keepAlive === '0' || keepAlive === '0s') {
-      if (fake.loaded.delete(name)) fake.unloads.push(name);
-      else fake.unloads.push(name);
+      fake.unloads.push(name);
+      // Like real Ollama, the memory is freed shortly AFTER the request returns (configurable).
+      if (fake.unloadDelayMs) setTimeout(() => fake.loaded.delete(name), fake.unloadDelayMs);
+      else fake.loaded.delete(name);
       return;
     }
     fake.loaded.set(name, { at: Date.now(), numCtx: numCtx || 4096, expires: new Date(Date.now() + 30 * 60000).toISOString() });
@@ -203,7 +212,7 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
       }
       sendJson(res, 404, { error: `fake-ollama: no route ${req.method} ${url.pathname}` });
     } catch (e) {
-      if (!res.headersSent) sendJson(res, 500, { error: e.message });
+      if (!res.headersSent) sendJson(res, e.status || 500, { error: e.message });
       else res.end();
     }
   });
