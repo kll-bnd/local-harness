@@ -3,9 +3,9 @@
 import Foundation
 
 enum PageScript {
-    /// `init` is JSON: { appVersion, actions, fullscreen }.
-    static func source(init: String) -> String {
-        return template.replacingOccurrences(of: "__HARNESS_INIT__", with: init)
+    /// `initJSON` is JSON: { appVersion, actions, fullscreen }.
+    static func source(initJSON: String) -> String {
+        return template.replacingOccurrences(of: "__HARNESS_INIT__", with: initJSON)
     }
 
     private static let template = #"""

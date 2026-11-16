@@ -68,7 +68,7 @@ final class MainWindow: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDe
         cfg.applicationNameForUserAgent = "Harness/\(app.appVersion)"
         let ucc = cfg.userContentController
         let initJSON = jsonString(["appVersion": app.appVersion, "actions": menuActions, "fullscreen": window.styleMask.contains(.fullScreen)] as [String: Any])
-        ucc.addUserScript(WKUserScript(source: PageScript.source(init: initJSON), injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        ucc.addUserScript(WKUserScript(source: PageScript.source(initJSON: initJSON), injectionTime: .atDocumentStart, forMainFrameOnly: true))
         ucc.add(app.pageMessages, name: "harnessDesktop")
         if let rules = app.contentRules { ucc.add(rules) }
         app.selfTest?.configure(ucc)

@@ -236,6 +236,21 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
                 if exists, case .found(let k) = DataKeyStore.read() { fp = DataKeyStore.fingerprint(k) }
                 DispatchQueue.main.async { r(["exists": exists, "fingerprint": fp]) }
             }
+        case "ollama":
+            // Ask the local Ollama directly (the page cannot reach 127.0.0.1): GET /api/ps, POST /api/pull, …
+            let path = (b["path"] as? String) ?? "/api/ps"
+            guard path.hasPrefix("/api/"), let u = URL(string: "http://127.0.0.1:11434" + path) else { r(["ok": false]); return }
+            var req = URLRequest(url: u, timeoutInterval: (b["timeout"] as? Double) ?? 60)
+            if let body = b["body"] {
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            }
+            URLSession.shared.dataTask(with: req) { data, resp, err in
+                let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let text = data.map { String(decoding: $0.prefix(4000), as: UTF8.self) } ?? ""
+                DispatchQueue.main.async { r(["status": status, "body": text, "error": err?.localizedDescription ?? NSNull()]) }
+            }.resume()
         case "stash":
             if let k = b["key"] as? String { stash[k] = b["value"] ?? NSNull() }
             write(stash, "stash.json")

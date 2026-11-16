@@ -307,17 +307,17 @@ jobs:
           touch "$FACTS"
           { echo "toolchain| macOS $(sw_vers -productVersion) $(uname -m) $(sysctl -n machdep.cpu.brand_string), RAM $(($(sysctl -n hw.memsize) / 1073741824)) GB"
             echo "toolchain| Command Line Tools: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools xcrun swiftc --version 2>&1 | head -n 1)"
-          } | tee -a "$FACTS"
+          } >> "$FACTS"
       - name: Build Harness.app with the Command Line Tools only
         env:
           DEVELOPER_DIR: /Library/Developer/CommandLineTools
         run: |
           if scripts/build-native.sh > /tmp/build.log 2>&1; then
-            grep '^==>' /tmp/build.log | sed 's/^/build| /' | tee -a "$FACTS"
-            echo "build| swiftc warnings: $(grep -c 'warning:' /tmp/build.log)" | tee -a "$FACTS"
+            grep '^==>' /tmp/build.log | sed 's/^/build| /' >> "$FACTS"
+            echo "build| swiftc warnings: $(grep -c 'warning:' /tmp/build.log)" >> "$FACTS"
           else
-            grep -E 'error:' /tmp/build.log | sed "s#$PWD/##" | head -n 40 | sed 's/^/build-error| /' | tee -a "$FACTS"
-            tail -n 5 /tmp/build.log | sed 's/^/build-tail| /' | tee -a "$FACTS"
+            grep -E '^/.*: error:' /tmp/build.log | sed "s#$PWD/##" | head -n 30 | sed 's/^/build-error| /' >> "$FACTS"
+            tail -n 5 /tmp/build.log | sed 's/^/build-tail| /' >> "$FACTS"
             exit 1
           fi
       - name: Inspect the bundle
@@ -328,7 +328,7 @@ jobs:
             echo "bundle| $(codesign -dv $A 2>&1 | grep -E '^(Identifier|Signature|CodeDirectory)' | tr '\n' ' ')"
             echo "bundle| node: $($A/Contents/MacOS/node -v) $(codesign -dv $A/Contents/MacOS/node 2>&1 | grep -E '^(Authority|TeamIdentifier)' | head -n 2 | tr '\n' ' ')"
             echo "bundle| $(file -b $A/Contents/MacOS/Harness)"
-          } | tee -a "$FACTS"
+          } >> "$FACTS"
       - name: Self-test against the mock backend (two launches, one data folder)
         run: |
           node -e "const n=20*1024*1024,b=Buffer.alloc(n);for(let i=0;i<n;i++)b[i]=(Math.imul(i,31)+7)&255;require('fs').writeFileSync('/tmp/pick-20mb.bin',b)"
