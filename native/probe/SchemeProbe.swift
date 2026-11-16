@@ -75,8 +75,9 @@ final class Handler: NSObject, WKURLSchemeHandler {
         requests.append(rec)
 
         switch path {
-        case "/", "/probe.html":
-            let d = (try? Data(contentsOf: root.appendingPathComponent("probe.html"))) ?? Data()
+        case "/", "/probe.html", "/probe-csp.html":
+            let name = path == "/probe-csp.html" ? "probe-csp.html" : "probe.html"
+            let d = (try? Data(contentsOf: root.appendingPathComponent(name))) ?? Data()
             respond(task, 200, "text/html; charset=utf-8", d)
         case "/probe.js":
             let d = (try? Data(contentsOf: root.appendingPathComponent("probe.js"))) ?? Data()
@@ -118,11 +119,10 @@ final class Handler: NSObject, WKURLSchemeHandler {
             }
             tick()
         case "/cancel-status":
-            json(task, ["foreverStarted": foreverStarted as Any, "stopAt": foreverStopAt as Any, "stopCalls": native["stopCalls"] ?? 0])
+            json(task, ["foreverStarted": foreverStarted ?? -1, "stopAt": foreverStopAt ?? -1, "stopCalls": (native["stopCalls"] as? Int) ?? 0])
         case "/done":
-            if let b = body, let o = try? JSONSerialization.jsonObject(with: b) { native["page"] = o }
+            if let b = body, let o = try? JSONSerialization.jsonObject(with: b) { native["pageViaPost"] = (o as? [String: Any])?.count ?? 0 }
             json(task, ["ok": true])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { finish("done") }
         default:
             json(task, ["error": "not found", "path": path], status: 404)
         }
@@ -164,9 +164,17 @@ final class Nav: NSObject, WKNavigationDelegate, WKUIDelegate {
 
 final class Msg: NSObject, WKScriptMessageHandler {
     func userContentController(_ c: WKUserContentController, didReceive message: WKScriptMessage) {
-        var l = (native["messages"] as? [Any]) ?? []
-        l.append(["origin": "\(message.frameInfo.securityOrigin.protocol)://\(message.frameInfo.securityOrigin.host)", "main": message.frameInfo.isMainFrame, "body": message.body])
-        native["messages"] = l
+        native["messageOrigin"] = "\(message.frameInfo.securityOrigin.protocol)://\(message.frameInfo.securityOrigin.host)"
+        if let b = message.body as? [String: Any], let kind = b["kind"] as? String {
+            if kind == "phase1" || kind == "phase2" {
+                native[kind] = b["results"] ?? [:]
+                if kind == "phase2" { DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { finish("done") } }
+            } else {
+                var l = (native["notes"] as? [Any]) ?? []
+                l.append(b)
+                native["notes"] = l
+            }
+        }
     }
 }
 

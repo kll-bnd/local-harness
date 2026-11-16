@@ -1,26 +1,25 @@
 ;; Harness offline lock: an OS-enforced "nothing leaves this Mac" profile for macOS sandbox-exec.
 ;;
-;;   /usr/bin/sandbox-exec -f server/security/offline-lock.sb <command> [args…]
+;;   HARNESS_SANDBOXED=1 /usr/bin/sandbox-exec -f server/security/offline-lock.sb <command> [args…]
 ;;
-;; Everything a normal process may do stays allowed EXCEPT talking to anything that is not this
-;; computer. Child processes inherit the sandbox, so wrapping the Harness backend also confines the
-;; Ollama server and model runner it starts.
-;;
-;; Not yet verified on a real Mac: see docs/BRIDGE.md ("Offline lock") for what the native-app
-;; work must confirm (syntax on current macOS, loopback still working, DNS lookups blocked).
+;; Everything a normal process may do stays allowed EXCEPT network traffic with anything that is not
+;; this computer. Child processes inherit the sandbox, so wrapping the Harness backend also confines
+;; the Ollama server and model runner it starts. In SBPL the last matching rule wins.
+;; What was verified on a real Mac is recorded in docs/BRIDGE.md ("Offline lock").
 (version 1)
 (allow default)
 
-;; No outbound or inbound network at all …
+;; No IP traffic at all …
 (deny network*)
-;; … except this machine: loopback TCP/UDP and local (Unix-domain) sockets.
+;; … except with this machine: loopback (127.0.0.1 and ::1) and local (Unix-domain) sockets.
 (allow network* (local ip "localhost:*"))
 (allow network* (remote ip "localhost:*"))
 (allow network* (remote unix-socket))
 (allow network* (local unix-socket))
 
-;; Name lookups go through a system daemon that would send the name out over DNS on our behalf.
-;; Harness only ever needs 127.0.0.1, so block the resolver services too.
+;; Name lookups: getaddrinfo() asks mDNSResponder (over this Unix socket) to send the name out over
+;; DNS on our behalf, so that socket is closed too. Harness only ever needs 127.0.0.1 / localhost,
+;; which resolve from /etc/hosts without it.
+(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
 (deny mach-lookup (global-name "com.apple.mDNSResponder"))
 (deny mach-lookup (global-name "com.apple.dnssd.service"))
-(deny mach-lookup (global-name "com.apple.networkd"))

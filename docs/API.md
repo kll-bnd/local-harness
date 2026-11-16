@@ -18,6 +18,7 @@ Contents
 7. [UI integration notes](#7-ui-integration-notes)
 8. [Fake backends for development](#8-fake-backends-for-development)
 9. [Changes in the hardening pass (for UI authors)](#9-changes-in-the-hardening-pass)
+10. [Version 0.2.0: password, encryption, internet blocker, native bridge, model catalogue](#10-version-020)
 
 ---
 
@@ -942,3 +943,220 @@ Everything below is additive unless marked **behaviour**. Documented shapes did 
 * Memories: `needsReview`, `allowSecret`, `origin: "restore"`, protected manual/pinned memories, stricter dedupe (3.6, 5.9).
 * Chats: `titleSource: "import"`; `DELETE /api/chats/:id?deleteMemories=true` → `removed`; regenerate on an image turn makes a new image; backup v2 with files + `POST /api/restore` (5.8).
 * Images: ComfyUI `count` = one prompt per image; resident-size unload decisions; RAM lease on 8 GB; timeouts/failures interrupt the backend.
+
+## 10. Version 0.2.0
+
+What 0.2.0 adds, as the UI, the launchers and the native app see it: the data directory is encrypted and opened
+with a typed **password** (10.1–10.4); the HTTP API answers only browsers and tools that proved they may (10.5);
+**"Block all internet access"** is one switch, on by default, that leaves chat untouched (10.6); the backend can run
+as a child of the native app with **no listening socket** (10.7, `docs/BRIDGE.md`); and a browsable **model
+catalogue** (Hugging Face GGUF repositories and the Ollama library) lists what this Mac can run (10.8). Everything
+below is decided; names and shapes are exact. 10.10 lists what breaks for existing UI code.
+
+### 10.1 Protection modes and states
+
+`launch.json` (plain text, in the data directory, read by every launcher before the backend starts — see
+`docs/BRIDGE.md`) says how the data is opened:
+
+| `encryption` | meaning |
+|---|---|
+| `"password"` (default) | The user types a password to open Harness. A random **data key** encrypts the data; it is stored only wrapped under a key derived from the password (scrypt) and under a **recovery key** shown once. Nothing on disk or in the Keychain can unwrap it. Forgetting both the password and the recovery key means the data is gone, by design. |
+| `"keychain"` | Opt-in convenience ("don't ask for a password on this Mac"): the data key is also wrapped under a random key kept in the login Keychain (service `local.harness`, account `data-key`, label `Harness data key`, value base64 of 32 bytes), so Harness opens without a prompt. Weaker: any program running as the user can ask the Keychain for that item. The password and recovery key still work. |
+| `"off"` | Plain-text data. Only reachable as a deliberate, password-confirmed choice (10.4); the password is kept (as a verifier) for confirmations. |
+
+States (`GET /api/security` → `state`):
+
+| state | what works |
+|---|---|
+| `needs_setup` | First run in password mode, or an existing plain-text data directory from 0.1 (`plainDataFound: true`). Only the UI's static files, `GET /api/health`, `GET /api/security` and `POST /api/security/setup` answer; everything else → **423** `needs_setup`. |
+| `locked` | The backend runs and serves the UI's static files, `GET /api/health`, `GET /api/security` and `POST /api/security/unlock`; **everything else → 423 `locked`** — chats, memories, images and attachment URLs, the UI-state store, search, settings and the global event stream (`GET /api/events` → 423; an open stream is closed with a final `locked` event when the backend locks). |
+| `migrating` | Setup, a mode change or an upgrade is encrypting/decrypting files; same routes as `locked`; `GET /api/security` → `migration` shows progress. |
+| `unlocked` | Everything, for callers with a session (10.5). |
+
+`GET /api/health` (no session needed) → `{ "ok": true, "name": "harness", "version": "0.2.0", "state": "locked" }`.
+
+### 10.2 `GET /api/security`
+
+No session needed (it contains no user data). Also embedded in `GET /api/system` as `security` (unlocked only).
+
+```json
+{
+  "state": "unlocked",
+  "mode": "password",
+  "plainDataFound": false,
+  "migration": null,
+  "unlock": { "failedAttempts": 0, "retryAfterMs": 0 },
+  "recoveryKey": { "createdAt": "2026-11-16T09:12:00.000Z" },
+  "idleLockMinutes": 15,
+  "session": { "authenticated": true, "via": "cookie" },
+  "transport": "listener",
+  "offlineLock": { "enabled": true, "blocked": true, "allowedUntil": null, "osEnforced": true, "osScope": "ollama", "externalOllama": false }
+}
+```
+
+* `migration` while migrating: `{ "op": "encrypt" | "decrypt" | "reencrypt", "done": 12, "total": 340, "startedAt": "…", "error": null }`.
+* `unlock.retryAfterMs`: wait before the next unlock attempt may be tried (10.3).
+* `recoveryKey`: `null` when none exists (off mode, or never created).
+* `idleLockMinutes`: from `settings.security.idleLockMinutes` (last known value while locked).
+* `session.via`: `"cookie" | "token" | "bridge" | null`. The UI shows its lock screen when `state !== "unlocked"` **or** `session.authenticated` is false.
+* `transport`: `"listener"` (HTTP) or `"bridge"` (native app).
+* `offlineLock`: 10.6.
+
+### 10.3 Setup, unlock, lock
+
+| | |
+|---|---|
+| `POST /api/security/setup` | `{ "password": "…" }` (≥ 8 characters, else **400** `weak_password`) — only in `needs_setup`. Creates the data key, wraps it, writes `vault.json`, and — when 0.1 data exists — starts encrypting it (resumable and verified: every file is re-read and compared before it replaces the plain one). → **200** `{ "state": "migrating" \| "unlocked", "recoveryKey": "HRK1-7Q2M-…", "migration": {…} \| null }` plus a session (cookie in listener mode). **The recovery key is returned exactly once** — the UI must show it with a "save it now" step and say that without the password and this key the data cannot be recovered. |
+| `POST /api/security/unlock` | `{ "password": "…" }` or `{ "recoveryKey": "HRK1-…" }` → **200** `{ "state": "unlocked" \| "migrating", "passwordReset": null \| { "until": "…" } }` plus a session. Also used while already unlocked to give a new browser (or a CLI tool) a session. Wrong → **401** `wrong_password` / `wrong_recovery_key` with `details.retryAfterMs`; too early → **429** `unlock_throttled` with `details.retryAfterMs`. Attempts 1–3 have no delay, then the wait doubles from 1 s up to 5 min; the count is kept in `vault.json` (survives restarts) and reset by a success. After unlocking with the recovery key, `passwordReset.until` (10 min) allows `POST /api/security/password` without the old password. In keychain mode `{}` (no field) unlocks with the Keychain item. |
+| `POST /api/security/lock` | `{}` → **200** `{ "state": "locked" }` ("Lock now"). Locking: running generations and image jobs are aborted (partial replies kept), background work stops, models Harness loaded into Ollama are unloaded, stores are closed, key buffers are overwritten, all sessions are dropped and open event streams end. Also triggered by `settings.security.idleLockMinutes` (default **15**; `0` = never) after that long without a request from the UI (in-flight requests and anything but `GET /api/events` count as activity), and by the bridge `lock` control message. Keychain mode: unlocking again needs only `{}`. |
+| `POST /api/security/password` | `{ "password": "<current>", "newPassword": "…" }` (or without `password` inside a `passwordReset` window) → **200** `{ "ok": true }`. Re-wraps the data key; nothing is re-encrypted. |
+| `POST /api/security/recovery-key` | `{ "password": "…" }` → **200** `{ "recoveryKey": "HRK1-…", "createdAt": "…" }`: a **new** recovery key (the old one stops working; the old one cannot be shown again because it is not stored). |
+| `POST /api/security/mode` | `{ "password": "…", "mode": "password" \| "keychain" \| "off" }` → **200** `{ "mode": "…", "state": "unlocked" \| "migrating" }`. `keychain` adds the Keychain wrap (listener mode: written with `/usr/bin/security`, the value passed on its stdin, never in argv or the environment; bridge mode: sent to the app as the event `keychain-key`, `docs/BRIDGE.md`); leaving keychain mode deletes it. `off` decrypts every file; leaving `off` encrypts them again (both resumable, with progress). Updates `launch.json`. |
+| `POST /api/security/confirm` | `{ "password": "…" }` → **200** `{ "confirmation": "<opaque>", "expiresAt": "…" }` — a single-use confirmation valid 2 minutes for this session, for confirmable requests whose body is not ours (header `X-Harness-Confirm: <confirmation>`). |
+
+**Confirmation.** These actions lower protection and need the password **in the same request** — a `"password"` field in the JSON body, or the header `X-Harness-Confirm` from `POST /api/security/confirm`: allowing internet access (`POST /api/network/allow`), turning the blocker off (`PUT /api/network`), full backups (`POST /api/export`), restoring over existing data (`POST /api/restore`), a new recovery key, changing the password, changing the mode. Missing → **403** `confirmation_required`; wrong → **401** `wrong_password` (same throttle). In off mode without any password ever set (development), no confirmation is asked.
+
+**Crypto.** AES-256-GCM (node:crypto). Password → key: scrypt **N = 2^17, r = 8, p = 1** (128 MiB, about 0.5 s on an M1 — the memory cost is what makes guessing expensive on GPUs, and 128 MiB is transient and safe on an 8 GB Mac); salt (16 random bytes) and parameters are stored beside the wrapped key and can be raised later. Recovery key: 32 random bytes shown as `HRK1-` + 13 groups of 4 Crockford base32 characters (case, spaces and dashes ignored; `I/L` = `1`, `O` = `0`), stretched with HKDF-SHA256. `vault.json` (plain, 0600) holds only wrapped keys, KDF parameters, the unlock-throttle state and migration progress.
+
+### 10.4 What is encrypted, and other storage rules
+
+* Encrypted (same file names, encrypted contents): chats and their summaries, memories, attachments (originals and extracted text), generated images and the gallery index, the recall/document/memory indexes (append-only logs stay append-only: each append is its own sealed record, so a turn does not re-encrypt an index), presets, settings (may hold provider API keys), the UI-state store, calibration data, the list of text-only copies, sessions. Plain: `launch.json`, `vault.json`, `harness.lock`, `measurements.json`, `api-token` (keychain/off modes only, 10.5), logs.
+* File formats: `HXC1` (chunked AES-256-GCM, 64 KiB chunks, nonce = random prefix + chunk counter + last-chunk flag, the header is authenticated — no truncation or reordering) and `HXL1` (append-only log of sealed records). Large files (50 MB attachments, images) are encrypted and served chunk by chunk.
+* The data directory is `0700` and every file `0600`.
+* Every API response, and every served user file (attachments, images), carries `Cache-Control: no-store` (the UI's own static files may be cached).
+* Logs and error messages never contain message text, prompts, memory text, attachment file names, passwords or keys.
+* An upgrade from 0.1 enters `needs_setup` with `plainDataFound: true`; choosing a password encrypts the existing data (a crash during it is resumed at the next unlock; a mixed directory is read correctly at every point).
+
+**UI state** (drafts, collapsed panels, preferences — instead of browser storage, which would sit on disk in plain text):
+
+| | |
+|---|---|
+| `GET /api/ui-state` | → `{ "state": { … }, "updatedAt": "…" \| null }` |
+| `PUT /api/ui-state` | `{ "state": { … } }` (any JSON object, ≤ 1 MiB) → `{ "ok": true, "updatedAt": "…" }` — replaces |
+| `PATCH /api/ui-state` | `{ "set": { "draft:chat_123": "…" }, "remove": ["draft:chat_456"] }` → `{ "ok": true, "updatedAt": "…" }` — top-level keys |
+
+**Backups.** `GET /api/export` → **403** `confirmation_required` when a password is set (it cannot carry one). Use
+`POST /api/export` `{ "password": "…", "passphrase": "…" | null }` → the backup download: with `passphrase: null`
+the plain `harness.backup` of 5.8; with a passphrase an envelope
+`{ "format": "harness.backup.encrypted", "version": 1, "kdf": { "name": "scrypt", "N": 131072, "r": 8, "p": 1, "salt": "<b64>" }, "cipher": "aes-256-gcm", "nonce": "<b64>", "data": "<b64>" }`.
+`POST /api/restore` and `POST /api/chats/import` accept both; an encrypted one needs the header
+`X-Harness-Backup-Passphrase: <base64url of the UTF-8 passphrase>` (missing → **400** `encrypted_backup`, wrong →
+**400** `wrong_passphrase`). `POST /api/restore` also needs a confirmation (`X-Harness-Confirm`).
+
+### 10.5 Sessions (listener mode)
+
+The HTTP listener answers only callers that proved they may: other programs and other user accounts can reach
+`127.0.0.1` but cannot read the data directory or know the password. Bridge requests need none of this (10.7).
+
+* **No session needed:** the UI's static files (`/`, `/index.html`, `/js/…`, `/css/…`, icons), `GET /api/health`, `GET /api/security`, `POST /api/security/setup`, `POST /api/security/unlock`, `POST /api/auth/session`, `GET /api/auth/status`.
+* **Password mode:** a browser gets a session only by a successful setup or unlock **in that browser**: the response sets `Set-Cookie: harness_session=<opaque>; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200` (12 h; dropped when Harness locks). The cookie also authorises `<img src>`, downloads and `EventSource`. CLI tools ask for the password on the terminal without echo (or read it from stdin for automation — never argv or the environment), call `POST /api/security/unlock` and use the returned `sessionToken` as `Authorization: Bearer <sessionToken>`. No `api-token` file exists in password mode.
+* **Keychain / off modes:** a per-install secret `api-token` (32 random bytes base64url, `0600`, in the data directory) authorises `Authorization: Bearer <token>`. A launcher with it asks `POST /api/auth/launch-code` → `{ "code": "…", "url": "http://127.0.0.1:4747/#launch=<code>", "expiresAt": "…" }` (one use, 2 min) and opens `url`. The UI, on load, sees `#launch=<code>` in `location.hash`, sends `POST /api/auth/session` `{ "code": "…" }` (→ the same cookie) and removes the fragment with `history.replaceState` — the code never reaches a log, the history or a referrer. `npm start -- --open` opens such a URL.
+* `startServer()` (Electron, in-process) returns `auth`: `{ createSession() → { "name": "harness_session", "value": "…", "maxAgeSec": 43200 }, launchUrl() → "http://127.0.0.1:…/#launch=…" }` (both throw while locked in password mode — the UI's lock screen then creates the session).
+* `GET /api/auth/status` → `{ "authenticated": true, "via": "cookie", "expiresAt": "…" }`; `POST /api/auth/logout` → clears the cookie.
+* Without a session → **401** `{ "error": { "code": "auth_required", "message": "…", "details": { "reason": "missing" | "invalid" | "expired", "unlock": true } } }` — `unlock: true` (password mode: show the lock screen) or `false` (keychain/off: "Open Harness from its launcher"). The Host/Origin/Sec-Fetch checks of §2 stay in front of all of this.
+* Browsers do not isolate cookies by port: another server on `localhost` that this browser visits could receive the cookie. The 12-hour lifetime and locking limit the exposure; the native app (bridge mode) avoids it entirely.
+
+### 10.6 "Block all internet access"
+
+One setting, on by default, in `launch.json` (`offlineLock`), with one clear state. Chat is never affected: while
+blocked, installed models, memory, summaries, tools other than `fetch_url`, documents and image generation through a
+local Draw Things / ComfyUI work exactly as before, with no warnings in the chat view.
+
+* **Blocked while on:** every outbound destination that is not this Mac (loopback, `localhost`) is refused at the single outbound choke point **before name resolution is attempted**: the model catalogue, model downloads (`POST /api/models/pull`, also the Ollama-side download it would trigger), `fetch_url` (not offered to the model; a direct call gets an error result), chat and image providers with remote URLs (status `unreachable`, a turn → `offline_lock`), and anything added later.
+* Status (`GET /api/network`, and `offlineLock` in `GET /api/security` / `GET /api/system`):
+  `{ "enabled": true, "blocked": true, "allowedUntil": null, "waitingFor": null, "osEnforced": true, "osScope": "ollama", "externalOllama": false }` —
+  `blocked` = enabled and not inside an allow window; `allowedUntil` = end of the window (ISO) or `null`; `waitingFor` = `"model_download"` when the window has ended but a download started inside it is still running (blocking resumes when it ends); `osEnforced` = an OS sandbox is in force in addition to the code; `osScope` = `"backend"` (the launcher sandboxed the whole backend, `HARNESS_SANDBOXED=1`), `"ollama"` (Harness started `ollama serve` under `sandbox-exec`), `"none"`; `externalOllama` = an Ollama that Harness did not start is in use (it cannot be confined; the code layer still blocks everything Harness itself sends).
+* `POST /api/network/allow` `{ "minutes": 15, "password": "…" }` (1–120, default 15; password confirmation, 10.3) → **200** `{ "offlineLock": {…}, "restartRequired": false }`. Blocking resumes automatically at `allowedUntil`.
+* `POST /api/network/block` `{}` → **200** `{ "offlineLock": {…}, "restartRequired": false }` — block again now (no password: it raises protection).
+* `PUT /api/network` `{ "enabled": false, "password": "…" }` — the setting itself (password needed to turn it off) → `{ "offlineLock": {…} }`.
+* `POST /api/network/test` → `{ "blocked": true, "results": [ { "layer": "code", "target": "huggingface.co:443", "result": "blocked", "detail": "…" }, { "layer": "os", "target": "1.1.1.1:443", "result": "blocked" | "reachable" | "skipped", "detail": "…" } ] }` — an on-demand self-test the user can run; the OS probe only runs where an OS sandbox claims to cover the process doing it, so the test itself never sends anything out while blocked.
+* Refused requests → **403** `{ "error": { "code": "offline_lock", "message": "Internet access is blocked in Harness …", "details": { "what": "model_catalog" | "model_download" | "fetch_url" | "remote_provider" | "remote_image_provider" | "other", "host": "huggingface.co", "allow": { "method": "POST", "path": "/api/network/allow", "body": { "minutes": 15 }, "needsPassword": true, "label": "Allow internet for 15 minutes" } } } }` — everything a single "Allow internet for 15 minutes" button needs.
+* Bus event `network.status` `{ offlineLock }` on every change. When Harness started `ollama serve` itself, allowing/blocking restarts it (with / without the sandbox) as part of that request only — never as a side effect of chatting; if `sandbox-exec` is missing or Ollama misbehaves under it, Harness silently runs it unsandboxed and reports `osEnforced: false`. When the launcher sandboxed the whole backend (`osScope: "backend"`), allowing needs a backend restart: listener mode reports `restartRequired: true`; bridge mode sends `restart-required` (and, in password mode, the user unlocks again).
+
+### 10.7 Bridge mode (native app)
+
+`node server/index.mjs --bridge` — see `docs/BRIDGE.md` for frames and control messages. The same routes answer;
+bridge requests skip the Host/Origin checks and sessions (no network is involved) but **not** the lock: while locked
+they get the same 423 answers. The lock screen, unlock and confirmations use the HTTP routes above through the
+bridge. `ready.locked`, the `locked`/`unlocked` events, `progress` (`what`: `"encrypting"` | `"decrypting"` |
+`"reencrypting"`), `restart-required` and `keychain-key` mirror 10.1–10.6.
+
+### 10.8 Model catalogue
+
+Browse without typing; search is one more filter. Two sources behind one route: **`ollama`** — the Ollama library
+(models Ollama itself packages, with its templates and capability flags: the dependable source; read from the
+ollama.com website pages, which have no API) and **`huggingface`** — GGUF repositories on Hugging Face (the wide
+source). A third, **`local`**, needs no network: installed models plus Harness's curated recommendations. Requests
+to the sites carry no token, cookie or identifying header (User-Agent `Harness/0.2 (model catalogue)`), are bounded
+in size and time, and are cached in memory only (5 min). Every field from these sites is untrusted text: shown to
+the user, never given to the model.
+
+`GET /api/catalog?source=local|ollama|huggingface&sort=trending|downloads|likes|updated&kind=chat|vision|embedding&fits=true&minParams=<n>&maxParams=<n>&publisher=<name>&q=<text>&cursor=<opaque>&limit=<1–50, default 24>`
+
+```json
+{ "source": "huggingface", "sort": "trending", "items": [ CatalogItem ], "nextCursor": "<opaque>" | null,
+  "sourceNote": null, "fetchedAt": "…", "cached": false }
+```
+
+CatalogItem:
+
+```json
+{ "source": "huggingface", "id": "unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF", "name": "NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF",
+  "publisher": "unsloth", "description": null, "kind": "vision", "capabilities": ["vision"],
+  "parameters": 7518069290, "architecture": "gemma4", "contextLength": 131072,
+  "downloads": 812345, "likes": 410, "trendingScore": 57, "updatedAt": "2026-11-02T10:11:12.000Z",
+  "gated": false, "license": "apache-2.0", "tags": ["conversational", "imatrix"],
+  "fit": { "fits": true, "sizeBytes": 4560000000, "numCtx": 16384, "basis": "parameters" | "tag_sizes" | "files", "note": "≈ 4.6 GB at 4-bit" } | null,
+  "installed": false, "recommended": true, "url": "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF" }
+```
+
+* `kind`: `chat` | `vision` | `embedding`. Hugging Face: only repositories Ollama can chat with or embed are listed (a chat/vision/embedding `pipeline_tag`, or none plus the `conversational` tag); video, speech and diffusion GGUF repositories are dropped. Ollama: from the capability chips (`vision`, `embedding`, `tools`, `thinking` → `capabilities`).
+* `fit` in the list is an estimate (Hugging Face: from the parameter count at ~4.8 bits per weight; Ollama: from the tag sizes when known); the detail view sizes every file. `fits=true` keeps what is estimated to fit this Mac.
+* `sort`: Hugging Face supports all four; the Ollama library supports `trending` (its "popular") and `updated` (its "newest") — other values → **400** `unsupported_sort`. `publisher`, `minParams`/`maxParams` are Hugging Face filters (ignored with `sourceNote` for Ollama). `q` works for both.
+* `nextCursor`: pass back as `cursor` for the next page (`null` at the end). The Ollama library has no paging (one page lists everything; Harness pages it itself).
+* `source=local` works with internet access blocked; `ollama` / `huggingface` → **403** `offline_lock` (`details.what: "model_catalog"`) while blocked, and work for exactly the allowed window.
+
+`GET /api/catalog/model?source=ollama|huggingface|local&id=<id>` → CatalogDetail:
+
+```json
+{ "source": "huggingface", "id": "unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF", "name": "…", "publisher": "unsloth",
+  "url": "https://huggingface.co/…", "description": "…" | null,
+  "license": { "id": "apache-2.0", "name": null, "link": null } | null, "gated": false,
+  "downloads": 812345, "likes": 410, "updatedAt": "…", "kind": "vision", "capabilities": ["vision"],
+  "parameters": 7518069290, "architecture": "gemma4", "contextLength": 131072, "baseModels": ["nvidia/…"], "tags": ["…"],
+  "card": { "format": "markdown", "text": "…", "truncated": false } | null,
+  "files": [ {
+      "tag": "UD-Q3_K_XL", "model": "hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL",
+      "files": [ { "path": "NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q3_K_XL.gguf", "size": 4219469824 } ],
+      "sizeBytes": 4219469824, "projectorBytes": 991952896, "downloadBytes": 5211422720,
+      "contextLength": null, "inputs": null,
+      "pullable": true | false | null,
+      "fit": { "fits": true, "numCtx": 16384, "limitedBy": "low_ram_cap", "estimatedTotalBytes": 4500000000, "explanation": "…", "basis": "text_only_copy" | "as_pulled" },
+      "textOnly": { "model": "nvidia-nemotron-3.5-bolt-e4b-text:ud-q3_k_xl", "sizeBytes": 4219469824, "recommended": true } | null,
+      "installed": false, "recommended": true } ],
+  "projectors": [ { "path": "mmproj-BF16.gguf", "size": 991952896 } ], "hasProjector": true,
+  "recommendedTag": "UD-Q3_K_XL" | null, "downloadable": true, "sourceNote": null, "notes": [ "…" ] }
+```
+
+* Hugging Face files: every `.gguf` that is not a projector (`mmproj*`), an importance matrix (`imatrix*`) or a drafter (`dflash*`); its tag is the file name's quantization suffix (multi-part `-00001-of-0000N` files summed and offered once); `pullable` = Ollama's registry knows exactly that tag (checked against `hf.co/v2/<id>/manifests/<tag>`; `null` when the check could not run); `latest` is never offered. Gated repositories: listed and described, `downloadable: false` (no one-click download).
+* Ollama files: one per tag from the library's tag list (`files: []`, `sizeBytes` from the listed size, `contextLength`, `inputs` like `["text","image"]`), `model` = `<name>:<tag>`; `latest` is offered only on machines above 8 GB, and only when no sized tag fits better.
+* `card`: Hugging Face — the README markdown without its YAML front matter (≤ 200 KB, `truncated`); Ollama — the README converted to markdown-ish text (`format: "text"`). Render it with the UI's sanitizer.
+* `recommendedTag`: the largest file that fits this Mac with a useful window (on ≤ 8 GB as a text-only copy when it ships a projector).
+* Download: the existing `POST /api/models/pull` `{ "model": files[i].model, "textOnlyCopy": true }` — new optional `textOnlyCopy` makes the text-only copy right after a successful pull; the pull's `done` event then carries `textOnlyCopy: { model, … }` (or `textOnlyCopyError`).
+* Errors: **404** `catalog_not_found` (an unknown or private repository — Hugging Face answers 401 for those), **502** `catalog_unavailable` (the site failed or changed: `details.source`), **403** `offline_lock`.
+
+### 10.9 System info and version
+
+* `GET /api/system` gains `security` (10.2) and `app.transport` (`"listener"` | `"bridge"`).
+* The version (`/api/health`, `/api/system`, the bridge `ready` event) comes from `package.json` `version` via `server/version.mjs`.
+* New bus events: `network.status` `{ offlineLock }`, `security.status` `{ state, mode }` (unlocked only; on lock the stream ends with a final `locked` event).
+* New settings: `security.idleLockMinutes` (0–1440, default 15). `tools.builtin.fetch_url` stays a setting but has no effect while internet access is blocked.
+
+### 10.10 What changes for existing UI code
+
+* Every page load now meets `GET /api/security` first: `needs_setup` → password setup (with the recovery-key step and, when `plainDataFound`, "your existing chats will be encrypted" + progress); `locked` or no session → lock screen; `unlocked` with a session → the app. Any **401** `auth_required` or **423** `locked`/`needs_setup` from any route → back to that screen.
+* Keychain/off modes: handle `#launch=<code>` on load (10.5).
+* Drafts and preferences move from browser storage to `GET/PUT/PATCH /api/ui-state`.
+* `GET /api/export` needs a password now → `POST /api/export`; restore needs `X-Harness-Confirm`.
+* Model downloads and the catalogue answer `offline_lock` by default → show the "Allow internet for 15 minutes" button (password prompt) from `error.details.allow`; show `offlineLock` in settings with "Block all internet access", the remaining window, and the self-test.
+* Test harnesses: `startServer({ security: { mode: "off", apiAuth: false }, offlineLock: false })` opts out explicitly (or `HARNESS_ENCRYPTION=off HARNESS_API_AUTH=0 HARNESS_OFFLINE_LOCK=0` for development stacks); with the defaults every UI test meets the setup screen first.

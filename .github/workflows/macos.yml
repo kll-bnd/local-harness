@@ -256,3 +256,72 @@ jobs:
           done
       - name: Probes
         run: node scripts/ci/mac-probe.mjs nemotron
+
+  native:
+    name: Native macOS app (WKWebView + bridge + offline lock)
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'native' }}
+    runs-on: macos-latest
+    timeout-minutes: 50
+    env:
+      FACTS: /tmp/native-facts.txt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Toolchain
+        run: |
+          touch "$FACTS"
+          { echo "toolchain| macOS $(sw_vers -productVersion) $(uname -m) $(sysctl -n machdep.cpu.brand_string)"
+            echo "toolchain| xcode-select: $(xcode-select -p)"
+            echo "toolchain| swiftc: $(swiftc --version 2>&1 | head -n 1)"
+            echo "toolchain| CLT swiftc: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools swiftc --version 2>&1 | head -n 1)"
+            echo "toolchain| CLT sdk: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools xcrun --show-sdk-path 2>&1)"
+            echo "toolchain| sandbox-exec: $(ls -l /usr/bin/sandbox-exec 2>&1)"
+          } | tee -a "$FACTS"
+      - name: Probe - build with the Command Line Tools only
+        continue-on-error: true
+        env:
+          DEVELOPER_DIR: /Library/Developer/CommandLineTools
+        run: native/probe/build-probes.sh
+      - name: Probe - build with Xcode if the Command Line Tools could not
+        run: test -x /tmp/probe/kcB || native/probe/build-probes.sh
+      - name: Probe - WKWebView custom scheme
+        continue-on-error: true
+        run: |
+          node native/ci/run.mjs 200 scheme -- /tmp/probe/SchemeProbe.app/Contents/MacOS/SchemeProbe --root "$PWD/native/probe" --out /tmp/probe/scheme.json > /dev/null
+          node native/ci/summarize-probe.mjs /tmp/probe/scheme.json
+      - name: Probe - Keychain
+        continue-on-error: true
+        run: |
+          { echo "keychain| default: $(security default-keychain 2>&1 | tr -d ' ')"
+            echo "keychain| list: $(security list-keychains -d user 2>&1 | tr -d ' ' | tr '\n' ' ')"
+            echo "keychain| info: $(security show-keychain-info 2>&1 | tr '\n' ' ')"
+          } | tee -a "$FACTS"
+          K=/tmp/probe
+          node native/ci/run.mjs 20 kc -- $K/kcA attrs
+          node native/ci/run.mjs 20 kc -- $K/kcA create
+          node native/ci/run.mjs 20 kc -- $K/kcA attrs
+          node native/ci/run.mjs 20 kc -- $K/kcA read-noui
+          node native/ci/run.mjs 20 kc -- $K/kcA read
+          node native/ci/run.mjs 20 kc -- $K/kcB attrs
+          node native/ci/run.mjs 20 kc -- $K/kcB read-noui
+          node native/ci/run.mjs 20 kc -- /usr/bin/security find-generic-password -s local.harness.probe -a data-key -w
+          node native/ci/run.mjs 20 kc -- $K/kcA create-dp
+          node native/ci/run.mjs 20 kc -- $K/kcA delete
+      - name: Probe - sandbox-exec and the offline-lock profile
+        continue-on-error: true
+        run: |
+          node native/ci/run.mjs 20 sb-parse-candidate -- /usr/bin/sandbox-exec -f server/security/offline-lock.sb /usr/bin/true
+          node native/ci/run.mjs 20 sb-parse-draft -- /usr/bin/sandbox-exec -f native/probe/offline-lock-draft.sb /usr/bin/true
+          node native/ci/run.mjs 60 net -- node native/ci/net-probe.mjs plain
+          HARNESS_SANDBOXED=1 node native/ci/run.mjs 60 net -- /usr/bin/sandbox-exec -f native/probe/offline-lock-draft.sb node native/ci/net-probe.mjs draft
+          HARNESS_SANDBOXED=1 node native/ci/run.mjs 60 net -- /usr/bin/sandbox-exec -f server/security/offline-lock.sb node native/ci/net-probe.mjs candidate
+      - name: Probe - a real Ollama under the offline lock
+        continue-on-error: true
+        run: |
+          brew install ollama > /dev/null 2>&1
+          KEEP=60 node native/ci/run.mjs 1500 ollama -- node native/ci/sandbox-ollama.mjs server/security/offline-lock.sb qwen3:0.6b > /dev/null
+      - name: Facts
+        if: always()
+        run: cat "$FACTS"

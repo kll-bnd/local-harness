@@ -79,9 +79,16 @@ reads a length above 1,048,581 treats the stream as corrupt and stops.
 - `{ "type": "locked" }` and `{ "type": "unlocked" }` whenever that state changes, so the app can enable
   or disable menu items, clear a Dock badge and stop holding off App Nap.
 - `{ "type": "progress", "what": "encrypting", "done": 12, "total": 340 }` during a one-off migration at
-  start-up, so the app can show something better than a frozen window.
+  start-up, so the app can show something better than a frozen window. `what` is `"encrypting"`,
+  `"decrypting"` or `"reencrypting"`; the same progress is in `GET /api/security` → `migration`.
+- `{ "type": "keychain-key", "dataKey": "<base64 of 32 bytes>" | null }` when the user switches to keychain
+  mode (store this value in the login Keychain, service `local.harness`, account `data-key`, and send it as
+  `hello.dataKey` from then on) or leaves it (`null`: delete the item). Sent only after the backend has
+  written `launch.json`.
 - `{ "type": "fatal", "code": "wrong_key" | "data_dir_locked" | "…", "message": "…", "url": null }` when the
-  backend cannot start; it exits non-zero right after. For `data_dir_locked`, `url` is the address of the
+  backend cannot start; it exits non-zero right after. Codes: `wrong_key` (keychain mode: the key in
+  `hello` does not open the data — the app should fall back to the password: start again with
+  `dataKey: null`), `data_dir_locked`, `bad_hello` (first frame missing or invalid), `startup_failed`. For `data_dir_locked`, `url` is the address of the
   instance that holds the lock when that instance has one.
 - `{ "type": "restart-required", "reason": "offline_lock" | "…" }`: the app should shut the backend down
   and start it again (re-reading `launch.json`, below), then reload the UI.
@@ -140,6 +147,14 @@ HARNESS_SANDBOXED=1 /usr/bin/sandbox-exec -f <repo>/server/security/offline-lock
 Children inherit the sandbox, so the Ollama server and the model runner that the backend starts are
 confined as well. The backend additionally refuses non-local destinations in its own code while the lock
 is on, which also covers launch modes that cannot use the sandbox.
+
+Without the launcher's sandbox, the backend confines only the `ollama serve` it starts itself (it runs it
+under `sandbox-exec` while internet access is blocked and restarts it when the user allows or blocks
+access). Recommended for the native app: do **not** sandbox the backend itself. Allowing internet access
+in a sandboxed backend needs a backend restart (`restart-required`), and in password mode that restart
+locks the data, so the user has to type the password again right after typing it to allow access. The
+backend reports what is enforced in `GET /api/security` → `offlineLock.osScope` (`"backend"`, `"ollama"`
+or `"none"`).
 
 To be confirmed on a real Mac by the native-app work (and recorded here once known): that
 `sandbox-exec` and this profile syntax work on current macOS; that a real Ollama under the sandbox still
