@@ -1000,6 +1000,7 @@ No session needed (it contains no user data). Also embedded in `GET /api/system`
 ```
 
 * `migration` while migrating: `{ "op": "encrypt" | "decrypt" | "reencrypt", "done": 12, "total": 340, "startedAt": "…", "error": null }`.
+* `plainDataFound`: in `needs_setup`, 0.1 data that setup will encrypt; in `locked` (from the start until the first unlock of the process), the folder holds plain owned files — off mode with a key store, or an encryption that was interrupted. A hint for the lock screen's wording only (an off-mode folder is not "encrypted on this Mac"); nothing decides anything from it. `false` in every other state.
 * `passwordSet`: a Harness password exists (always in password/keychain mode once set up; in off mode only when the user had one — then confirmations ask for it; `false` = off mode that never had a password, no confirmations).
 * `unlock.retryAfterMs`: wait before the next unlock attempt may be tried (10.3). `unlock.keychainError` (keychain mode, only when the Keychain did not open the data): `{ "code": "keychain_unavailable" | "wrong_key" | "keychain_not_enabled", "message": "…" }`.
 * `idleLockAt`: when Harness would lock if nothing else happens (password mode, unlocked, idle lock on, no user-started work running), else `null` — for a "locking soon" warning.

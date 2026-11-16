@@ -887,12 +887,16 @@ describe('plain files cannot lower protection (review 01, 05, 06)', () => {
         }
         v.lock();
         s = await stack({ dataDir, fake, mode: 'launch' });
+        const before = await sec(s);
+        assert.deepEqual([before.state, before.plainDataFound], ['locked', true], 'a half-encrypted folder: plain owned files (wording hint)');
         assert.equal((await s.unlock()).status, 200);
         const st = await sec(s);
         assert.deepEqual([st.migration, st.mode], [null, 'password']);
         // a 0.2.0 key store with encrypted data looks like one whose record was wiped everywhere: told once
         assert.deepEqual(st.tamper?.fields || null, legacy ? [MISSING_RECORD] : null);
         assert.ok((await s.call('GET', '/api/chats')).data.chats.some((x) => x.title === 'ENC-RESUME-MARKER'));
+        assert.equal((await s.call('POST', '/api/security/lock', {})).status, 200);
+        assert.deepEqual([(await sec(s)).state, (await sec(s)).plainDataFound], ['locked', false], 'converted: nothing plain any more');
         await s.close({ keep: true });
         assert.deepEqual(grepDir(dataDir, 'ENC-RESUME-MARKER'), [], `encrypted again (${legacy ? '0.2.0 key store' : 'record'})`);
         if (legacy) assert.ok(readJ(dataDir, 'vault.json').state, 'the record is written at the first unlock');
@@ -1184,6 +1188,29 @@ describe('key material is never lost; without an intact record only the most pro
       assert.equal(st.offlineLock.enabled, true, 'the owner\'s recorded choice is reset to the protective default…');
       assert.ok(st.tamper?.fields.includes(MISSING_RECORD), `…and the owner is told: ${JSON.stringify(st.tamper)}`);
       assert.ok(await hasMemory(s, 'WIPED-RECORD'));
+    } finally { await s.close(); }
+  });
+
+  test('plainDataFound while locked (wording only): true for off mode with a key store, false for an encrypted folder', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.call('POST', '/api/chats', { title: 'PLAIN-HINT' });
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      let st = await sec(s);
+      assert.deepEqual([st.state, st.mode, st.plainDataFound], ['locked', 'password', false], 'an ordinary encrypted folder');
+      await s.unlock();
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'off', password: PW })).status, 200);
+      await waitFor(async () => { const x = await sec(s); return x.state === 'unlocked' && x.mode === 'off'; }, { timeout: 15000 });
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      st = await sec(s);
+      assert.deepEqual([st.state, st.mode, st.plainDataFound], ['locked', 'password', true], 'off mode with a key store, before the unlock');
+      await s.unlock();
+      st = await sec(s);
+      assert.deepEqual([st.state, st.mode, st.plainDataFound], ['unlocked', 'off', false]);
     } finally { await s.close(); }
   });
 

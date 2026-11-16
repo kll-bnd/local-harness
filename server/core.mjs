@@ -160,6 +160,9 @@ export class Core extends EventEmitter {
       setDirCipher(this.dataDir, 'locked');
       return this;
     }
+    // A hint for the lock screen's wording only (an off-mode folder is not "encrypted on this Mac"): nothing decides
+    // anything from it. Cleared once the record has been settled at the first unlock.
+    this.plainDataFound = await hasPlainData(this.dataDir).catch(() => false);
     this.state = 'locked';
     setDirCipher(this.dataDir, 'locked');
     if (mode === 'keychain') {
@@ -194,7 +197,8 @@ export class Core extends EventEmitter {
       ...(this.state === 'error' ? { error: this.error } : {}),
       mode: this.mode,
       passwordSet: this.vault.hasPassword,
-      plainDataFound: this.state === 'needs_setup' ? this.plainDataFound : false,
+      // wording only (needs_setup: 0.1 data to encrypt; locked: plain owned files, e.g. off mode) — decides nothing
+      plainDataFound: this.state === 'needs_setup' || this.state === 'locked' ? this.plainDataFound : false,
       migration: this.migration ? { op: this.migration.op, done: this.migration.done, total: this.migration.total, startedAt: this.migration.startedAt, error: this.migration.error || null } : null,
       unlock: { failedAttempts: this.vault.meta?.throttle?.failures || 0, retryAfterMs: this.vault.exists ? this.vault.retryAfterMs() : 0, ...(this.keychainError ? { keychainError: this.keychainError } : {}) },
       recoveryKey: rk ? { createdAt: rk.createdAt } : null,
@@ -614,6 +618,7 @@ export class Core extends EventEmitter {
     this.auth.syncTokenFile({ fresh: !this._tokenIssued });
     this._tokenIssued = true;
     this.migration = null;
+    this.plainDataFound = false; // a lock later in this process only follows a finished conversion (or none is possible)
     // the blocker is off by the owner's choice: an Ollama started while locked (sandboxed) leaves the sandbox
     if (!this.network.blocked && this.ollamaProcess.sandboxed) this.ollamaProcess.applySandbox().catch((e) => log.warn(`Restarting Ollama outside the sandbox: ${e.message}`));
     return rec;
