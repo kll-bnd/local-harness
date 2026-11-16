@@ -237,6 +237,8 @@ describe('image generation (16 GB machine)', () => {
 });
 
 describe('image generation on an 8 GB Mac: RAM coordination', () => {
+  // the automatic default on 8 GB: the installed model that fits (the 7.9 GB official Nemotron does not)
+  const CHAT8 = 'qwen3:4b';
   let h;
   let f;
   before(async () => {
@@ -249,19 +251,19 @@ describe('image generation on an 8 GB Mac: RAM coordination', () => {
     const chat = await newChat(h.c);
     await send(h.c, chat, 'warm up the model please');
     await h.app.background.idle();
-    assert.ok(h.fake.loaded.has('nemotron-3.5-bolt:e4b'));
+    assert.ok(h.fake.loaded.has(CHAT8));
     const r = await h.c.sse('/api/images/generate', { providerId: 'dt', prompt: 'a small cottage', chatId: chat });
     const phases = byType(r.events, 'image_status').map((s) => s.phase);
     assert.deepEqual(phases.slice(0, 4), ['starting', 'unloading', 'unloaded', 'generating']);
     const unloading = byType(r.events, 'image_status').find((s) => s.phase === 'unloading');
-    assert.deepEqual(unloading.models, ['nemotron-3.5-bolt:e4b']);
+    assert.deepEqual(unloading.models, [CHAT8]);
     assert.equal(unloading.reason, 'low_ram');
-    assert.ok(h.fake.unloads.includes('nemotron-3.5-bolt:e4b'));
+    assert.ok(h.fake.unloads.includes(CHAT8));
     const done = byType(r.events, 'done')[0];
     assert.equal(done.job.params.width, 512);
     assert.equal(byType(r.events, 'image_done')[0].reload, 'lazy');
     assert.equal(h.app.modelState.unloadedForImage, true);
-    assert.equal(h.fake.loaded.has('nemotron-3.5-bolt:e4b'), false, 'not eagerly reloaded');
+    assert.equal(h.fake.loaded.has(CHAT8), false, 'not eagerly reloaded');
 
     // Background LLM work is held while the chat model is unloaded for an image job.
     let ran = false;
@@ -285,7 +287,7 @@ describe('image generation on an 8 GB Mac: RAM coordination', () => {
     const r = await send(h.c, chat, 'draw a tiny robot');
     const types = r.events.map((e) => e.type);
     assert.ok(byType(r.events, 'image_status').some((s) => s.phase === 'unloading'));
-    assert.ok(h.fake.unloads.includes('nemotron-3.5-bolt:e4b'));
+    assert.ok(h.fake.unloads.includes(CHAT8));
     const iLoad = types.indexOf('model_status');
     assert.ok(iLoad > types.indexOf('tool_result'), 'reload announced after the tool result, before the final answer');
     assert.match(byType(r.events, 'done')[0].message.content, /Tool generate_image returned/);

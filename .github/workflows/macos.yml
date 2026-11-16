@@ -94,16 +94,6 @@ jobs:
         run: npm run test:e2e
       - name: Build Harness.app and the disk image
         run: npm run dist
-      - name: Inspect the build
-        run: |
-          set -x
-          ls -la dist
-          du -sh dist/mac-arm64/Harness.app dist/*.dmg
-          file dist/mac-arm64/Harness.app/Contents/MacOS/Harness
-          codesign -dv --verbose=2 dist/mac-arm64/Harness.app 2>&1 | head -n 20
-          codesign --verify --deep --strict dist/mac-arm64/Harness.app && echo "signature verifies"
-          spctl --assess --type execute --verbose dist/mac-arm64/Harness.app || echo "spctl: not accepted (expected for an ad-hoc signature; a locally built app is not quarantined)"
-          plutil -p dist/mac-arm64/Harness.app/Contents/Info.plist | grep -E 'CFBundle(Name|Identifier|ShortVersionString|IconFile)|LSMinimumSystemVersion|LSApplicationCategoryType'
       - name: Desktop end-to-end, packaged app
         run: HARNESS_E2E_APP="$PWD/dist/mac-arm64/Harness.app/Contents/MacOS/Harness" npm run test:e2e
       - name: UI tests in WebKit (Safari engine)
@@ -117,6 +107,19 @@ jobs:
           name: Harness-mac-arm64
           path: dist/*.dmg
           retention-days: 7
+      - name: Inspect the build
+        run: |
+          set -euo pipefail
+          APP=dist/mac-arm64/Harness.app
+          du -sh "$APP" dist/*.dmg
+          file "$APP/Contents/MacOS/Harness"
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -E 'Identifier|Format|Signature|TeamIdentifier|flags|Authority' || true
+          codesign --verify --deep --strict "$APP"
+          echo "signature verifies (deep, strict)"
+          spctl --assess --type execute --verbose "$APP" 2>&1 || echo "spctl does not accept it (expected for an ad-hoc signature; a locally built app is not quarantined)"
+          xattr -l "$APP" | head -n 5 || true
+          plutil -p "$APP/Contents/Info.plist" | grep -E 'CFBundle(Name|Identifier|ShortVersionString|IconFile)|LSMinimumSystemVersion'
+          npx asar list "$APP/Contents/Resources/app.asar" | awk -F/ 'NF>1 {print $2}' | sort | uniq -c
 
   live:
     name: Live check against a real Ollama

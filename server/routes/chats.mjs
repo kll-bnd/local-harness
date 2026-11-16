@@ -387,7 +387,8 @@ export function registerChatRoutes(r, app) {
 
   r.post('/api/chats/:id/title', async ({ params }) => {
     const chat = app.chats.get(params.id);
-    if (chat.titleSource === 'user') chat.titleSource = 'provisional';
+    // An explicit "regenerate title" request also replaces a user-set or imported title.
+    if (chat.titleSource === 'user' || chat.titleSource === 'import') chat.titleSource = 'provisional';
     const title = await generateTitle(app, chat);
     return { title: title || chat.title, chat: chatSummary(chat) };
   });

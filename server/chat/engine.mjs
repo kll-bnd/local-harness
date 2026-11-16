@@ -342,14 +342,33 @@ export class ChatEngine {
     const totals = { promptTokens: 0, completionTokens: 0, evalMs: 0, promptMs: 0, loadMs: 0, iterations: 0, toolCalls: 0 };
     let finalReason = 'stop';
     let lastUsage = null;
+    // Stats, finish reason and tool clean-up of a finished (or aborted) turn — before finishUp persists it.
+    const finalizeTurn = () => {
+      if (!asst) return;
+      for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'aborted'; m.content ||= 'Aborted'; } }
+      asst.updatedAt = nowIso();
+      asst.usage = lastUsage;
+      asst.stats = {
+        durationMs: Date.now() - t0,
+        iterations: totals.iterations,
+        toolCalls: totals.toolCalls,
+        promptTokens: totals.promptTokens,
+        completionTokens: totals.completionTokens,
+        tokensPerSecond: totals.evalMs ? Math.round((totals.completionTokens / totals.evalMs) * 10000) / 10 : null,
+        loadMs: totals.loadMs,
+      };
+      if (finalReason !== 'stop') asst.finishReason = finalReason;
+      if (lastUsage?.promptTokens && asst.context) asst.context.actual = { promptTokens: lastUsage.promptTokens, completionTokens: lastUsage.completionTokens, used: lastUsage.promptTokens + (lastUsage.completionTokens || 0) };
+    };
+    let savedP = null;
     const finishUp = () => {
       lease?.release();
       lease = null;
       signal?.removeEventListener('abort', onAbort);
       this.release(chat.id, rec);
-      if (!started) return;
+      if (!started || savedP) return;
       this.app.chats.touch(chat);
-      this.app.chats.saveNow(chat).catch(() => {});
+      savedP = this.app.chats.saveNow(chat).catch(() => {});
       this.app.bus.publish('generation.finished', { chatId: chat.id, generationId });
     };
     let target = null;
@@ -435,7 +454,20 @@ export class ChatEngine {
       let think = resolveThink(s, t.info, t.provider);
       // Will this request (re)load the model? Then take a memory-pressure snapshot first (bounded, ~10 ms on macOS)
       // so swap/compressor growth caused by the load can be seen afterwards.
-      const loadExpected = t.provider.kind === 'ollama' && (this.loadedCtx.get(`${t.provider.id}/${t.model}`) !== t.plan.numCtx || this.app.modelState.unloadedForImage);
+      const ctxKey = `${t.provider.id}/${t.model}`;
+      let loadReason = null;
+      if (t.provider.kind === 'ollama') {
+        const known = this.loadedCtx.get(ctxKey);
+        if (this.app.modelState.unloadedForImage) loadReason = 'reload_after_image';
+        else if (known === undefined) {
+          // Not sent by this process yet (e.g. after a restart): ask Ollama what is loaded (bounded).
+          const ps = await Promise.race([t.provider.ps().catch(() => null), new Promise((r) => setTimeout(r, 300, null))]);
+          const e = ps?.find((m) => m.model === t.model || m.name === t.model || m.model === `${t.model}:latest`);
+          if (!e) loadReason = 'not_loaded';
+          else if (Number.isFinite(e.contextLength) && e.contextLength !== t.plan.numCtx) loadReason = 'context_change';
+        } else if (known !== t.plan.numCtx) loadReason = 'context_change';
+      }
+      const loadExpected = !!loadReason;
       const probe = this.app.memoryProbe;
       const baselineP = loadExpected && probe && s.context?.useMeasurements !== false
         ? Promise.race([probe.pressure().catch(() => null), new Promise((r) => setTimeout(r, 300, null))])
@@ -457,7 +489,16 @@ export class ChatEngine {
       for (;;) {
         const offerTools = tools.length && iteration < maxIter ? tools : undefined;
         if (this.app.modelState.unloadedForImage) emit('model_status', { phase: 'loading', models: this.app.modelState.models, reason: 'reload_after_image', message: 'Reloading the chat model…' });
-        const r = await this.streamOnce({ t, messages: asm.messages, tools: offerTools, options, think, signal: sig, asst, emit });
+        // Honest progress: "loading the model" (first request after an unload / a context change) vs "reading the
+        // prompt" (no output yet). Ollama sends nothing until the first token; its final chunk reports load_duration.
+        const announceLoad = iteration === 0 && loadExpected && loadReason !== 'reload_after_image';
+        if (announceLoad) emit('model_status', { phase: 'loading', reason: loadReason, model: t.model, numCtx: t.plan.numCtx, message: loadReason === 'context_change' ? `Reloading ${t.model} with a ${formatTokensK(t.plan.numCtx)} context…` : `Loading ${t.model}…` });
+        const prog = waitProgress(emit, { loading: announceLoad, promptTokens: asm.usage?.used ?? null });
+        let r;
+        try {
+          r = await this.streamOnce({ t, messages: asm.messages, tools: offerTools, options, think, signal: sig, asst, emit, onFirst: prog.first });
+        } finally { prog.stop(); }
+        if (announceLoad && r.usage?.loadMs != null) emit('model_status', { phase: 'loaded', model: t.model, loadMs: r.usage.loadMs });
         think = r.think;
         if (r.toolsRejected) { tools = []; toolDefs = []; this.app.registry.toolsRejected.add(`${t.provider.id}|${t.model}`); }
         totals.iterations++;
@@ -544,6 +585,7 @@ export class ChatEngine {
         break;
       }
       asst.status = 'complete';
+      finalizeTurn();
     } catch (e) {
       if (!started) {
         finishUp();
@@ -552,6 +594,7 @@ export class ChatEngine {
       if (sig.aborted || isAbortError(e)) {
         finalReason = 'aborted';
         if (asst) asst.status = 'aborted';
+        finalizeTurn();
       } else {
         if (e.code === 'model_load_failed' && target && !e.nextSteps) {
           this.app.loadFailures?.record(target.provider.id, target.model, { message: e.message });
@@ -562,43 +605,28 @@ export class ChatEngine {
         // Close any tool messages left running.
         for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'error'; m.content ||= `Error: ${e.message}`; m.isError = true; } }
         finishUp();
+        await savedP;
         emit('error', { code: e.code || 'internal_error', message: e.message, messageId: asst?.id || null, generationId, ...(e.nextSteps ? { nextSteps: e.nextSteps } : {}) });
         return asst;
       }
     } finally {
-      // Every exit path releases the chat, the RAM lease and the foreground count (idempotent).
+      // Every exit path releases the chat, the RAM lease and the foreground count (idempotent) — before `done`,
+      // so `done` really means "you can send again"; finishUp also persists the turn.
       finishUp();
-    }
-    {
-      for (const id of created) { const m = chat.messages[id]; if (m?.role === 'tool' && m.status === 'running') { m.status = 'aborted'; m.content ||= 'Aborted'; } }
-      const durationMs = Date.now() - t0;
-      asst.updatedAt = nowIso();
-      asst.usage = lastUsage;
-      asst.stats = {
-        durationMs,
-        iterations: totals.iterations,
-        toolCalls: totals.toolCalls,
-        promptTokens: totals.promptTokens,
-        completionTokens: totals.completionTokens,
-        tokensPerSecond: totals.evalMs ? Math.round((totals.completionTokens / totals.evalMs) * 10000) / 10 : null,
-        loadMs: totals.loadMs,
-      };
-      if (finalReason !== 'stop') asst.finishReason = finalReason;
-      if (lastUsage?.promptTokens && asst.context) asst.context.actual = { promptTokens: lastUsage.promptTokens, completionTokens: lastUsage.completionTokens, used: lastUsage.promptTokens + (lastUsage.completionTokens || 0) };
-      this.app.chats.markDirty(chat);
     }
     if (measureP) {
       let timer;
       await Promise.race([measureP, new Promise((r) => { timer = setTimeout(r, 1500); timer.unref?.(); })]);
       clearTimeout(timer);
     }
+    await savedP; // the turn is on disk before `done`
     emit('done', { generationId, reason: finalReason, message: publicMessage(asst), createdMessageIds: created, chat: chatSummary(chat), context: asst.context || null, stats: asst.stats });
     if (finalReason !== 'aborted') this.afterTurn(chat);
     return asst;
   }
 
   /** One model call with streaming; retries once without tools / think when the backend rejects them. */
-  async streamOnce({ t, messages, tools, options, think, signal, asst, emit }) {
+  async streamOnce({ t, messages, tools, options, think, signal, asst, emit, onFirst = null }) {
     let useTools = tools;
     let useThink = think;
     let toolsRejected = false;
@@ -619,6 +647,7 @@ export class ChatEngine {
         for await (const ev of t.provider.chat({ model: t.model, messages, tools: useTools, options, keepAlive: t.s.keepAlive, think: useThink, signal })) {
           if (first) {
             first = false;
+            onFirst?.();
             if (this.app.modelState.unloadedForImage) { this.app.modelState.markReloaded(); emit('model_status', { phase: 'ready' }); }
           }
           if (ev.type === 'thinking') onPart('reasoning', ev.text);
@@ -652,7 +681,8 @@ export class ChatEngine {
   afterTurn(chat) {
     const s = this.effectiveSettings(chat);
     const bg = this.app.background;
-    if (s.titles?.auto !== false && chat.titleSource !== 'user' && chat.titleSource !== 'auto') {
+    // Auto-title only untitled / provisionally titled chats: never once titled (auto), renamed (user) or imported.
+    if (s.titles?.auto !== false && (!chat.titleSource || chat.titleSource === 'provisional')) {
       bg.schedule(`title:${chat.id}`, ({ signal } = {}) => generateTitle(this.app, chat, { signal }).catch((e) => { if (signal?.aborted) throw e; log.debug('title failed', e.message); }), { priority: 1, label: 'title' });
     }
     if (!chat.incognito && s.memory?.enabled !== false && s.memory?.autoExtract !== false) {
@@ -678,6 +708,39 @@ export class ChatEngine {
     this.app.chats.touch(chat);
     return m;
   }
+}
+
+/**
+ * model_status progress while waiting for the first output of a backend call: `evaluating` (reading the prompt)
+ * after 1.5 s and then every 5 s with the elapsed time; `ready` once output starts (only if something was shown).
+ * While a load was announced, the wait is reported as `loading` with the elapsed time instead.
+ */
+export const WAIT_PROGRESS = { firstMs: 1500, everyMs: 5000 };
+function waitProgress(emit, { loading, promptTokens }) {
+  const t0 = Date.now();
+  let shown = false;
+  let done = false;
+  let timer = null;
+  const tick = () => {
+    if (done) return;
+    shown = true;
+    const elapsedMs = Date.now() - t0;
+    if (loading) emit('model_status', { phase: 'loading', elapsedMs, message: `Loading the model… ${Math.round(elapsedMs / 1000)} s` });
+    else emit('model_status', { phase: 'evaluating', elapsedMs, promptTokens, message: `Reading the prompt${promptTokens ? ` (~${promptTokens} tokens)` : ''}… ${Math.round(elapsedMs / 1000)} s` });
+    timer = setTimeout(tick, WAIT_PROGRESS.everyMs);
+    timer.unref?.();
+  };
+  timer = setTimeout(tick, WAIT_PROGRESS.firstMs);
+  timer.unref?.();
+  return {
+    first: () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (shown || loading) emit('model_status', { phase: 'ready', reason: loading ? 'loaded' : 'prompt_read', elapsedMs: Date.now() - t0 });
+    },
+    stop: () => { done = true; clearTimeout(timer); },
+  };
 }
 
 function imageAnswerText(pics) {

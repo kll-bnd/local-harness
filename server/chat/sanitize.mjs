@@ -16,7 +16,8 @@ const CHAT_VERSION = 1;
 const ROLES = new Set(['user', 'assistant', 'tool']);
 const STATUSES = new Set(['complete', 'aborted', 'error', 'running']);
 const KINDS = new Set(['image_request', 'image_result']);
-const TITLE_SOURCES = new Set(['auto', 'user', 'provisional']);
+// 'import': the title came with an imported chat — like 'user', it is never replaced by auto-titling.
+const TITLE_SOURCES = new Set(['auto', 'user', 'provisional', 'import']);
 const MAX_CONTENT = 5 * 1024 * 1024;
 const MAX_MESSAGES = 50000;
 
@@ -153,6 +154,13 @@ function cleanMessage(raw, fallbackDate) {
  * @param {{attachments?: Map, images?: Map}} [o.refs] old → new ids for referenced files
  * @returns {{ chat: object, report: { droppedMessages: number, reparented: number, changedIds: number } } | null}
  */
+/** An imported chat that brings its own title keeps it ('import'); only untitled / provisional ones get auto-titled. */
+function titleSourceOf(raw, imported) {
+  const src = TITLE_SOURCES.has(raw.titleSource) ? raw.titleSource : null;
+  if (!imported || src === 'user' || src === 'auto' || src === 'import' || src === 'provisional') return src;
+  return typeof raw.title === 'string' && raw.title.trim() ? 'import' : null;
+}
+
 export function sanitizeChat(raw, { mintIds = false, exists = () => false, refs = {} } = {}) {
   if (!isPlainObject(raw) || !isPlainObject(raw.messages)) return null;
   const report = { droppedMessages: 0, reparented: 0, changedIds: 0 };
@@ -221,7 +229,7 @@ export function sanitizeChat(raw, { mintIds = false, exists = () => false, refs 
     version: CHAT_VERSION,
     id: chatId,
     title: (typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : 'Imported chat').slice(0, 200),
-    titleSource: TITLE_SOURCES.has(raw.titleSource) ? raw.titleSource : null,
+    titleSource: titleSourceOf(raw, mintIds),
     createdAt: isoDate(raw.createdAt, now),
     updatedAt: isoDate(raw.updatedAt, now),
     pinned: raw.pinned === true,

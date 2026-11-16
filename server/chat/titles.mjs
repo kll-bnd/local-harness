@@ -19,7 +19,7 @@ export function cleanTitle(raw) {
 }
 
 export async function generateTitle(app, chat, { signal } = {}) {
-  if (chat.titleSource === 'user') return null;
+  if (chat.titleSource === 'user' || chat.titleSource === 'import') return null;
   const path = activePath(chat);
   const u = path.find((m) => m.role === 'user' && m.content?.trim());
   if (!u) return null;
@@ -34,7 +34,7 @@ export async function generateTitle(app, chat, { signal } = {}) {
     signal,
   });
   const title = cleanTitle(out);
-  if (!title || chat.titleSource === 'user' || !app.chats.has(chat.id)) return null;
+  if (!title || chat.titleSource === 'user' || chat.titleSource === 'import' || !app.chats.has(chat.id)) return null;
   chat.title = title;
   chat.titleSource = 'auto';
   app.chats.markDirty(chat);

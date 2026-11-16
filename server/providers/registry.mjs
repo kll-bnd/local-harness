@@ -3,8 +3,8 @@
 import { OllamaProvider } from './ollama.mjs';
 import { OpenAICompatProvider } from './openai.mjs';
 import { normalizeOllamaShow, normalizeOpenAIModel } from './model-info.mjs';
-import { RECOMMENDED_MODELS, EMBEDDING_NAME_RE, smallerVariantFor } from './catalog.mjs';
-import { computeContextPlan } from '../context/sizing.mjs';
+import { RECOMMENDED_MODELS, EMBEDDING_NAME_RE, smallerVariantFor, textOnlyName, avoidedTag } from './catalog.mjs';
+import { computeContextPlan, ramTier } from '../context/sizing.mjs';
 import { defaultOllamaUrl } from '../store/settings.mjs';
 import { HttpError, ProviderError } from '../lib/errors.mjs';
 
@@ -162,19 +162,47 @@ export class ProviderRegistry {
     return { provider, model: ref.model, providerId };
   }
 
+  /**
+   * The automatic default chat model: the installed model that best fits this machine. Candidates in order: the
+   * recommended catalog (on ≤ 8 GB a text-only copy before its multimodal original), then other installed models
+   * (newest first), tags that must never be suggested last. The first whose context plan fits the safe budget wins;
+   * when nothing fits, the first candidate is used (its plan then carries the "exceeds budget" warning).
+   */
   async defaultChatModel() {
     const s = this.settings;
     if (s.defaultModel?.model) return s.defaultModel;
     const list = (await this.listModels()).filter((m) => !m.embedding);
     if (!list.length) return null;
+    const key = JSON.stringify([list.map((m) => `${m.providerId}|${m.model}|${m.digest}`), s.context, this.ollamaProcess?.managed || false]);
+    if (this._defaultCache?.key === key && Date.now() - this._defaultCache.at < 5000) return this._defaultCache.value;
+    const lowRam = ramTier(this.system?.totalMem || 0) === 'low';
+    const ordered = [];
+    const add = (m) => { if (m && !ordered.includes(m)) ordered.push(m); };
+    const exact = (name) => list.find((m) => m.model === name || m.name === name);
     for (const rec of RECOMMENDED_MODELS) {
       for (const v of rec.variants) {
-        const hit = list.find((m) => m.model === v.model || m.model.startsWith(v.model.split(':')[0] + ':'));
-        if (hit) return { providerId: hit.providerId, model: hit.model };
+        const copy = rec.textOnly?.supported ? exact(textOnlyName(v.model)) : null;
+        const orig = exact(v.model) || (v.model.includes(':') ? null : exact(`${v.model}:latest`));
+        if (lowRam) { add(copy); add(orig); } else { add(orig); add(copy); }
       }
     }
-    const sorted = [...list].sort((a, b) => String(b.modifiedAt || '').localeCompare(String(a.modifiedAt || '')));
-    return { providerId: sorted[0].providerId, model: sorted[0].model };
+    const rest = list.filter((m) => !ordered.includes(m)).sort((a, b) => String(b.modifiedAt || '').localeCompare(String(a.modifiedAt || '')));
+    for (const m of rest) if (!avoidedTag(m.model)) add(m);
+    for (const m of rest) add(m);
+    let pick = null;
+    for (const m of ordered.slice(0, 12)) {
+      const provider = this.get(m.providerId);
+      if (!provider) continue;
+      try {
+        const plan = await this.contextPlan(provider, m.model, s);
+        const fits = plan.fits !== false && !(plan.warnings || []).some((w) => ['model_exceeds_budget', 'model_too_big'].includes(w.code));
+        if (fits) { pick = m; break; }
+      } catch { /* metadata unavailable: try the next one */ }
+    }
+    pick ||= ordered[0];
+    const value = { providerId: pick.providerId, model: pick.model };
+    this._defaultCache = { key, at: Date.now(), value };
+    return value;
   }
 
   /** Normalized ModelInfo (cached by provider/model/digest). */

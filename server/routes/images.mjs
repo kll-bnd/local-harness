@@ -167,12 +167,23 @@ export async function runImageTurn({ app, req, res, chat, reservation, ireq, pro
       am.imageJobId = job.id;
       am.updatedAt = nowIso();
     }
+    // Release the chat and persist the turn BEFORE `done`: after `done` the client may send again immediately.
+    if (chat) {
+      if (reservation) app.engine.release(chat.id, reservation);
+      app.chats.touch(chat);
+      await app.chats.saveNow(chat).catch(() => {});
+    }
     const payload = { job, images: images.map(publicImage), ...(am ? { message: publicMessage(am), userMessage: publicMessage(um), chat: chatSummary(chat) } : {}) };
     if (chatStyle) Object.assign(payload, { generationId: reservation?.generationId || null, reason: 'stop', createdMessageIds: [am.id] });
     if (sse) sse.send('done', payload); else sendJson(res, 200, payload);
   } catch (e) {
     const aborted = controller.signal.aborted || e.name === 'AbortError';
     if (am) { am.status = aborted ? 'aborted' : 'error'; am.error = aborted ? null : e.message; am.updatedAt = nowIso(); }
+    if (chat) {
+      if (reservation) app.engine.release(chat.id, reservation);
+      app.chats.touch(chat);
+      await app.chats.saveNow(chat).catch(() => {});
+    }
     if (sse) sse.send('error', { code: aborted ? 'aborted' : e.code || 'image_error', message: e.message, ...(am ? { messageId: am.id } : {}) });
     else if (!res.headersSent) throw e;
   } finally {

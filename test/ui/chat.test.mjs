@@ -193,7 +193,10 @@ test('desktop shell: every native menu action is handled; traffic-light zone is 
     // Traffic lights: ≥ 80px left padding in the sidebar's title bar, drag region on the bar.
     const pad = await page.locator('.side-titlebar').evaluate((el) => parseFloat(getComputedStyle(el).paddingLeft));
     assert.ok(pad >= 80, `expected >= 80px, got ${pad}`);
-    assert.equal(await page.locator('.side-titlebar').evaluate((el) => getComputedStyle(el).getPropertyValue('-webkit-app-region') || getComputedStyle(el).webkitAppRegion), 'drag');
+    // -webkit-app-region only exists in Chromium (Electron); other engines drop the declaration.
+    if ((process.env.HARNESS_UI_BROWSER || 'chromium') === 'chromium') {
+      assert.equal(await page.locator('.side-titlebar').evaluate((el) => getComputedStyle(el).getPropertyValue('-webkit-app-region') || getComputedStyle(el).webkitAppRegion), 'drag');
+    }
     await send(page, 'hello from the desktop');
     await menu('open-settings'); await page.waitForSelector('.settings-view');
     await menu('open-models'); await page.waitForFunction(() => location.hash === '#/models');

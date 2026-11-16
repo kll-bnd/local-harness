@@ -71,7 +71,7 @@ export function importPayload(body, { exists, refs = {} } = {}) {
       messages[id] = { id, parentId: parent, role: raw.role, content, createdAt: new Date((t += 1000)).toISOString(), status: 'complete' };
       parent = id;
     });
-    raws.push({ title: typeof body.title === 'string' ? body.title : 'Imported chat', messages, activeLeafId: parent });
+    raws.push({ title: typeof body.title === 'string' ? body.title : null, messages, activeLeafId: parent }); // no title → placeholder + auto-title
   } else throw badRequest('Unsupported import format: expected {format:"harness.chat"}, {format:"harness.backup"} or {messages:[...]}');
   const chats = [];
   const maps = [];
