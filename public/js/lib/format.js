@@ -150,9 +150,9 @@ export function modelShort(id, max = 30) {
     // Tag too long to keep (e.g. "UD-Q3_K_XL text-only"): keep the family name and the text-only marker.
     const marker = /text-only/.test(tag) ? ' · text-only' : '';
     const r2 = max - marker.length;
-    return `${n0.length > r2 ? `${n0.slice(0, r2 - 1).trimEnd()}…` : n0}${marker}`;
+    return `${n0.length > r2 ? `${n0.slice(0, r2 - 1).replace(/[\s.,·-]+$/, '')}…` : n0}${marker}`;
   }
-  const n = n0.length > room ? `${n0.slice(0, room - 1).trimEnd()}…` : n0;
+  const n = n0.length > room ? `${n0.slice(0, room - 1).replace(/[\s.,·-]+$/, '')}…` : n0;
   return tag ? `${n} · ${tag}` : n;
 }
 

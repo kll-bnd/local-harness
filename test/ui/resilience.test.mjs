@@ -67,3 +67,20 @@ test('busy: a chat already generating elsewhere answers 409 → "still replying"
     await other;
   } finally { await app.close(); await stack.close(); }
 });
+
+test('slow start: "Loading …" / "Reading the conversation…" come from the server\'s model_status with elapsed time', async () => {
+  const stack = await startStack({ delayMs: 1800 });
+  const app = await openApp(stack);
+  try {
+    const { page } = app;
+    await page.evaluate(() => {
+      window.__seen = new Set();
+      new MutationObserver(() => document.querySelectorAll('.status-line, .status-hint').forEach((e) => window.__seen.add(e.textContent))).observe(document.body, { subtree: true, childList: true, characterData: true });
+    });
+    await send(page, 'hi', { wait: false });
+    await page.waitForFunction(() => /You said: hi/.test(document.querySelector('.msg-assistant .prose')?.textContent || ''), null, { timeout: 30000 });
+    const seen = (await page.evaluate(() => [...window.__seen])).join('\n');
+    assert.match(seen, /(Loading .+|Reading the conversation.*)… \d+ s/, `saw: ${seen}`);
+    assert.doesNotMatch(seen, /nemotron-3\.5-bolt:e4b/, 'friendly names, not raw ids');
+  } finally { await app.close(); await stack.close(); }
+});

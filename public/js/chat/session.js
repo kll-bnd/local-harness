@@ -233,7 +233,7 @@ export function describeLive(model) {
   // Fallback for servers that don't send model_status: infer from what /api/system says is loaded.
   if (l.seenModelStatus) return { label: s >= 2 ? `Waiting for the model… ${s} s` : 'Waiting for the model…', phase: 'waiting' };
   const loaded = !ref || (store.get('system')?.loadedModels || []).some((x) => x.model === ref.model);
-  if (!loaded) return { label: `Loading ${modelShort(ref.model, 28)}… ${s} s`, phase: 'loading', hint: s >= 5 ? `The first reply after loading takes 20–60 s on ${mac}. This is normal.` : null };
+  if (!loaded) return { label: `Loading ${modelShort(ref.model, 32)}… ${s} s`, phase: 'loading', hint: s >= 5 ? `The first reply after loading takes 20–60 s on ${mac}. This is normal.` : null };
   if (s >= 2) return { label: `Reading the conversation… ${s} s`, phase: 'prompt', hint: s >= 8 ? `Long conversations take a while to read on ${mac}; the reply starts as soon as it's done.` : null };
   return { label: 'Waiting for the model…', phase: 'waiting' };
 }
