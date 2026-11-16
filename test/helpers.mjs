@@ -88,7 +88,9 @@ export async function setup({ settings = {}, system, fakeOptions = {}, dataDir, 
   const fake = await startFakeOllama({ port: 0, ...fakeOptions });
   // Always a fake memory probe (deterministic on any OS; never the developer's real Ollama processes).
   const memoryProbe = probe === null ? null : probe || createFakeMemoryProbe(fake);
-  system = { ...(system || {}), memoryProbe };
+  // A fixed 16 GB machine unless the test says otherwise: results must not depend on the RAM of
+  // whatever computer runs the suite (which model fits, and so which becomes the default, does).
+  system = { totalMem: 16 * GiB, ...(system || {}), memoryProbe };
   dataDir ||= await tmpDir();
   const base = {
     providers: { builtin: { ollama: { baseUrl: fake.url } } },
