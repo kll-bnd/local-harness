@@ -4,8 +4,9 @@
 //
 //   node scripts/ci/mac-probe.mjs api        # API behaviours Harness relies on (tiny models)
 //   node scripts/ci/mac-probe.mjs nemotron   # the real Nemotron 3.5 Bolt E4B: load, memory, tools
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
@@ -20,22 +21,28 @@ const out = (label, v, n) => console.log(`${label}: ${typeof v === 'string' ? cl
 const head = (t) => console.log(`\n## ${t}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function api(p, body, { method, timeoutMs = 900000 } = {}) {
+function api(p, body, { method, timeoutMs = 1500000, base = O } = {}) {
+  // node:http rather than fetch: fetch gives up after 300 s without response headers, and Ollama
+  // sends none until the first token.
   const t0 = Date.now();
-  try {
-    const res = await fetch(O + p, {
-      method: method || (body === undefined ? 'GET' : 'POST'),
-      headers: body === undefined ? {} : { 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+  const u = new URL(base + p);
+  return new Promise((resolve) => {
+    const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method: method || (data ? 'POST' : 'GET'), headers: data ? { 'content-type': 'application/json', 'content-length': data.length } : {} }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* NDJSON or plain text */ }
+        resolve({ status: res.statusCode, json, text, ms: Date.now() - t0 });
+      });
     });
-    const text = await res.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch { /* NDJSON or plain text */ }
-    return { status: res.status, json, text, ms: Date.now() - t0 };
-  } catch (e) {
-    return { status: 0, json: null, text: '', ms: Date.now() - t0, error: `${e.name}: ${e.message}${e.cause ? ` (${e.cause.code || e.cause.message})` : ''}` };
-  }
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`no response in ${timeoutMs} ms`)));
+    req.on('error', (e) => resolve({ status: 0, json: null, text: '', ms: Date.now() - t0, error: e.message }));
+    if (data) req.write(data);
+    req.end();
+  });
 }
 const lines = (text) => text.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
 
@@ -54,7 +61,9 @@ function vm() {
     const stat = execFileSync('vm_stat', { encoding: 'utf8' });
     const page = Number(stat.match(/page size of (\d+)/)?.[1] || 16384);
     const pick = (k) => Math.round((Number(stat.match(new RegExp(`${k}:\\s+(\\d+)`))?.[1] || 0) * page) / 2 ** 20);
-    return { freeMb: pick('Pages free'), inactiveMb: pick('Pages inactive'), wiredMb: pick('Pages wired down'), compressedMb: pick('Pages occupied by compressor'), swap };
+    let pressure = null;
+    try { pressure = Number(execFileSync('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()); } catch { /* not available */ }
+    return { freeMb: pick('Pages free'), inactiveMb: pick('Pages inactive'), wiredMb: pick('Pages wired down'), compressedMb: pick('Pages occupied by compressor'), swapUsedMb: Number(swap.match(/used = ([\d.]+)M/)?.[1] ?? NaN), pressure };
   } catch (e) { return { error: e.message }; }
 }
 async function mem(label) {
@@ -158,20 +167,6 @@ async function probeApi() {
     logFind(/cancel|aborted|context canceled/i, { max: 2, n: 300 });
   });
 
-  await section('prompt cache vs RSS (32K context, alternating two different long prompts)', async () => {
-    const o = { num_ctx: 32768, num_predict: 4 };
-    await api('/api/chat', { model: CHAT, think: false, stream: false, messages: [user('hi')], options: o });
-    await mem('loaded @32K');
-    for (let i = 1; i <= 4; i++) {
-      const a = await api('/api/chat', { model: CHAT, think: false, stream: false, messages: [user(`${LONG_A} ${LONG_A} ${LONG_A} Reply OK. (${i})`)], options: o });
-      const b = await api('/api/chat', { model: CHAT, think: false, stream: false, messages: [user(`${LONG_B} ${LONG_B} ${LONG_B} Reply OK. (${i})`)], options: o });
-      out(`round ${i}`, { a: stats(a.json), b: stats(b.json), rss: rss() });
-    }
-    await mem('after alternating');
-    logFind(/prompt cache|cache state|cache size|saved to prompt cache/i, { max: 6, n: 300 });
-    logFind(/starting llama-server/, { max: 1, n: 3000 });
-  });
-
   await section('unload', async () => {
     const before = rss();
     const t0 = Date.now();
@@ -209,171 +204,161 @@ function parseParams(text) {
   return p;
 }
 
-async function exercise(M, tag) {
-  await section(`[${tag}] memory vs num_ctx`, async () => {
-    for (const ctx of [2048, 4096, 8192, 16384, 32768]) {
-      const r = await api('/api/chat', { model: M, stream: false, messages: [user('Say hello in five words.')], options: { num_ctx: ctx, num_predict: 16 } });
-      out(`num_ctx=${ctx}`, { http: r.status, content: r.json?.message?.content, thinking: r.json?.message?.thinking, ...stats(r.json) }, 160);
-      await mem(`${ctx}`);
-      if (r.status !== 200) break;
-    }
-  });
-  await section(`[${tag}] long prompt at 8K, then switching conversations`, async () => {
-    const o = { num_ctx: 8192, num_predict: 8 };
-    const a = await api('/api/chat', { model: M, stream: false, messages: [user(`${LONG_A} Reply with OK.`)], options: o });
-    out('long A', { chars: LONG_A.length, content: a.json?.message?.content, ...stats(a.json) }, 120);
-    await mem('after long A');
-    for (let i = 1; i <= 3; i++) {
-      const b = await api('/api/chat', { model: M, stream: false, messages: [user(`${LONG_B} Reply with OK. (${i})`)], options: o });
-      const a2 = await api('/api/chat', { model: M, stream: false, messages: [user(`${LONG_A} Reply with OK. (${i})`)], options: o });
-      out(`switch ${i}`, { b: stats(b.json), a: stats(a2.json), rss: rss() });
-    }
-    await mem('after switching');
-  });
-  await section(`[${tag}] tools`, async () => {
-    const tools = [
-      { type: 'function', function: { name: 'generate_image', description: 'Generate an image from a text prompt and show it to the user.', parameters: { type: 'object', properties: { prompt: { type: 'string', description: 'What to draw' } }, required: ['prompt'] } } },
-      { type: 'function', function: { name: 'get_current_time', description: 'Get the current date and time.', parameters: { type: 'object', properties: {} } } },
-    ];
-    const o = { num_ctx: 4096, num_predict: 300, temperature: 0 };
-    const q = user('Draw me a red fox in the snow.');
-    const call = await api('/api/chat', { model: M, stream: false, tools, messages: [q], options: o });
-    out('tool call', { http: call.status, message: call.json?.message, ...stats(call.json) }, 400);
-    const calls = call.json?.message?.tool_calls || [];
-    if (calls.length) {
-      const back = await api('/api/chat', { model: M, stream: false, tools, messages: [q, { role: 'assistant', content: '', tool_calls: calls }, { role: 'tool', tool_name: 'generate_image', content: 'Image generated and shown to the user.' }], options: o });
-      out('after tool result', { http: back.status, message: back.json?.message, error: back.json?.error }, 400);
-    }
-    const st = await api('/api/chat', { model: M, tools, messages: [user('What time is it right now?')], options: o });
-    const ls = lines(st.text);
-    out('streamed tool call', { http: st.status, total_lines: ls.length, tool_lines: ls.filter((l) => l.message?.tool_calls).slice(0, 2), last: ls.at(-1) }, 300);
-    const plain = await api('/api/chat', { model: M, stream: false, tools, messages: [user('What is the capital of France?')], options: o });
-    out('question needing no tool', { http: plain.status, message: plain.json?.message }, 300);
-  });
-  await section(`[${tag}] thinking and structured output`, async () => {
-    const o = { num_ctx: 4096, num_predict: 300, temperature: 0 };
-    for (const think of [true, false, undefined]) {
-      const r = await api('/api/chat', { model: M, stream: false, ...(think === undefined ? {} : { think }), messages: [user('What is 17 * 3?')], options: o });
-      out(`think=${think}`, { http: r.status, error: r.json?.error, thinking: r.json?.message?.thinking, content: r.json?.message?.content, eval_tokens: r.json?.eval_count }, 220);
-    }
-    const s = await api('/api/chat', { model: M, stream: false, format: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] }, messages: [user('Give a short title for a chat about cooking pasta.')], options: { num_ctx: 2048, num_predict: 60, temperature: 0 } });
-    out('format schema', { http: s.status, message: s.json?.message, error: s.json?.error });
-  });
+const flags = (cmd) => String(cmd || '').replace(/^.*?llama-server /, '').replace(/\S*\/blobs\/sha256-(\w{8})\w+/g, '<blob $1>').replace(/"$/, '');
+function lastServerCmd(from, file = LOG) {
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8').slice(from); } catch { /* no log */ }
+  const l = text.split('\n').filter((x) => /starting llama-server/.test(x)).at(-1);
+  return l ? flags(l.match(/cmd="(.*)"/)?.[1] ?? l) : '(no llama-server start line)';
+}
+function logSince(from, re, max = 14) {
+  const hits = logText().slice(from).split('\n').filter((l) => re.test(l));
+  for (const l of hits.slice(0, max)) console.log(`  log> ${clip(l.replace(/^time=\S+\s+/, ''), 230)}`);
+  if (!hits.length) console.log(`  log> (nothing matching ${re})`);
+}
+const MEMLOG = /kv[ _]cache|KV self size|n_ctx_seq\s|n_swa|swa_full|compute buffer size|model buffer size\s+=\s+\d{3,}|offloaded \d+\/\d+|prompt cache is enabled|has bfloat|memory_seq|failed|GGML_ASSERT|cannot run/i;
+
+async function hello(model, ctx, extra = {}) {
+  const mark = logText().length;
+  const r = await api('/api/chat', { model, stream: false, think: false, messages: [user('Say hello in five words.')], options: { num_ctx: ctx, num_predict: 12, ...extra } });
+  let res = r;
+  if (r.status === 400 && /think/.test(r.json?.error || '')) res = await api('/api/chat', { model, stream: false, messages: [user('Say hello in five words.')], options: { num_ctx: ctx, num_predict: 12, ...extra } });
+  out(`hello ${model} @${ctx}${extra.num_gpu === 0 ? ' cpu' : ''}`, { http: res.status, thinkFalseRejected: r !== res, content: res.json?.message?.content, ...stats(res.json), error: res.json?.error ?? res.error }, 200);
+  return { ok: res.status === 200, mark };
 }
 
 async function probeNemotron() {
   const REPO = process.env.HF_REPO || 'unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF';
   const TAG = process.env.TAG || 'UD-Q3_K_XL';
   const M = `hf.co/${REPO}:${TAG}`;
+  const blob = (digest) => path.join(os.homedir(), '.ollama/models/blobs', `sha256-${digest}`);
+  let layers = [];
+  let show = {};
 
   await section('machine', async () => {
-    out('machine', { cpu: os.cpus()[0]?.model, cores: os.cpus().length, totalMemGb: +(os.totalmem() / 2 ** 30).toFixed(1), freeMemGb: +(os.freemem() / 2 ** 30).toFixed(1), release: os.release(), vm: vm() });
-    out('version', (await api('/api/version')).json);
+    out('machine', { cpu: os.cpus()[0]?.model, cores: os.cpus().length, totalMemGb: +(os.totalmem() / 2 ** 30).toFixed(1), vm: vm(), version: (await api('/api/version')).json?.version });
   });
 
-  await section(`which tags resolve on hf.co for ${REPO}`, async () => {
-    for (const tag of ['UD-Q3_K_XL', 'Q3_K_XL', 'UD-Q4_K_XL', 'Q4_K_M', 'Q3_K_M', 'UD-IQ3_XXS', 'UD-Q2_K_XL', 'UD-IQ2_M', 'latest']) {
-      try {
-        const res = await fetch(`https://hf.co/v2/${REPO}/manifests/${tag}`, { headers: { accept: 'application/vnd.docker.distribution.manifest.v2+json' }, signal: AbortSignal.timeout(30000) });
-        const j = await res.json().catch(() => null);
-        out(tag, { http: res.status, layers: (j?.layers || []).map((l) => `${l.mediaType.replace('application/vnd.ollama.image.', '')}=${Math.round(l.size / 2 ** 20)}MB`), error: j?.errors || j?.error }, 200);
-      } catch (e) { out(tag, { error: e.message }); }
-    }
-  });
-
-  let modelDigest = null;
   await section(`pull ${M}`, async () => {
-    const t0 = Date.now();
-    const r = await api('/api/pull', { model: M, stream: true }, { timeoutMs: 1500000 });
-    const ls = lines(r.text);
-    out('pull', { http: r.status, seconds: Math.round((Date.now() - t0) / 1000), statuses: [...new Set(ls.map((l) => (l.status || '').replace(/sha256:\w+|[0-9a-f]{12}/, '<digest>')))].slice(0, 12), error: ls.find((l) => l.error)?.error ?? r.error, last: ls.at(-1) });
-    const tags = await api('/api/tags');
-    for (const m of tags.json?.models || []) out('installed', { name: m.name, sizeMb: Math.round(m.size / 2 ** 20), details: m.details }, 200);
-    const show = await api('/api/show', { model: M });
-    const j = show.json || {};
-    out('show', { http: show.status, capabilities: j.capabilities, details: j.details, parameters: j.parameters, template: j.template, model_info: Object.fromEntries(Object.entries(j.model_info || {}).filter(([, v]) => !Array.isArray(v))) }, 300);
-    const froms = String(j.modelfile || '').split('\n').filter((l) => /^(FROM|ADAPTER|PARSER|RENDERER|TEMPLATE|PARAMETER)\b/.test(l));
-    out('modelfile directives', froms.map((l) => clip(l, 160)));
-    modelDigest = String(j.modelfile || '').match(/^FROM\s+\S*sha256[-:]([0-9a-f]{64})/m)?.[1] || null;
+    const r = await api('/api/pull', { model: M, stream: true });
+    out('pull', { http: r.status, seconds: Math.round(r.ms / 1000), last: lines(r.text).at(-1), error: r.error });
+    show = (await api('/api/show', { model: M })).json || {};
+    out('show', { capabilities: show.capabilities, details: show.details, parameters: show.parameters, templateChars: show.template?.length, templateHead: show.template?.slice(0, 120) }, 300);
     try {
-      const mf = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.ollama/models/manifests/hf.co', REPO, TAG), 'utf8'));
-      out('on-disk manifest layers', mf.layers.map((l) => `${l.mediaType.replace('application/vnd.ollama.image.', '')}=${Math.round(l.size / 2 ** 20)}MB ${l.digest.slice(7, 19)}`));
-      modelDigest = mf.layers.find((l) => l.mediaType.endsWith('.model'))?.digest.slice(7) || modelDigest;
-    } catch (e) { out('on-disk manifest', `not readable: ${e.message}`); }
-    out('model layer digest', modelDigest);
-    out('disk', execFileSync('df', ['-h', '/'], { encoding: 'utf8' }).split('\n')[1]);
+      layers = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.ollama/models/manifests/hf.co', REPO, TAG), 'utf8')).layers.map((l) => ({ type: l.mediaType.replace('application/vnd.ollama.image.', ''), digest: l.digest.slice(7), mb: Math.round(l.size / 2 ** 20) }));
+    } catch (e) { out('manifest', `not readable: ${e.message}`); }
+    out('layers', layers.map((l) => `${l.type}=${l.mb}MB`));
+    const mf = String(show.modelfile || '');
+    out('modelfile (non-comment lines, clipped)', mf.split('\n').filter((l) => l && !l.startsWith('#')).map((l) => clip(l, 110)).slice(0, 40), 120);
+    const t = layers.find((l) => l.type === 'template');
+    if (t) { const text = fs.readFileSync(blob(t.digest), 'utf8'); out('template layer (Go template)', { chars: text.length, text }, 1500); }
+    const p = layers.find((l) => l.type === 'params');
+    if (p) out('params layer', fs.readFileSync(blob(p.digest), 'utf8'));
   });
 
-  let fullWorks = false;
-  await section('load as pulled (with the vision/audio projector)', async () => {
-    const mark = logText().length;
-    const r = await api('/api/chat', { model: M, stream: false, messages: [user('Say hello in five words.')], options: { num_ctx: 2048, num_predict: 16 } });
-    out('chat', { http: r.status, content: r.json?.message?.content, ...stats(r.json) }, 200);
-    fullWorks = r.status === 200;
-    await mem('as pulled @2K');
-    logFind(/starting llama-server/, { max: 1, n: 3500, from: mark });
-    if (!fullWorks) {
-      const seg = logText().slice(mark).split('\n');
-      const i = seg.findIndex((l) => /GGML_ASSERT|libc\+\+abi|abort|terminat|failed to|error:/i.test(l));
-      console.log('  log around the first failure:');
-      for (const l of seg.slice(Math.max(0, i - 14), i + 4)) console.log(`  log> ${clip(l.replace(/^time=\S+\s+/, ''), 260)}`);
-      const cpu = await api('/api/chat', { model: M, stream: false, messages: [user('Say hello in five words.')], options: { num_ctx: 2048, num_predict: 16, num_gpu: 0 } });
-      out('same with num_gpu: 0', { http: cpu.status, content: cpu.json?.message?.content, ...stats(cpu.json) }, 200);
-      await mem('as pulled, num_gpu 0');
-    }
-  });
-  if (fullWorks) {
-    await section('image input on the model as pulled', async () => {
-      const png = redPng(64).toString('base64');
-      const r = await api('/api/chat', { model: M, stream: false, messages: [user('What colour is this image? One word.', { images: [png] })], options: { num_ctx: 4096, num_predict: 20 } });
-      out('image chat', { http: r.status, content: r.json?.message?.content, ...stats(r.json) }, 200);
-      await mem('after image');
-    });
-    await exercise(M, 'as pulled');
-    await api('/api/generate', { model: M, keep_alive: 0 });
-    await sleep(2000);
-  }
+  const model = layers.find((l) => l.type === 'model');
+  const goTemplate = (() => { const t = layers.find((l) => l.type === 'template'); try { return t ? fs.readFileSync(blob(t.digest), 'utf8') : null; } catch { return null; } })();
+  const params = parseParams(show.parameters);
+  let TEXT = null;
 
-  const TEXT = `nemotron-bolt-e4b-text:${TAG.toLowerCase()}`;
-  let textWorks = false;
-  await section(`create a text-only copy (${TEXT}) from the model layer alone`, async () => {
-    if (!modelDigest) { out('skip', 'no model layer digest found'); return; }
-    const show = (await api('/api/show', { model: M })).json || {};
-    const attempts = [
-      ['files + parameters', { model: TEXT, files: { 'model.gguf': `sha256:${modelDigest}` }, parameters: parseParams(show.parameters), stream: false }],
-      ['files only', { model: TEXT, files: { 'model.gguf': `sha256:${modelDigest}` }, stream: false }],
+  await section('text-only copies: which create request keeps the model\'s own chat format?', async () => {
+    if (!model) { out('skip', 'no model layer'); return; }
+    const files = { 'model.gguf': `sha256:${model.digest}` };
+    const variants = [
+      ['go', { files, template: goTemplate, parameters: params }],
+      ['jinja', { files, template: show.template, parameters: params }],
+      ['none', { files, parameters: params }],
     ];
-    for (const [label, body] of attempts) {
-      const r = await api('/api/create', body, { timeoutMs: 600000 });
-      out(`create (${label})`, { http: r.status, body: r.json ?? clip(r.text, 400), ms: r.ms });
-      if (r.status === 200 && !r.json?.error) break;
+    for (const [name, body] of variants) {
+      if (name !== 'none' && !body.template) { out(`variant ${name}`, 'skipped: no template text'); continue; }
+      const id = `nemotron-text-${name}:probe`;
+      const c = await api('/api/create', { model: id, stream: false, ...body });
+      const s = (await api('/api/show', { model: id })).json || {};
+      out(`variant ${name}: create`, { http: c.status, body: c.json ?? clip(c.text, 300), capabilities: s.capabilities, templateChars: s.template?.length, templateHead: s.template?.slice(0, 80), runner: s.details?.runner }, 200);
+      if (c.status !== 200) continue;
+      const h = await hello(id, 2048);
+      out(`variant ${name}: llama-server flags`, lastServerCmd(h.mark));
+      if (h.ok && !/--chat-template chatml/.test(lastServerCmd(h.mark)) && !TEXT) TEXT = id;
     }
-    const s = (await api('/api/show', { model: TEXT })).json || {};
-    out('show text-only', { capabilities: s.capabilities, details: s.details, parameters: s.parameters, template: s.template }, 300);
-    const mark = logText().length;
-    const r = await api('/api/chat', { model: TEXT, stream: false, messages: [user('Say hello in five words.')], options: { num_ctx: 2048, num_predict: 16 } });
-    out('chat', { http: r.status, content: r.json?.message?.content, ...stats(r.json) }, 200);
-    textWorks = r.status === 200;
-    logFind(/starting llama-server/, { max: 1, n: 3500, from: mark });
-    if (!textWorks) {
-      const seg = logText().slice(mark).split('\n');
-      const i = seg.findIndex((l) => /GGML_ASSERT|libc\+\+abi|abort|terminat|failed to|error:/i.test(l));
-      for (const l of seg.slice(Math.max(0, i - 14), i + 4)) console.log(`  log> ${clip(l.replace(/^time=\S+\s+/, ''), 260)}`);
+    out('text-only model chosen for the remaining checks', TEXT ?? 'none kept the native format; using the first that loads');
+    if (!TEXT) TEXT = 'nemotron-text-none:probe';
+  });
+
+  await section('does LLAMA_ARG_CACHE_RAM reach llama-server through `ollama serve`?', async () => {
+    const log2 = '/tmp/harness-ci-ollama2.log';
+    const child = spawn('ollama', ['serve'], { env: { ...process.env, OLLAMA_HOST: '127.0.0.1:11500', LLAMA_ARG_CACHE_RAM: '256', OLLAMA_NO_CLOUD: '1', OLLAMA_KV_CACHE_TYPE: 'q8_0', OLLAMA_FLASH_ATTENTION: '1' }, stdio: ['ignore', fs.openSync(log2, 'w'), fs.openSync(log2, 'a')] });
+    let spawnError = null;
+    child.on('error', (e) => { spawnError = e.message; });
+    await sleep(300);
+    if (spawnError) { out('skip', `could not start a second ollama: ${spawnError}`); return; }
+    try {
+      await api('/api/generate', { model: TEXT, keep_alive: 0 });
+      for (let i = 0; i < 60; i++) { if ((await api('/api/version', undefined, { base: 'http://127.0.0.1:11500', timeoutMs: 2000 })).status === 200) break; await sleep(500); }
+      const r = await api('/api/chat', { model: TEXT, stream: false, think: false, messages: [user('Hi')], options: { num_ctx: 2048, num_predict: 4 } }, { base: 'http://127.0.0.1:11500' });
+      out('chat via second server', { http: r.status, content: r.json?.message?.content, error: r.json?.error ?? r.error });
+      const text = fs.readFileSync(log2, 'utf8');
+      for (const l of text.split('\n').filter((x) => /prompt cache|cache-ram|LLAMA_ARG|OLLAMA_NO_CLOUD|no cloud/i.test(x)).slice(0, 6)) console.log(`  log> ${clip(l.replace(/^time=\S+\s+/, ''), 400)}`);
+      out('flags', lastServerCmd(0, log2));
+    } finally { child.kill('SIGTERM'); await sleep(1500); }
+  });
+
+  await section('memory at two context sizes (text-only)', async () => {
+    for (const ctx of [4096, 16384]) {
+      const h = await hello(TEXT, ctx);
+      await mem(`text-only @${ctx}`);
+      logSince(h.mark, MEMLOG);
     }
   });
-  if (textWorks) {
-    await exercise(TEXT, 'text-only');
-    await section('unload the text-only model', async () => {
-      const before = rss();
-      const t0 = Date.now();
-      await api('/api/generate', { model: TEXT, keep_alive: 0 });
-      const samples = [];
-      for (const wait of [200, 800, 2000, 4000]) { await sleep(wait); samples.push(`${Date.now() - t0}ms=${rss().totalMb}MB`); }
-      out('unload', { rss_before: before, rss_after: samples.join(' '), ps: (await api('/api/ps')).json?.models?.length });
-    });
-  }
-  await section('log lines about memory and layout', async () => {
-    logFind(/offloaded \d+\/\d+ layers|model buffer size\s+=\s+\d{3,}|KV self size|kv cache|n_ctx_seq\s|llama_kv_cache|compute buffer size|sched.go.*(memory|vram)|n_swa|swa_full/i, { max: 24, n: 240 });
+
+  await section('tools (text-only)', async () => {
+    const tools = [
+      { type: 'function', function: { name: 'generate_image', description: 'Generate an image from a text prompt and show it to the user.', parameters: { type: 'object', properties: { prompt: { type: 'string', description: 'What to draw' } }, required: ['prompt'] } } },
+      { type: 'function', function: { name: 'get_current_time', description: 'Get the current date and time.', parameters: { type: 'object', properties: {} } } },
+    ];
+    const o = { num_ctx: 4096, num_predict: 90, temperature: 0 };
+    const q = user('Draw me a red fox in the snow.');
+    const call = await api('/api/chat', { model: TEXT, stream: false, think: false, tools, messages: [q], options: o });
+    out('tool call', { http: call.status, message: call.json?.message, ...stats(call.json) }, 400);
+    const calls = call.json?.message?.tool_calls || [];
+    if (calls.length) {
+      const back = await api('/api/chat', { model: TEXT, stream: false, think: false, tools, messages: [q, { role: 'assistant', content: '', tool_calls: calls }, { role: 'tool', tool_name: 'generate_image', content: 'Image generated and shown to the user.' }], options: o });
+      out('after tool result', { http: back.status, message: back.json?.message, error: back.json?.error }, 400);
+    }
+    const st = await api('/api/chat', { model: TEXT, think: false, tools, messages: [user('What time is it right now?')], options: o });
+    const ls = lines(st.text);
+    out('streamed tool call', { http: st.status, total_lines: ls.length, tool_lines: ls.filter((l) => l.message?.tool_calls).slice(0, 1), last: ls.at(-1) }, 300);
+  });
+
+  await section('thinking and structured output (text-only)', async () => {
+    const o = { num_ctx: 4096, num_predict: 70, temperature: 0 };
+    for (const think of [true, false, undefined]) {
+      const r = await api('/api/chat', { model: TEXT, stream: false, ...(think === undefined ? {} : { think }), messages: [user('What is 17 * 3?')], options: o });
+      out(`think=${think}`, { http: r.status, error: r.json?.error, thinking: r.json?.message?.thinking, content: r.json?.message?.content, eval_tokens: r.json?.eval_count }, 160);
+    }
+    const s = await api('/api/chat', { model: TEXT, stream: false, think: false, format: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] }, messages: [user('Give a short title for a chat about cooking pasta.')], options: { num_ctx: 2048, num_predict: 40, temperature: 0 } });
+    out('format schema', { http: s.status, message: s.json?.message, error: s.json?.error });
+    const sys = await api('/api/chat', { model: TEXT, stream: false, think: false, messages: [{ role: 'system', content: 'You are a pirate. Always answer like a pirate.' }, user('Where is the treasure?')], options: { num_ctx: 2048, num_predict: 30, temperature: 0 } });
+    out('system prompt respected?', { http: sys.status, content: sys.json?.message?.content }, 300);
+  });
+
+  await section('the model with a projector: as pulled (BF16 projector), then the Q8 projector alias', async () => {
+    await api('/api/generate', { model: TEXT, keep_alive: 0 });
+    const h = await hello(M, 2048);
+    out('as pulled: flags', lastServerCmd(h.mark));
+    logSince(h.mark, /has bfloat|cannot run|GGML_ASSERT|clip_model_loader: (has|model size)|mmproj|projector/i, 8);
+    const alias = `hf.co/${REPO}:${TAG.replace(/^UD-/, '')}`;
+    if (alias === M) return;
+    const r = await api('/api/pull', { model: alias, stream: true });
+    out(`pull ${alias}`, { http: r.status, seconds: Math.round(r.ms / 1000), last: lines(r.text).at(-1), error: r.error });
+    const h2 = await hello(alias, 2048);
+    out('alias: flags', lastServerCmd(h2.mark));
+    logSince(h2.mark, /has bfloat|cannot run|GGML_ASSERT|clip_model_loader: (has|model size)|mmproj|projector/i, 8);
+    await mem('alias with projector @2K');
+    if (h2.ok) {
+      const img = await api('/api/chat', { model: alias, stream: false, messages: [user('What colour is this image? One word.', { images: [redPng(64).toString('base64')] })], options: { num_ctx: 4096, num_predict: 12 } });
+      out('image input', { http: img.status, content: img.json?.message?.content, ...stats(img.json), error: img.json?.error }, 200);
+      await mem('after image');
+    }
   });
 }
 
