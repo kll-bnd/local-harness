@@ -30,6 +30,11 @@ on:
         description: "ui job: only tests whose name matches this pattern (empty = all)"
         type: string
         default: ""
+      runner:
+        description: "macOS runner image (try another one when the default pool hands out no runner)"
+        type: choice
+        default: macos-latest
+        options: [macos-latest, macos-15, macos-14]
 
 permissions:
   contents: read
@@ -48,7 +53,7 @@ jobs:
   backend:
     name: Backend on macOS
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'backend' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -96,7 +101,7 @@ jobs:
   desktop:
     name: Desktop app on macOS (Electron)
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'desktop' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -137,7 +142,7 @@ jobs:
   ui:
     name: Web UI in WebKit (the engine of the native app and Safari)
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'ui' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 30
     env:
       UI_FILTER: ${{ inputs.ui_filter }}
@@ -167,7 +172,7 @@ jobs:
   live:
     name: Live check against a real Ollama
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'live' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -201,7 +206,7 @@ jobs:
   sandbox:
     name: Harness starts Ollama inside the sandbox, repeated
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'sandbox' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -228,7 +233,7 @@ jobs:
   sandbox_timing:
     name: How long Ollama needs to start, sandboxed and plain (fact-finding)
     if: ${{ inputs.jobs == 'sandbox-timing' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -252,7 +257,7 @@ jobs:
   e2e:
     name: Real Nemotron through Harness, end to end
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'e2e' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 55
     env:
       TAG: hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:${{ inputs.nemotron_tag || 'UD-Q3_K_XL' }}
@@ -319,7 +324,7 @@ jobs:
   ollama:
     name: Real Ollama API behaviour
     if: ${{ inputs.jobs == 'ollama' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 30
     env:
       CHAT: qwen3:0.6b
@@ -348,7 +353,7 @@ jobs:
   nemotron:
     name: Nemotron 3.5 Bolt E4B on a Mac runner
     if: ${{ inputs.jobs == 'nemotron' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 60
     env:
       TAG: ${{ inputs.nemotron_tag || 'UD-Q3_K_XL' }}
@@ -374,7 +379,7 @@ jobs:
   native:
     name: Native macOS app (WKWebView + bridge + offline lock)
     if: ${{ inputs.jobs == 'all' || inputs.jobs == 'native' }}
-    runs-on: macos-latest
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 35
     env:
       FACTS: /tmp/native-facts.txt
