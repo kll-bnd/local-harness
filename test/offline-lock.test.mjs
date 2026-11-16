@@ -189,11 +189,11 @@ exec "$@"
       netg.launch.set({ offlineLockSuspendedUntil: new Date(Date.now() + 50).toISOString() });
       netg._arm();
       await waitFor(() => netg.blocked);
-      await waitFor(() => s.srv.core.ollamaProcess.sandboxed && s.srv.core.ollamaProcess.child?.pid !== pid2, { timeout: 15000 });
+      // (the restart is done once its start has finished, not when the child was spawned)
+      await waitFor(() => s.srv.core.ollamaProcess.sandboxed && s.srv.core.ollamaProcess.child?.pid !== pid2 && !s.srv.core.ollamaProcess.starting && log().length === 3, { timeout: 15000 });
       n = (await s.call('GET', '/api/network')).data.offlineLock;
       assert.equal(n.osScope, 'ollama');
       assert.equal(n.osPending, false);
-      assert.equal(log().length, 3);
       // the self-test: a direct TCP connection from inside the sandbox reaches a listener → the OS layer does not hold
       const listener = net.createServer((c) => c.destroy());
       await new Promise((r) => listener.listen(0, '127.0.0.2', r).on('error', () => listener.listen(0, '127.0.0.1', r)));
