@@ -2,7 +2,7 @@
 // registry (keyboard shortcuts, command palette and the Electron menu all share it) and the shell.
 import { h, isTypingTarget, pickFiles, download, mount, add } from './lib/dom.js';
 import { icon } from './lib/icons.js';
-import { truncate } from './lib/format.js';
+import { truncate, isMac } from './lib/format.js';
 import * as api from './api.js';
 import { store, bus, loadSettings, loadPresets, loadSystem, loadModels, loadChats, loadArchived, refreshSystemSoon, refreshModelsSoon, refreshChatsSoon, setUiPref, uiPrefs, chatModels, dropModelInfo, flushUiPrefs } from './state.js';
 import { defineAction, runAction, runActionFrom, chordOf, actionForChord, allActions } from './actions.js';
@@ -26,27 +26,27 @@ const currentSummary = () => {
   return m ? (store.get('chats') || []).find((c) => c.id === m.id) || (store.get('archived') || []).find((c) => c.id === m.id) || m.chat : null;
 };
 
-defineAction('new-chat', { title: 'New chat', keys: ['Mod+N', 'Mod+Shift+O'], group: 'Chats', icon: 'compose', run: () => { store.set('pendingChat', null); navigate('/chat'); shell.focusComposer(); } });
+defineAction('new-chat', { title: 'New chat', keys: ['Mod+N', 'Mod+Shift+O'], menu: true, group: 'Chats', icon: 'compose', run: () => { store.set('pendingChat', null); navigate('/chat'); shell.focusComposer(); } });
 defineAction('new-incognito-chat', { title: 'New incognito chat', keys: ['Mod+Shift+N'], group: 'Chats', icon: 'incognito', run: () => { store.set('pendingChat', { incognito: true }); navigate('/chat'); shell.chatView.renderIntro(); shell.updateToolbar(); shell.focusComposer(); } });
-defineAction('search-chats', { title: 'Search chats', keys: ['Mod+Shift+F'], group: 'Chats', icon: 'search', run: () => { shell.toggleSidebar(true); shell.sidebar.focusSearch(); } });
-defineAction('command-palette', { title: 'Command palette', keys: ['Mod+K', 'Mod+Shift+P'], group: 'General', icon: 'command', palette: false, run: () => openPalette(shell) });
-defineAction('open-settings', { title: 'Settings', keys: ['Mod+,'], group: 'Go to', icon: 'settings', run: (section) => navigate(`/settings${typeof section === 'string' ? `/${section}` : ''}`) });
-defineAction('open-models', { title: 'Models', keys: ['Mod+Shift+M'], group: 'Go to', icon: 'cube', run: () => navigate('/models') });
-defineAction('open-images', { title: 'Image studio', keys: ['Mod+Shift+G'], group: 'Go to', icon: 'image', run: () => navigate('/images') });
-defineAction('open-memory', { title: 'Memory', keys: ['Mod+Shift+Y'], group: 'Go to', icon: 'memory', run: () => navigate('/memory') });
+defineAction('search-chats', { title: 'Search chats', keys: desktop ? ['Mod+F', 'Mod+Shift+F'] : ['Mod+Shift+F'], menu: true, group: 'Chats', icon: 'search', run: () => { shell.toggleSidebar(true); shell.sidebar.focusSearch(); } });
+defineAction('command-palette', { title: 'Command palette', keys: ['Mod+K', 'Mod+Shift+P'], menu: true, group: 'General', icon: 'command', palette: false, run: () => openPalette(shell) });
+defineAction('open-settings', { title: 'Settings', keys: ['Mod+,'], menu: true, group: 'Go to', icon: 'settings', run: (section) => navigate(`/settings${typeof section === 'string' ? `/${section}` : ''}`) });
+defineAction('open-models', { title: 'Models', keys: ['Mod+1', 'Mod+Shift+M'], menu: true, group: 'Go to', icon: 'cube', run: () => navigate('/models') });
+defineAction('open-images', { title: 'Image studio', keys: ['Mod+2', 'Mod+Shift+G'], menu: true, group: 'Go to', icon: 'image', run: () => navigate('/images') });
+defineAction('open-memory', { title: 'Memory', keys: ['Mod+3', 'Mod+Shift+Y'], menu: true, group: 'Go to', icon: 'memory', run: () => navigate('/memory') });
 defineAction('open-setup', { title: 'Setup & health', group: 'Go to', icon: 'server', run: () => navigate('/setup') });
-defineAction('toggle-sidebar', { title: 'Toggle sidebar', keys: ['Mod+Shift+S', 'Mod+Ctrl+S'], group: 'View', icon: 'sidebar', run: () => shell.toggleSidebar() });
-defineAction('toggle-inspector', { title: 'Toggle inspector', keys: ['Mod+Shift+I', 'Mod+Alt+I'], group: 'View', icon: 'inspector', run: () => shell.toggleInspector() });
-defineAction('focus-composer', { title: 'Focus message field', keys: ['/', 'Mod+L'], group: 'Chats', icon: 'pencil', run: () => shell.focusComposer() });
-defineAction('stop-generation', { title: 'Stop generating', keys: ['Mod+.'], group: 'Chats', icon: 'stop', when: () => true, run: () => {
+defineAction('toggle-sidebar', { title: 'Toggle sidebar', keys: isMac ? ['Mod+Ctrl+S', 'Mod+Shift+S'] : ['Mod+Shift+S'], menu: true, group: 'View', icon: 'sidebar', run: () => shell.toggleSidebar() });
+defineAction('toggle-inspector', { title: 'Toggle inspector', keys: ['Mod+Alt+I', 'Mod+Shift+I'], menu: true, group: 'View', icon: 'inspector', run: () => shell.toggleInspector() });
+defineAction('focus-composer', { title: 'Focus message field', keys: ['Mod+L', '/'], menu: true, group: 'Chats', icon: 'pencil', run: () => shell.focusComposer() });
+defineAction('stop-generation', { title: 'Stop generating', keys: ['Mod+.'], menu: true, group: 'Chats', icon: 'stop', when: () => true, run: () => {
   const m = currentChat();
   if (m?.generating) stopGeneration(m);
   else { const any = liveChats()[0]; if (any) stopGeneration(any); else toast({ message: 'Nothing is generating', id: 'nothing' }); }
 } });
 defineAction('stop-generation-hint', { title: 'Wait or stop', palette: false, run: () => toast({ kind: 'warn', message: 'This chat is still replying', detail: 'Wait for it to finish, or stop it first.', action: { label: 'Stop', run: () => runAction('stop-generation') }, id: 'busy' }) });
-defineAction('export-chat', { title: 'Export chat…', keys: ['Mod+Shift+E'], group: 'Chats', icon: 'share', run: () => shell.exportDialog(currentSummary()) });
-defineAction('import-chat', { title: 'Import chats…', keys: ['Mod+O'], group: 'Chats', icon: 'importIcon', run: () => importChats() });
-defineAction('show-shortcuts', { title: 'Keyboard shortcuts', keys: ['Mod+/'], group: 'Help', icon: 'keyboard', run: () => openShortcuts() });
+defineAction('export-chat', { title: 'Export chat…', keys: ['Mod+Shift+E'], menu: true, group: 'Chats', icon: 'share', run: () => shell.exportDialog(currentSummary()) });
+defineAction('import-chat', { title: 'Import chats…', keys: ['Mod+O'], menu: true, group: 'Chats', icon: 'importIcon', run: () => importChats() });
+defineAction('show-shortcuts', { title: 'Keyboard shortcuts', keys: ['Mod+/'], menu: true, group: 'Help', icon: 'keyboard', run: () => openShortcuts() });
 defineAction('show-context', { title: 'Show context details', group: 'View', icon: 'layers', run: () => shell.showInspector('context') });
 defineAction('show-summary', { title: 'Show chat summary', group: 'View', icon: 'summary', run: () => shell.showInspector('summary') });
 defineAction('show-retrieval', { title: 'Show memories used', group: 'View', icon: 'memory', palette: false, run: (messageId) => shell.showInspector('memory', { retrieval: messageId }) });
@@ -131,6 +131,9 @@ document.addEventListener('keydown', (e) => {
   }
   const a = actionForChord(chord);
   if (!a) return;
+  // Inside the desktop app the native menu owns its accelerators (they fire before the page sees the key);
+  // only the menu's primary key is skipped here, the alternatives still work.
+  if (desktop && a.menu && a.keys[0] === chord) return;
   const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
   if (plain && isTypingTarget(e.target)) return; // "/" etc. only outside text fields
   e.preventDefault();
@@ -250,6 +253,7 @@ function connectEvents() {
     if (d.status === 'success') { refreshModelsSoon(); dropModelInfo(); }
   });
   on('model.deleted', () => { refreshModelsSoon(); dropModelInfo(); });
+  on('model.measured', () => { dropModelInfo(); refreshSystemSoon(); });
   on('model.status', () => refreshSystemSoon());
   on('attachment.indexed', (d) => bus.emit('attachment.indexed', d));
   const jobEvent = (d) => {

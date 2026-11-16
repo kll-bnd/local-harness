@@ -588,6 +588,8 @@ class Run {
     const limit = this.T(timeoutMs);
     let timer;
     let outcome;
+    const prevSignal = ACTIVE.signal;
+    ACTIVE.signal = ac.signal;
     try {
       const timeout = new Promise((_, rej) => { timer = setTimeout(() => { ac.abort(new Error('timeout')); rej(Object.assign(new Error(`no result within ${fmtMs(limit)}`), { isCheckTimeout: true })); }, limit); });
       outcome = await Promise.race([Promise.resolve().then(() => fn({ signal: ac.signal, sample: (k, v) => this.sample(k, v) })), timeout]);
@@ -597,6 +599,7 @@ class Run {
       else outcome = FAIL(`check crashed: ${errText(e)}`, { actual: excerpt(e?.stack || String(e), 800) });
     } finally {
       clearTimeout(timer);
+      ACTIVE.signal = prevSignal;
     }
     if (!outcome || !outcome.status) outcome = FAIL('check returned no outcome');
     const r = {
@@ -645,79 +648,110 @@ class Run {
 }
 
 // =============================================================================================== HTTP helpers
-function anySignal(signal, timeoutMs) {
-  const list = [];
-  if (signal) list.push(signal);
+// Transport on node:http, not global fetch: undici's hidden 300 s headers/body timeouts would cut long first-token
+// waits on a slow 8 GB Mac (and make --timeout-scale useless). The only timeouts are the ones passed in here, plus
+// the signal of the running check, so a check that times out also cancels its own requests.
+const ACTIVE = { signal: null };
+function anySignal(signals, timeoutMs) {
+  const list = (Array.isArray(signals) ? signals : [signals]).filter(Boolean);
   if (timeoutMs) list.push(AbortSignal.timeout(timeoutMs));
   return list.length ? (list.length === 1 ? list[0] : AbortSignal.any(list)) : undefined;
 }
+const abortReason = (sig) => (sig?.reason instanceof Error ? sig.reason : Object.assign(new Error('aborted'), { name: 'AbortError' }));
+/** → Promise<{ res: IncomingMessage, done() }>; `done()` detaches the abort listener once the body was consumed. */
+async function rawRequest(url, { method = 'GET', headers = {}, body, signal } = {}) {
+  const { default: httpLib } = await import(url.startsWith('https:') ? 'node:https' : 'node:http');
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(abortReason(signal)); return; }
+    let req;
+    const onAbort = () => req?.destroy(abortReason(signal));
+    const done = () => signal?.removeEventListener('abort', onAbort);
+    try {
+      req = httpLib.request(url, { method, headers, agent: false }, (res) => resolve({ res, done }));
+    } catch (e) { reject(e); return; }
+    signal?.addEventListener('abort', onAbort, { once: true });
+    req.on('error', (e) => { done(); reject(e); });
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+function encodeBody(body, headers) {
+  if (body === undefined) return undefined;
+  const payload = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+  if (!headers['content-type']) headers['content-type'] = 'application/json';
+  headers['content-length'] = Buffer.byteLength(payload);
+  return payload;
+}
 function headersOf(res) {
   const out = {};
-  for (const k of ['content-type', 'content-length', 'transfer-encoding', 'server']) { const v = res.headers.get(k); if (v) out[k] = v; }
+  for (const k of ['content-type', 'content-length', 'transfer-encoding', 'server']) if (res.headers[k]) out[k] = res.headers[k];
   return out;
 }
 
-/** One HTTP request; never throws. → { ok, status, headers, text, json, ms, error, timeout } */
+/** One HTTP request; never throws. → { ok, status, headers, text, json, buf, ms, error, timeout } */
 async function http(base, p, { method = 'GET', body, headers = {}, timeoutMs = 10000, signal, apiKey, binary = false } = {}) {
   const t0 = nowMs();
   const h = { ...headers };
-  if (body !== undefined && !h['content-type']) h['content-type'] = 'application/json';
+  const payload = encodeBody(body, h);
   if (apiKey) h.authorization = `Bearer ${apiKey}`;
+  const sig = anySignal([signal, ACTIVE.signal], timeoutMs);
   try {
-    const res = await fetch(base + p, { method, headers: h, body: body === undefined ? undefined : typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body), signal: anySignal(signal, timeoutMs) });
-    let text = null;
-    let buf = null;
-    if (binary) buf = Buffer.from(await res.arrayBuffer());
-    else text = await res.text();
+    const { res, done } = await rawRequest(base + p, { method, headers: h, body: payload, signal: sig });
+    const chunks = [];
+    try { for await (const c of res) chunks.push(c); } finally { done(); }
+    const buf = Buffer.concat(chunks);
+    const text = binary ? null : buf.toString('utf8');
     let json;
     if (text) { try { json = JSON.parse(text); } catch { json = undefined; } }
-    return { ok: res.ok, status: res.status, headers: headersOf(res), text, json, buf, ms: nowMs() - t0 };
+    const status = res.statusCode;
+    return { ok: status >= 200 && status < 300, status, headers: headersOf(res), text, json, buf: binary ? buf : null, ms: nowMs() - t0 };
   } catch (e) {
     return { ok: false, status: 0, error: errText(e), timeout: e?.name === 'TimeoutError', ms: nowMs() - t0 };
   }
 }
-const errorOf = (r) => (r.json && (typeof r.json.error === 'string' ? r.json.error : r.json.error?.message || r.json.detail || r.json.message)) || r.text || r.error || `HTTP ${r.status}`;
-const httpSummary = (r) => (r.status ? `HTTP ${r.status} ${excerpt(r.text ?? '', 300)}` : `no response: ${r.error}`);
+/** 'HTTP 404' — or 'timed out' / 'no response' when nothing came back. */
+const hs = (r) => (r?.status ? `HTTP ${r.status}` : r?.timeout ? 'timed out' : 'no response');
+const errorOf = (r) => (r.json && (typeof r.json.error === 'string' ? r.json.error : r.json.error?.message || r.json.detail || r.json.message)) || r.text || r.error || `${hs(r)}`;
+const httpSummary = (r) => (r.status ? `${hs(r)} ${excerpt(r.text ?? '', 300)}` : `no response: ${r.error}`);
 
 /**
- * Streamed request, line by line. `onLine(line, state)` may return 'stop' to abort the request (the reason
- * observed by the reader is recorded). → { status, ok, contentType, lines:[{t,text}], firstByteMs, totalMs, error, aborted, abortErrorName, bodyText }
+ * Streamed request, line by line. `onLine(line, state)` may return 'stop': the connection is then closed (what
+ * ChatEngine.stop() does to a backend). → { status, ok, contentType, lines:[{t,text}], firstByteMs, totalMs, error, aborted, bodyText, json }
  */
 async function streamLines(url, { method = 'POST', body, headers = {}, timeoutMs = 120000, signal, onLine, apiKey } = {}) {
   const t0 = nowMs();
-  const out = { status: 0, ok: false, contentType: null, lines: [], firstByteMs: null, totalMs: null, error: null, aborted: false, abortErrorName: null, bodyText: null };
-  const ac = new AbortController();
-  const sig = AbortSignal.any([ac.signal, ...(signal ? [signal] : []), ...(timeoutMs ? [AbortSignal.timeout(timeoutMs)] : [])]);
-  const h = { 'content-type': 'application/json', ...headers };
+  const out = { status: 0, ok: false, contentType: null, lines: [], firstByteMs: null, totalMs: null, error: null, aborted: false, bodyText: null };
+  const h = { ...headers };
+  const payload = encodeBody(body, h);
   if (apiKey) h.authorization = `Bearer ${apiKey}`;
+  const sig = anySignal([signal, ACTIVE.signal], timeoutMs);
   let res;
+  let done = () => {};
   try {
-    res = await fetch(url, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body), signal: sig });
+    ({ res, done } = await rawRequest(url, { method, headers: h, body: payload, signal: sig }));
   } catch (e) {
     out.error = errText(e);
     out.timeout = e?.name === 'TimeoutError';
     out.totalMs = nowMs() - t0;
     return out;
   }
-  out.status = res.status;
-  out.ok = res.ok;
-  out.contentType = res.headers.get('content-type');
-  if (!res.ok) {
-    out.bodyText = await res.text().catch(() => '');
-    try { out.json = JSON.parse(out.bodyText); } catch { /* not JSON */ }
-    out.totalMs = nowMs() - t0;
-    return out;
-  }
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
-  let stop = false;
+  out.status = res.statusCode;
+  out.ok = res.statusCode >= 200 && res.statusCode < 300;
+  out.contentType = res.headers['content-type'] || null;
   try {
-    while (!stop) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    if (!out.ok) {
+      const chunks = [];
+      for await (const c of res) chunks.push(c);
+      out.bodyText = Buffer.concat(chunks).toString('utf8');
+      try { out.json = JSON.parse(out.bodyText); } catch { /* not JSON */ }
+      return out;
+    }
+    const dec = new TextDecoder();
+    let buf = '';
+    let stop = false;
+    for await (const chunk of res) {
       if (out.firstByteMs == null) out.firstByteMs = nowMs() - t0;
-      buf += dec.decode(value, { stream: true });
+      buf += dec.decode(chunk, { stream: true });
       let i;
       while (!stop && (i = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, i).replace(/\r$/, '');
@@ -725,22 +759,19 @@ async function streamLines(url, { method = 'POST', body, headers = {}, timeoutMs
         out.lines.push({ t: nowMs() - t0, text: line });
         if (onLine && (await onLine(line, out)) === 'stop') stop = true;
       }
+      if (stop) break;
     }
-    if (!stop) {
+    if (stop) { out.aborted = true; res.destroy(); } else {
       buf += dec.decode();
       if (buf.length) out.lines.push({ t: nowMs() - t0, text: buf });
     }
   } catch (e) {
     out.error = errText(e);
     out.timeout = e?.name === 'TimeoutError';
+  } finally {
+    done();
+    out.totalMs = nowMs() - t0;
   }
-  if (stop) {
-    out.aborted = true;
-    ac.abort();
-    try { await reader.read(); } catch (e) { out.abortErrorName = e?.name || 'Error'; }
-    if (!out.abortErrorName) out.abortErrorName = 'closed';
-  }
-  out.totalMs = nowMs() - t0;
   return out;
 }
 
@@ -882,7 +913,7 @@ async function detectBackends(run) {
     const url = stripV1(ollamaUrl);
     const r = await http(url, '/api/version', { timeoutMs: T(3000) });
     const ok = r.ok && typeof r.json?.version === 'string';
-    note('ollama', url, !!o.ollamaUrl, ok, ok ? r.json.version : null, ok ? null : (r.error || `HTTP ${r.status}`));
+    note('ollama', url, !!o.ollamaUrl, ok, ok ? r.json.version : null, ok ? null : (r.error || `${hs(r)}`));
     if (ok) B.ollama = { url, version: r.json.version, explicit: !!o.ollamaUrl };
   }
   const oaiCandidates = [];
@@ -896,7 +927,7 @@ async function detectBackends(run) {
       const props = await http(c.url, '/props', { timeoutMs: T(2000), apiKey: o.apiKey });
       if (props.ok && isObj(props.json) && (props.json.default_generation_settings || props.json.total_slots !== undefined)) c.flavor = 'llamacpp';
     }
-    note(c.sid, c.url, c.explicit, ok, ok ? `${c.flavor}, ${r.json.data.length} model(s)` : null, ok ? null : (r.error || `HTTP ${r.status}`));
+    note(c.sid, c.url, c.explicit, ok, ok ? `${c.flavor}, ${r.json.data.length} model(s)` : null, ok ? null : (r.error || `${hs(r)}`));
     if (ok) B.openai.push({ ...c, models: r.json.data.map((m) => m.id).filter(Boolean) });
   }
   const a1111Url = o.a1111Url || (o.detect ? 'http://127.0.0.1:7860' : null);
@@ -911,13 +942,13 @@ async function detectBackends(run) {
     const url = stripV1(comfyUrl);
     const r = await http(url, '/system_stats', { timeoutMs: T(3000) });
     const ok = r.ok && isObj(r.json?.system);
-    note('comfyui', url, !!o.comfyuiUrl, ok, ok ? r.json.system.comfyui_version || 'version ?' : null, ok ? null : (r.error || `HTTP ${r.status}`));
+    note('comfyui', url, !!o.comfyuiUrl, ok, ok ? r.json.system.comfyui_version || 'version ?' : null, ok ? null : (r.error || `${hs(r)}`));
     if (ok) B.comfyui = { url, version: r.json.system.comfyui_version || null, explicit: !!o.comfyuiUrl };
   }
   if (o.openaiImagesUrl) {
     const url = stripV1(o.openaiImagesUrl);
     const r = await http(url, '/v1/models', { timeoutMs: T(3000), apiKey: o.apiKey });
-    note('openai-images', url, true, r.ok, r.ok ? 'models answered' : null, r.ok ? null : (r.error || `HTTP ${r.status}`));
+    note('openai-images', url, true, r.ok, r.ok ? 'models answered' : null, r.ok ? null : (r.error || `${hs(r)}`));
     if (r.ok) B.openaiImages = { url, models: (r.json?.data || []).map((m) => m.id) };
   }
   return B;
@@ -957,7 +988,7 @@ function parseOllamaStream(r) {
     if (Array.isArray(m.tool_calls)) { p.toolCalls.push(...m.tool_calls); p.toolCallChunks.push({ index: i, done: !!o.done }); }
     if (o.done && !p.final) { p.final = o; p.finalIndex = i; }
   });
-  if (!r.ok) p.errorText = (typeof r.json?.error === 'string' ? r.json.error : r.json?.error?.message) || r.bodyText || r.error || `HTTP ${r.status}`;
+  if (!r.ok) p.errorText = (typeof r.json?.error === 'string' ? r.json.error : r.json?.error?.message) || r.bodyText || r.error || `${hs(r)}`;
   return p;
 }
 function streamSample(body, r, p) {
@@ -1198,7 +1229,7 @@ async function ollamaGroup(run, B) {
     const msg = errorOf(r);
     const code = classifyCode(r.status, msg);
     if (r.status === 404 && code === 'model_not_found') return PASS(`HTTP 404 "${excerpt(msg, 120)}" → model_not_found`);
-    return FAIL(`HTTP ${r.status} "${excerpt(msg, 160)}" → classified as ${code}`, { expected: 'HTTP 404 {"error":"model … not found"} → model_not_found', actual: r.text ?? r.error, fix: 'Adjust classifyOllamaError to this answer.' });
+    return FAIL(`${hs(r)} "${excerpt(msg, 160)}" → classified as ${code}`, { expected: 'HTTP 404 {"error":"model … not found"} → model_not_found', actual: r.text ?? r.error, fix: 'Adjust classifyOllamaError to this answer.' });
   });
 
   // ---- chat with the chat model at num_ctx 2048
@@ -1209,7 +1240,7 @@ async function ollamaGroup(run, B) {
     A = await chat(chatBody(C, msgsA, thinkOffFor(C)));
     const { r, p } = A;
     sample(`ollama POST /api/chat stream (${C})`, streamSample(A.body, r, p));
-    if (!r.ok) return FAIL(`HTTP ${r.status}: ${excerpt(p.errorText, 300)}`, { expected: 'HTTP 200 NDJSON stream', actual: p.errorText, fix: 'Every chat turn would fail with this error.' });
+    if (!r.ok) return FAIL(`${hs(r)}: ${excerpt(p.errorText, 300)}`, { expected: 'HTTP 200 NDJSON stream', actual: p.errorText, fix: 'Every chat turn would fail with this error.' });
     const problems = [];
     if (r.error) problems.push(`stream broke: ${r.error}`);
     if (p.bad.length) problems.push(`${p.bad.length} line(s) are not JSON (readNdjson silently drops them): ${excerpt(p.bad[0], 120)}`);
@@ -1278,7 +1309,7 @@ async function ollamaGroup(run, B) {
     need(C, 'no usable chat model', NEED.chat);
     const q = await chat(chatBody(C, [{ role: 'user', content: 'Write a long story about a dragon who learns to bake bread.' }], { ...thinkOffFor(C), options: { num_predict: 3 } }));
     sample('ollama /api/chat num_predict 3 (final chunk)', q.p.final ? { ...q.p.final } : q.p.errorText);
-    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.p.errorText}`);
+    if (!q.r.ok) return FAIL(`${hs(q.r)}: ${q.p.errorText}`);
     if (q.p.final?.done_reason === 'length') return PASS(`done_reason "length" after ${q.p.final.eval_count} tokens`);
     return WARN(`done_reason "${q.p.final?.done_reason}" after hitting num_predict — truncated answers would not be marked`, { expected: '"length"', actual: excerpt({ ...q.p.final, message: undefined }), fix: 'ChatEngine marks truncated answers via doneReason === "length"; map this value in OllamaProvider.chat.' });
   }, { timeoutMs: 300000 });
@@ -1329,7 +1360,7 @@ async function ollamaGroup(run, B) {
     const d = expiresDelta(entry1);
     if (d === null) return FAIL(`expires_at "${entry1.expires_at}" is not a timestamp`, { fix: 'OllamaProvider.ps passes it through as expiresAt; the UI countdown would break.' });
     const want = intendedSeconds(O.keepAlive);
-    if (!expiryMatches(d, want)) return WARN(`expires in ${describeSeconds(d)}, but keep_alive ${JSON.stringify(O.keepAlive)} means ${describeSeconds(want)}`, { info: [`expires_at ${entry1.expires_at}`] });
+    if (!expiryMatches(d, want)) return WARN(`expires in ${describeSeconds(d)}, but keep_alive ${JSON.stringify(O.keepAlive)} means ${describeSeconds(want)}`, { info: [`expires_at ${entry1.expires_at}`], fix: 'The UI countdown (expiresAt) would be wrong; see the ollama.keep_alive.* checks for how each form is interpreted.' });
     return PASS(`expires in ${describeSeconds(d)} for keep_alive ${JSON.stringify(O.keepAlive)}`);
   });
 
@@ -1361,11 +1392,10 @@ async function ollamaGroup(run, B) {
     const perTok = O.evalTps ? 1000 / O.evalTps : null;
     const remaining = perTok ? (400 - chunks) * perTok : null;
     const base = O.baselineTtft ?? null;
-    sample('ollama /api/chat abort experiment', { abortedAfterChunks: chunks, abortErrorName: q.r.abortErrorName, readerError: q.r.error, nextRequestMs: ttft, baselineTtftMs: base, estimatedRemainingGenerationMs: remaining });
+    sample('ollama /api/chat abort experiment', { abortedAfterChunks: chunks, readerError: q.r.error, nextRequestMs: ttft, baselineTtftMs: base, estimatedRemainingGenerationMs: remaining });
     const info = [`aborted after ${chunks} chunks (${fmtMs(abortedAt)}); next request answered after ${fmtMs(ttft)} (warm baseline ${fmtMs(base)}; finishing the 400-token answer would take ~${fmtMs(remaining)})`];
     if (!q.r.aborted && q.p.final) return WARN('the stream finished before 5 content chunks arrived (answer too short to test)', { info });
     if (!next.r.ok) return FAIL(`the request after the abort failed: ${next.p.errorText}`, { info, fix: 'Ollama is left in a bad state by client disconnects.' });
-    if (q.r.abortErrorName && !['AbortError', 'closed'].includes(q.r.abortErrorName)) return WARN(`client abort surfaced as ${q.r.abortErrorName} (Harness treats only AbortError as a clean stop)`, { info });
     if (remaining && base != null && remaining > 1500 && ttft > base + remaining * 0.6) return WARN('the next request waited about as long as the aborted answer needed: Ollama kept generating after the client disconnected', { info, fix: 'ChatEngine.stop() only closes the connection; with OLLAMA_NUM_PARALLEL=1 a stopped turn still occupies the model.' });
     return PASS('connection closed cleanly and the model was free right away', { info });
   }, { timeoutMs: 420000 });
@@ -1378,7 +1408,7 @@ async function ollamaGroup(run, B) {
     sample(`ollama /api/chat format=MEMORY_SCHEMA (${C})`, streamSample(q.body, q.r, q.p));
     if (!q.r.ok) {
       const retried = /format|schema|grammar/i.test(q.p.errorText || '');
-      return FAIL(`HTTP ${q.r.status}: ${excerpt(q.p.errorText, 200)}`, { info: [retried ? 'LLM.completeWith would retry without format' : 'LLM.completeWith would NOT retry (text does not match /format|schema|grammar/) → memory extraction fails'], fix: 'Structured output is rejected; adjust MEMORY_SCHEMA or the retry pattern.' });
+      return FAIL(`${hs(q.r)}: ${excerpt(q.p.errorText, 200)}`, { info: [retried ? 'LLM.completeWith would retry without format' : 'LLM.completeWith would NOT retry (text does not match /format|schema|grammar/) → memory extraction fails'], fix: 'Structured output is rejected; adjust MEMORY_SCHEMA or the retry pattern.' });
     }
     let strict = null;
     try { strict = JSON.parse(q.p.content); } catch { /* not strict JSON */ }
@@ -1399,7 +1429,7 @@ async function ollamaGroup(run, B) {
     const r = await http(O.url, '/api/generate', { method: 'POST', body: { model: C, keep_alive: O.keepAlive, options: { num_ctx: 4096 } }, timeoutMs: T(300000) });
     const last = (r.text || '').trim().split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).at(-1);
     sample('ollama POST /api/generate (load, no prompt)', { request: { model: C, keep_alive: O.keepAlive, options: { num_ctx: 4096 } }, status: r.status, body: last ?? r.text ?? r.error });
-    if (!r.ok) return FAIL(`HTTP ${r.status}: ${errorOf(r)}`, { fix: 'OllamaProvider.load() (used by POST /api/models/load and eager reload after images) would fail.' });
+    if (!r.ok) return FAIL(`${hs(r)}: ${errorOf(r)}`, { fix: 'OllamaProvider.load() (used by POST /api/models/load and eager reload after images) would fail.' });
     const ps = await psList(O, run);
     entry2 = psFind(ps.models, C);
     sample('ollama GET /api/ps (after load at num_ctx 4096)', ps.r.json ?? ps.r.text);
@@ -1412,7 +1442,7 @@ async function ollamaGroup(run, B) {
     need(entry1 && entry2, 'need /api/ps at num_ctx 2048 and 4096', 'ollama.load.generate_empty to pass');
     const dSize = entry2.size - entry1.size;
     const perTok = dSize / 2048;
-    if (dSize <= 0) return FAIL(`size did not grow: ${fmtBytes(entry1.size)} at 2048 → ${fmtBytes(entry2.size)} at 4096`, { expected: 'size(4096) > size(2048)', fix: 'fitMeasurements assumes size = fixed + perToken·num_ctx; with a flat size the fitted slope is clamped to ¼ of the estimate.' });
+    if (dSize <= 0) return FAIL(`size did not grow: ${fmtBytes(entry1.size)} at 2048 → ${fmtBytes(entry2.size)} at 4096`, { expected: 'size(4096) > size(2048)', fix: 'fitMeasurements assumes size = fixed + perToken·num_ctx; a flat or shrinking size makes it fall back to the architecture estimate for the slope (method "linear-clamped"), so measurements only correct the fixed part. Check that options.num_ctx really changes the KV allocation.' });
     O.measuredPerToken = perTok;
     return PASS(`${fmtBytes(entry1.size)} → ${fmtBytes(entry2.size)}: ${fmtBytes(perTok)} per token`);
   });
@@ -1430,7 +1460,8 @@ async function ollamaGroup(run, B) {
     const lines = [`estimate (${kvType}): ${fmtBytes(estModelOnly(2048))} at 2K, ${fmtBytes(estModelOnly(4096))} at 4K, ${fmtBytes(kv.perToken)}/token; measured ${fmtBytes(entry1.size)} / ${fmtBytes(entry2.size)}`];
     if (fit) lines.push(`fit: usable ${fit.usable}, method ${fit.method}, rejected ${fit.rejected}, fixed ${fmtBytes(fit.fixedBytes)}, per-token ${fmtBytes(fit.perTokenBytes)}`);
     if (!fit?.usable) return FAIL(`both real samples are rejected by fitMeasurements' sanity limits (0.4–3× the estimate) — Harness would ignore real measurements of this model`, { info: lines, fix: 'The architecture estimate is far off for this model; widen the sanity band or fix kvCacheModel for this architecture.' });
-    if (fit.method === 'linear-clamped') return WARN(`measured slope ${fmtBytes(O.measuredPerToken)}/token is outside ¼–4× of the estimate ${fmtBytes(kv.perToken)}/token, so the fit is clamped`, { info: lines, fix: 'kvCacheModel misjudges this architecture (sliding window? KV precision?); see ollama.ps.kv_cache_type.' });
+    const slope = (entry2.size - entry1.size) / 2048;
+    if (fit.method === 'linear-clamped') return WARN(`measured slope ${slope > 0 ? `${fmtBytes(slope)}/token` : `${Math.round(slope)} B/token (not positive)`} is outside ¼–4× of the estimate ${fmtBytes(kv.perToken)}/token, so the fit is clamped`, { info: lines, fix: slope > 0 ? 'kvCacheModel misjudges this architecture (sliding window? KV precision?); see ollama.ps.kv_cache_type.' : 'See ollama.ps.size_grows_with_num_ctx.' });
     return PASS(`usable linear fit (${fit.method})`, { info: lines });
   });
 
@@ -1454,20 +1485,20 @@ async function ollamaGroup(run, B) {
       const sent = H.normalizeKeepAlive(value);
       const send = (ka) => http(O.url, '/api/chat', { method: 'POST', body: { model: C, messages: [], stream: false, keep_alive: ka, options: { num_ctx: ctx } }, timeoutMs: T(120000) });
       const r = await send(sent);
-      const info = [`Harness sends ${JSON.stringify(sent)}${sent !== value ? ` for the setting ${JSON.stringify(value)} (normalizeKeepAlive)` : ''} → HTTP ${r.status}${r.ok ? '' : ` ${excerpt(errorOf(r), 160)}`}`];
+      const info = [`Harness sends ${JSON.stringify(sent)}${sent !== value ? ` for the setting ${JSON.stringify(value)} (normalizeKeepAlive)` : ''} → ${hs(r)}${r.ok ? '' : ` ${excerpt(errorOf(r), 160)}`}`];
       let raw = null;
       if (sent !== value) {
         raw = await send(value);
-        info.push(`raw ${JSON.stringify(value)} straight to Ollama → HTTP ${raw.status}${raw.ok ? '' : ` "${excerpt(errorOf(raw), 160)}"`}`);
+        info.push(`raw ${JSON.stringify(value)} straight to Ollama → ${hs(raw)}${raw.ok ? '' : ` "${excerpt(errorOf(raw), 160)}"`}`);
       }
       sample(`ollama keep_alive ${JSON.stringify(value)}`, { sent, status: r.status, body: r.json ?? r.text, ...(raw ? { raw: { value, status: raw.status, body: raw.json ?? raw.text } } : {}) });
-      if (!r.ok) return FAIL(`keep_alive ${JSON.stringify(sent)} rejected: HTTP ${r.status} "${excerpt(errorOf(r), 200)}"`, { info, expected: 'HTTP 200', actual: r.text ?? r.error, fix: `Every chat with keepAlive ${JSON.stringify(value)} fails. Convert this form before sending (normalizeKeepAlive in ollama.mjs) or reject it in the settings validator (settings.mjs keepAlive).` });
+      if (!r.ok) return FAIL(`keep_alive ${JSON.stringify(sent)} rejected: ${hs(r)} "${excerpt(errorOf(r), 200)}"`, { info, expected: 'HTTP 200', actual: r.text ?? r.error, fix: `Every chat with keepAlive ${JSON.stringify(value)} fails. Convert this form before sending (normalizeKeepAlive in ollama.mjs) or reject it in the settings validator (settings.mjs keepAlive).` });
       const ps = await psList(O, run);
       const e = psFind(ps.models, C);
       const d = expiresDelta(e);
       info.push(`ps expires_at ${e?.expires_at ?? '(not listed)'} → ${describeSeconds(d)} from now; intended ${describeSeconds(intended)}`);
       if (!e) return intended < 60 ? PASS('accepted; model already expired (short keep_alive)', { info }) : WARN('accepted, but the model is no longer listed in /api/ps', { info });
-      if (!expiryMatches(d, intended)) return WARN(`accepted, but Ollama keeps the model ${describeSeconds(d)} instead of ${describeSeconds(intended)}`, { info, expected: describeSeconds(intended), actual: e.expires_at, fix: 'The setting does not mean what the settings UI says; adjust normalizeKeepAlive or the validator message.' });
+      if (!expiryMatches(d, intended)) return WARN(`accepted, but Ollama keeps the model ${describeSeconds(d)} instead of ${describeSeconds(intended)}`, { info, expected: describeSeconds(intended), actual: e.expires_at, fix: 'Either Ollama gives this form another meaning (then normalizeKeepAlive / the settings validator text must change) or the server ignores keep_alive when reporting expires_at (test/fake-ollama.mjs always reports 30 min).' });
       return PASS(`accepted; expires in ${describeSeconds(d)} as intended`, { info });
     }, { timeoutMs: 240000 });
   }
@@ -1478,7 +1509,7 @@ async function ollamaGroup(run, B) {
     const t0 = nowMs();
     const r = await http(O.url, '/api/generate', { method: 'POST', body: { model: C, keep_alive: 0 }, timeoutMs: T(60000) });
     sample('ollama POST /api/generate keep_alive 0 (unload)', { status: r.status, body: r.json ?? r.text ?? r.error, ms: Math.round(r.ms) });
-    if (!r.ok) return FAIL(`unload request failed: HTTP ${r.status} ${errorOf(r)}`, { fix: 'OllamaProvider.unload throws; the image service would generate next to the resident LLM.' });
+    if (!r.ok) return FAIL(`unload request failed: ${hs(r)} ${errorOf(r)}`, { fix: 'OllamaProvider.unload throws; the image service would generate next to the resident LLM.' });
     const w = await waitGone(O, run, C, T(30000));
     const info = [`unload answered after ${fmtMs(r.ms)} (done_reason ${r.json?.done_reason ?? '?'}); /api/ps stopped listing it after ${fmtMs(nowMs() - t0)} (${w.polls} polls)`];
     O.unloadMs = w.ms + r.ms;
@@ -1495,7 +1526,7 @@ async function ollamaGroup(run, B) {
     need(TH, 'no model with "thinking" installed', NEED.think);
     const q = await chat(chatBody(TH, [{ role: 'user', content: 'What is 12 + 30? Answer with just the number.' }], { think: true, options: { num_predict: 400 } }));
     sample(`ollama /api/chat think:true (${TH})`, streamSample(q.body, q.r, q.p));
-    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.p.errorText}`, { fix: `resolveThink sends think:true to this model (capabilities include thinking); the turn would fail${/think/i.test(q.p.errorText || '') ? ', or retry without thinking' : ''}.` });
+    if (!q.r.ok) return FAIL(`${hs(q.r)}: ${q.p.errorText}`, { fix: `resolveThink sends think:true to this model (capabilities include thinking); the turn would fail${/think/i.test(q.p.errorText || '') ? ', or retry without thinking' : ''}.` });
     const info = [`thinking ${q.p.thinking.length} chars (first after ${fmtMs(q.p.firstThinkingMs)}), content ${excerpt(q.p.content, 80)}`];
     if (q.p.thinking) return PASS(`message.thinking streamed separately (${q.p.thinking.length} chars)`, { info });
     if (/<think>/i.test(q.p.content)) return WARN('reasoning came inline as <think> tags in content, not in message.thinking (ThinkTagParser copes)', { info });
@@ -1506,7 +1537,7 @@ async function ollamaGroup(run, B) {
     need(TH, 'no model with "thinking" installed', NEED.think);
     const q = await chat(chatBody(TH, [{ role: 'user', content: 'What is 12 + 30? Answer with just the number.' }], { think: false, options: { num_predict: 64 } }));
     sample(`ollama /api/chat think:false (${TH})`, streamSample(q.body, q.r, q.p));
-    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.p.errorText}`, { fix: 'LLM.completeWith sends think:false for internal tasks; they would all fail.' });
+    if (!q.r.ok) return FAIL(`${hs(q.r)}: ${q.p.errorText}`, { fix: 'LLM.completeWith sends think:false for internal tasks; they would all fail.' });
     if (q.p.thinking) return WARN(`thinking still produced (${q.p.thinking.length} chars) with think:false — internal tasks pay for it in tokens/time`, { info: [`content: ${excerpt(q.p.content, 100)}`] });
     if (/<think>/i.test(q.p.content)) return WARN('content contains <think> tags with think:false (stripThinking removes them)', { info: [excerpt(q.p.content, 160)] });
     return PASS(`no thinking; content "${excerpt(q.p.content, 60)}"`);
@@ -1529,8 +1560,8 @@ async function ollamaGroup(run, B) {
     sample(`ollama /api/chat think:true on ${NT} (no thinking)`, { status: q.r.status, body: q.r.ok ? q.p.objs.slice(-1) : (q.r.json ?? q.r.bodyText) });
     if (q.r.ok) return WARN(`accepted silently (HTTP 200) — harmless because resolveThink only sends think to models whose capabilities include "thinking"`, { info: [`model ${NT}`] });
     const code = classifyCode(q.r.status, q.p.errorText);
-    if (code === 'thinking_unsupported') return PASS(`HTTP ${q.r.status} "${excerpt(q.p.errorText, 160)}" → thinking_unsupported (retry path works)`);
-    return FAIL(`HTTP ${q.r.status} "${excerpt(q.p.errorText, 160)}" → ${code}`, { expected: 'text matching /does not support thinking|think.*not supported/', actual: q.p.errorText, fix: 'Update the thinking_unsupported pattern in classifyOllamaError to this exact text.' });
+    if (code === 'thinking_unsupported') return PASS(`${hs(q.r)} "${excerpt(q.p.errorText, 160)}" → thinking_unsupported (retry path works)`);
+    return FAIL(`${hs(q.r)} "${excerpt(q.p.errorText, 160)}" → ${code}`, { expected: 'text matching /does not support thinking|think.*not supported/', actual: q.p.errorText, fix: 'Update the thinking_unsupported pattern in classifyOllamaError to this exact text.' });
   }, { timeoutMs: 300000 });
 
   // ---- tools
@@ -1541,7 +1572,7 @@ async function ollamaGroup(run, B) {
     need(TM, 'no model with "tools" installed', NEED.tool);
     const q = await chat(chatBody(TM, toolMsgs, { ...thinkOffFor(TM), tools: toolsSchema(), options: { num_predict: 256 } }));
     sample(`ollama /api/chat tools (${TM})`, streamSample(q.body, q.r, q.p));
-    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.p.errorText}`, { fix: 'The capability says "tools", but the request fails.' });
+    if (!q.r.ok) return FAIL(`${hs(q.r)}: ${q.p.errorText}`, { fix: 'The capability says "tools", but the request fails.' });
     const info = [];
     if (!q.p.toolCalls.length) {
       const textual = /"name"\s*:\s*"calculate"|<tool_call>|\bcalculate\s*\(/i.test(q.p.content);
@@ -1557,7 +1588,7 @@ async function ollamaGroup(run, B) {
     if (typeof fn.arguments === 'string') {
       let parsed = null;
       try { parsed = JSON.parse(fn.arguments); } catch { /* not JSON */ }
-      return WARN(`function.arguments is a STRING (${parsed ? 'valid JSON' : 'not even JSON'}) — parseArgs() ${parsed ? 'parses it, so Harness copes' : 'wraps it as {_raw}, the tool gets no expression'}; the fakes send an object`, { info, expected: 'arguments as a JSON object', actual: fn.arguments, fix: 'Make test/fake-ollama.mjs (and docs) reflect string arguments if this is real.' });
+      return WARN(`function.arguments is a STRING (${parsed ? 'valid JSON' : 'not even JSON'}) — parseArgs() ${parsed ? 'parses it, so Harness copes' : 'wraps it as {_raw}, the tool gets no expression'}; the fakes send an object`, { info, expected: 'arguments as a JSON object', actual: fn.arguments, fix: 'Nothing breaks in Harness; update test/fake-ollama.mjs (it sends objects) if real Ollama does this.' });
     }
     if (!isObj(fn.arguments)) return FAIL(`function.arguments is ${JSON.stringify(fn.arguments)}`, { info, expected: 'an object', fix: 'parseArgs() returns {} → the tool runs without arguments.' });
     if (typeof fn.arguments.expression !== 'string') return WARN(`arguments ${JSON.stringify(fn.arguments)} lack "expression"`, { info });
@@ -1570,7 +1601,7 @@ async function ollamaGroup(run, B) {
     const msgs = [...toolMsgs, { role: 'assistant', content: '', tool_calls: [{ function: { name: toolCall.function.name, arguments: args } }] }, { role: 'tool', content: '17*23 = 391', tool_name: toolCall.function.name }];
     const q = await chat(chatBody(TM, msgs, { ...thinkOffFor(TM), tools: toolsSchema(), options: { num_predict: 128 } }));
     sample(`ollama /api/chat tool result round trip (${TM})`, streamSample(q.body, q.r, q.p));
-    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.p.errorText}`, { fix: 'toOllamaMessage() output (tool_calls + role "tool" + tool_name) is rejected.' });
+    if (!q.r.ok) return FAIL(`${hs(q.r)}: ${q.p.errorText}`, { fix: 'toOllamaMessage() output (tool_calls + role "tool" + tool_name) is rejected.' });
     if (!q.p.content && q.p.toolCalls.length) return WARN('the model called a tool again instead of answering', { info: [excerpt(q.p.toolCalls, 200)] });
     if (!q.p.content) return FAIL('empty answer after the tool result', { actual: excerpt(q.p.final), fix: 'Check that tool_name / role "tool" are understood by this Ollama version.' });
     if (!q.p.content.includes('391')) return WARN(`answer does not mention 391: "${excerpt(q.p.content, 160)}"`);
@@ -1584,8 +1615,8 @@ async function ollamaGroup(run, B) {
     sample(`ollama /api/chat tools on ${PL} (no tools)`, { status: q.r.status, body: q.r.ok ? q.p.objs.slice(-1) : (q.r.json ?? q.r.bodyText) });
     if (q.r.ok) return WARN('accepted silently (HTTP 200): Harness would never notice — harmless because toolsFor() offers tools only to models whose capabilities include "tools"');
     const code = classifyCode(q.r.status, q.p.errorText);
-    if (code === 'tools_unsupported') return PASS(`HTTP ${q.r.status} "${excerpt(q.p.errorText, 160)}" → tools_unsupported`);
-    return FAIL(`HTTP ${q.r.status} "${excerpt(q.p.errorText, 160)}" → ${code}`, { expected: 'text matching /does not support tools/', actual: q.p.errorText, fix: 'Update the tools_unsupported pattern in classifyOllamaError.' });
+    if (code === 'tools_unsupported') return PASS(`${hs(q.r)} "${excerpt(q.p.errorText, 160)}" → tools_unsupported`);
+    return FAIL(`${hs(q.r)} "${excerpt(q.p.errorText, 160)}" → ${code}`, { expected: 'text matching /does not support tools/', actual: q.p.errorText, fix: 'Update the tools_unsupported pattern in classifyOllamaError.' });
   }, { timeoutMs: 300000 });
 
   // ---- embeddings
@@ -1596,7 +1627,7 @@ async function ollamaGroup(run, B) {
     const input = ['The cat sat on the mat.', 'A dog runs in the park.'];
     const r = await http(O.url, '/api/embed', { method: 'POST', body: { model: E, input, keep_alive: H.normalizeKeepAlive('10m') }, timeoutMs: T(180000) });
     sample(`ollama POST /api/embed (${E})`, { request: { model: E, input }, status: r.status, body: r.json ?? r.text ?? r.error });
-    if (!r.ok) return FAIL(`HTTP ${r.status}: ${errorOf(r)}`, { fix: 'Embedder.embed falls back to BM25 for 30 s after every failure.' });
+    if (!r.ok) return FAIL(`${hs(r)}: ${errorOf(r)}`, { fix: 'Embedder.embed falls back to BM25 for 30 s after every failure.' });
     O.used.add(E);
     embedLoaded = true;
     const em = r.json?.embeddings;
@@ -1615,8 +1646,8 @@ async function ollamaGroup(run, B) {
     sample(`ollama /api/chat on embedding model ${E}`, { status: q.r.status, body: q.r.ok ? q.p.objs.slice(-1) : (q.r.json ?? q.r.bodyText) });
     if (q.r.ok) return WARN('an embedding model accepted a chat request', { info: [excerpt(q.p.content, 100)] });
     const code = classifyCode(q.r.status, q.p.errorText);
-    if (code === 'not_chat_model') return PASS(`HTTP ${q.r.status} "${excerpt(q.p.errorText, 120)}" → not_chat_model`);
-    return WARN(`HTTP ${q.r.status} "${excerpt(q.p.errorText, 160)}" → ${code} (Harness checks capabilities first, so only the message shown differs)`);
+    if (code === 'not_chat_model') return PASS(`${hs(q.r)} "${excerpt(q.p.errorText, 120)}" → not_chat_model`);
+    return WARN(`${hs(q.r)} "${excerpt(q.p.errorText, 160)}" → ${code} (Harness checks capabilities first, so only the message shown differs)`);
   }, { timeoutMs: 90000 });
 
   await run.check('ollama.unload.embedding', async ({ sample }) => {
@@ -1628,7 +1659,7 @@ async function ollamaGroup(run, B) {
     const gMsg = g.ok ? null : errorOf(g);
     const gCode = g.ok ? null : classifyCode(g.status, gMsg);
     sample(`ollama POST /api/generate keep_alive 0 on embedding model ${E}`, { status: g.status, body: g.json ?? g.text ?? g.error });
-    const info = [`/api/generate keep_alive 0 → HTTP ${g.status}${g.ok ? ` done_reason ${g.json?.done_reason ?? '?'}` : ` "${excerpt(gMsg, 140)}" → ${gCode}`}`];
+    const info = [`/api/generate keep_alive 0 → ${hs(g)}${g.ok ? ` done_reason ${g.json?.done_reason ?? '?'}` : ` "${excerpt(gMsg, 140)}" → ${gCode}`}`];
     const fallbackWouldRun = !g.ok && (gCode === 'not_chat_model' || /embed/i.test(gMsg || ''));
     if (!g.ok && !fallbackWouldRun) return FAIL(`OllamaProvider.unload() would throw: the generate error "${excerpt(gMsg, 160)}" does not trigger the /api/embed fallback`, { info, fix: 'Match this text in OllamaProvider.unload (or check capabilities and go straight to /api/embed for embedding models).' });
     let w = g.ok ? await waitGone(O, run, E, T(3000)) : { gone: false };
@@ -1651,14 +1682,14 @@ async function ollamaGroup(run, B) {
     sample('ollama /api/chat unknown model', { status: q.r.status, body: q.r.json ?? q.r.bodyText ?? q.r.error });
     const code = classifyCode(q.r.status, q.p.errorText);
     if (q.r.status === 404 && code === 'model_not_found') return PASS(`HTTP 404 "${excerpt(q.p.errorText, 120)}" → model_not_found`);
-    return FAIL(`HTTP ${q.r.status} "${excerpt(q.p.errorText, 160)}" → ${code}`, { expected: 'HTTP 404 → model_not_found', fix: 'Adjust classifyOllamaError.' });
+    return FAIL(`${hs(q.r)} "${excerpt(q.p.errorText, 160)}" → ${code}`, { expected: 'HTTP 404 → model_not_found', fix: 'Adjust classifyOllamaError.' });
   });
 
   await run.check('ollama.errors.delete_unknown_model', async ({ sample }) => {
     const r = await http(O.url, '/api/delete', { method: 'DELETE', body: { model: 'livecheck-no-such-model:latest' }, timeoutMs: T(15000) });
     sample('ollama DELETE /api/delete unknown model', { status: r.status, body: r.json ?? r.text ?? r.error });
     if (r.status === 404) return PASS(`HTTP 404 "${excerpt(errorOf(r), 120)}"`);
-    return WARN(`HTTP ${r.status} "${excerpt(errorOf(r), 160)}"`, { expected: 'HTTP 404', fix: 'DELETE /api/models would report this status for a vanished model.' });
+    return WARN(`${hs(r)} "${excerpt(errorOf(r), 160)}"`, { expected: 'HTTP 404', fix: 'DELETE /api/models would report this status for a vanished model.' });
   });
 
   await run.check('ollama.errors.pull_unknown_model', async ({ sample }) => {
@@ -1669,7 +1700,7 @@ async function ollamaGroup(run, B) {
     if (!msg) return FAIL(`no error for a non-existent model (${r.ok ? `${p.objs.length} lines, last ${excerpt(p.objs.at(-1))}` : r.error})`, { fix: 'OllamaProvider.pull only fails on an {error} line.' });
     const code = r.ok ? (/not found|does not exist|manifest/i.test(msg) ? 'model_not_found' : 'provider_error') : classifyCode(r.status, msg);
     const offline = /dial tcp|lookup|no such host|connection refused|i\/o timeout|tls|certificate|network is unreachable|EOF/i.test(msg);
-    const info = [`${r.ok ? `HTTP 200 stream, error line after ${p.objs.length - 1} status line(s)` : `HTTP ${r.status}`}: "${excerpt(msg, 200)}" → ${code}`];
+    const info = [`${r.ok ? `HTTP 200 stream, error line after ${p.objs.length - 1} status line(s)` : `${hs(r)}`}: "${excerpt(msg, 200)}" → ${code}`];
     if (offline) return WARN('the registry is unreachable from here, so the real "not found" text could not be captured', { info, fix: code === 'model_not_found' ? 'Note: this network error is classified as model_not_found because it contains "manifest" — the UI would say the model does not exist when the machine is offline. Match network errors first in OllamaProvider.pull.' : undefined });
     if (code === 'model_not_found') return PASS(info[0]);
     return FAIL(`error "${excerpt(msg, 160)}" is classified as ${code}`, { info, expected: 'model_not_found', fix: 'Extend the pattern in OllamaProvider.pull.' });
@@ -1739,7 +1770,7 @@ function parseOaiStream(r) {
   }
   if (!r.ok) {
     const j = r.json;
-    const m = j?.error?.message || j?.error || j?.message || r.bodyText || r.error || `HTTP ${r.status}`;
+    const m = j?.error?.message || j?.error || j?.message || r.bodyText || r.error || `${hs(r)}`;
     out.errorText = typeof m === 'string' ? m : JSON.stringify(m);
   }
   return out;
@@ -1819,9 +1850,9 @@ async function openaiGroup(run, S) {
     const entry = list.find((m) => m.model === M) || list[0] || { model: M };
     const info = H.normalizeOpenAIModel(prov, entry, si);
     const plan = H.computeContextPlan({ providerKind: 'openai', serverCtx: info.serverContext, modelMax: info.contextLength, modelMaxSource: info.contextLengthSource, advertisedMax: info.advertisedContextLength, modelBytes: info.sizeBytes || 0, system: { totalMem: os.totalmem(), platform: process.platform, arch: process.arch } });
-    const lines = [`flavor after status(): ${prov.flavor}; /props → HTTP ${props.status}${props.json?.default_generation_settings?.n_ctx ? ` n_ctx ${props.json.default_generation_settings.n_ctx}` : ''}${props.json?.n_ctx ? ` top-level n_ctx ${props.json.n_ctx}` : ''}`,
+    const lines = [`flavor after status(): ${prov.flavor}; /props → ${hs(props)}${props.json?.default_generation_settings?.n_ctx ? ` n_ctx ${props.json.default_generation_settings.n_ctx}` : ''}${props.json?.n_ctx ? ` top-level n_ctx ${props.json.n_ctx}` : ''}`,
       `Harness: serverContext ${info.serverContext ?? 'unknown'}, model max ${info.contextLength ?? 'unknown'} (${info.contextLengthSource}), plan num_ctx ${plan.numCtx} — "${plan.explanation}"`];
-    if (lmr) lines.push(`LM Studio /api/v0/models → HTTP ${lmr.status}${lmr.json?.data ? `: ${lmr.json.data.slice(0, 4).map((m) => `${m.id} ${m.type} ${m.state} max ${m.max_context_length} loaded ${m.loaded_context_length ?? 'absent'}`).join(' | ')}` : ''}`);
+    if (lmr) lines.push(`LM Studio /api/v0/models → ${hs(lmr)}${lmr.json?.data ? `: ${lmr.json.data.slice(0, 4).map((m) => `${m.id} ${m.type} ${m.state} max ${m.max_context_length} loaded ${m.loaded_context_length ?? 'absent'}`).join(' | ')}` : ''}`);
     if (info.serverContext) return PASS(`server context ${info.serverContext} tokens`, { info: lines });
     if (info.contextLength) return WARN(`no loaded-context figure; Harness plans with the trained maximum ${info.contextLength} (requests beyond the real -c / load setting fail with a context error)`, { info: lines, fix: S.flavor === 'lmstudio' ? 'LM Studio did not report loaded_context_length for the model; read it from another field.' : 'Read the server context from /props (llama.cpp) or ask the user.' });
     return FAIL('neither the server context nor the model maximum is exposed — Harness assumes 8K', { info: lines, fix: 'Add a source for the context size of this server.' });
@@ -1834,7 +1865,7 @@ async function openaiGroup(run, S) {
     base = await oaiChat(chatBody());
     const { r, s } = base;
     sample(`${S.sid} POST /v1/chat/completions stream`, oaiSample(base.body, r, s));
-    if (!r.ok) return FAIL(`HTTP ${r.status}: ${excerpt(s.errorText, 300)}`, { fix: 'Every chat turn through this provider would fail.' });
+    if (!r.ok) return FAIL(`${hs(r)}: ${excerpt(s.errorText, 300)}`, { fix: 'Every chat turn through this provider would fail.' });
     const problems = [];
     if (r.error) problems.push(`stream broke: ${r.error}`);
     if (s.bad.length) problems.push(`${s.bad.length} data line(s) are not JSON`);
@@ -1860,7 +1891,7 @@ async function openaiGroup(run, S) {
     need(M, 'no model to chat with', pick.why);
     const q = await oaiChat(chatBody({ messages: [{ role: 'user', content: 'Write a long story about a dragon who bakes bread.' }], max_tokens: 3 }));
     sample(`${S.sid} chat max_tokens 3 (last chunks)`, { status: q.r.status, chunks: q.s.chunks.slice(-2), body: q.r.ok ? undefined : q.r.json ?? q.r.bodyText });
-    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${q.s.errorText}`);
+    if (!q.r.ok) return FAIL(`${hs(q.r)}: ${q.s.errorText}`);
     if (q.s.finish === 'length') return PASS('finish_reason "length"');
     return WARN(`finish_reason "${q.s.finish}" after hitting max_tokens — truncated answers would not be marked`, { expected: '"length"', fix: 'Map this finish_reason in OpenAICompatProvider.chat (finishReason "length").' });
   }, { timeoutMs: 300000 });
@@ -1874,7 +1905,7 @@ async function openaiGroup(run, S) {
       q = await oaiChat(chatBody({ model: R, messages: [{ role: 'user', content: 'What is 12 + 30? Think step by step, then answer.' }], max_tokens: 400 }));
       s = q.s;
       sample(`${S.sid} chat reasoning (${R})`, oaiSample(q.body, q.r, s));
-      if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${s.errorText}`);
+      if (!q.r.ok) return FAIL(`${hs(q.r)}: ${s.errorText}`);
     }
     const info = [`delta keys {${[...s.deltaKeys].join(', ')}}`];
     if (s.otherReasoningKeys.size) return FAIL(`reasoning arrives in delta.${[...s.otherReasoningKeys].join('/')}, which Harness ignores`, { info, expected: 'reasoning_content or reasoning', fix: 'Read this field in OpenAICompatProvider.chat.' });
@@ -1888,7 +1919,7 @@ async function openaiGroup(run, S) {
     need(M, 'no model to chat with', pick.why);
     const q = await oaiChat(chatBody({ chat_template_kwargs: { enable_thinking: false }, max_tokens: 16 }));
     sample(`${S.sid} chat chat_template_kwargs enable_thinking:false`, oaiSample(q.body, q.r, q.s));
-    if (!q.r.ok) return FAIL(`rejected: HTTP ${q.r.status} ${excerpt(q.s.errorText, 200)}`, { fix: 'Every turn with reasoning "off" would fail on llama.cpp; drop chat_template_kwargs.' });
+    if (!q.r.ok) return FAIL(`rejected: ${hs(q.r)} ${excerpt(q.s.errorText, 200)}`, { fix: 'Every turn with reasoning "off" would fail on llama.cpp; drop chat_template_kwargs.' });
     return PASS(`accepted${q.s.reasoning ? ` (but ${q.s.reasoning.length} chars of reasoning still came)` : ''}`);
   }, { timeoutMs: 300000 });
 
@@ -1901,7 +1932,7 @@ async function openaiGroup(run, S) {
     sample(`${S.sid} chat with tools`, oaiSample(q.body, q.r, q.s));
     if (!q.r.ok) {
       toolsRejected = { status: q.r.status, text: q.s.errorText };
-      return SKIP(`the server rejected tools: HTTP ${q.r.status} "${excerpt(q.s.errorText, 160)}" (classification in ${id('tools.unsupported_error')})`, 'a server started with tool support (llama.cpp: --jinja)');
+      return SKIP(`the server rejected tools: ${hs(q.r)} "${excerpt(q.s.errorText, 160)}" (classification in ${id('tools.unsupported_error')})`, 'a server started with tool support (llama.cpp: --jinja)');
     }
     const calls = assembleToolCalls(q.s.toolDeltas);
     const info = [`${q.s.toolDeltas.length} tool_call delta(s); finish_reason ${q.s.finish}; first delta ${excerpt(q.s.toolDeltas[0], 200)}`];
@@ -1924,7 +1955,7 @@ async function openaiGroup(run, S) {
     const msgs = [...toolMsgs, H.toOpenAIMessage({ role: 'assistant', content: '', toolCalls: [{ id: oaiCall.id || 'call_0', name: oaiCall.name, arguments: oaiCall.arguments }] }), H.toOpenAIMessage({ role: 'tool', toolCallId: oaiCall.id || 'call_0', content: '17*23 = 391' })];
     const q = await oaiChat(chatBody({ messages: msgs, tools: toolsSchema(), tool_choice: 'auto', max_tokens: 160 }));
     sample(`${S.sid} chat tool result round trip`, oaiSample(q.body, q.r, q.s));
-    if (!q.r.ok) return FAIL(`HTTP ${q.r.status}: ${excerpt(q.s.errorText, 200)}`, { fix: 'toOpenAIMessage() output is rejected (content null with tool_calls? tool_call_id?).' });
+    if (!q.r.ok) return FAIL(`${hs(q.r)}: ${excerpt(q.s.errorText, 200)}`, { fix: 'toOpenAIMessage() output is rejected (content null with tool_calls? tool_call_id?).' });
     if (!q.s.content) return WARN(`no text answer (finish ${q.s.finish}, ${q.s.toolDeltas.length} new tool deltas)`);
     return q.s.content.includes('391') ? PASS(`"${excerpt(q.s.content, 100)}"`) : WARN(`answer ignores the result: "${excerpt(q.s.content, 140)}"`);
   }, { timeoutMs: 300000 });
@@ -1948,7 +1979,7 @@ async function openaiGroup(run, S) {
     const em = models.map((m) => m.id).find((x) => H.EMBEDDING_NAME_RE.test(x)) || M;
     const r = await http(S.url, '/v1/embeddings', { method: 'POST', body: { model: em, input: ['The cat sat on the mat.', 'A dog runs in the park.'] }, timeoutMs: T(120000), apiKey: key });
     sample(`${S.sid} POST /v1/embeddings (${em})`, { status: r.status, body: r.json ?? r.text ?? r.error });
-    if (!r.ok) return WARN(`not available for ${em}: HTTP ${r.status} "${excerpt(errorOf(r), 160)}"`, { info: ['Harness uses this provider for embeddings only when configured (settings.embeddings.model)'], fix: S.flavor === 'llamacpp' ? 'llama-server needs --embeddings (and an embedding model) for this.' : undefined });
+    if (!r.ok) return WARN(`not available for ${em}: ${hs(r)} "${excerpt(errorOf(r), 160)}"`, { info: ['Harness uses this provider for embeddings only when configured (settings.embeddings.model)'], fix: S.flavor === 'llamacpp' ? 'llama-server needs --embeddings (and an embedding model) for this.' : undefined });
     const data = r.json?.data;
     if (!Array.isArray(data) || data.length !== 2 || !data.every((d) => Array.isArray(d.embedding))) return FAIL('unexpected shape', { actual: excerpt(r.json, 300), expected: 'data:[{index, embedding:[…]}×2]' });
     return PASS(`2 × ${data[0].embedding.length} dims (model ${em})${data.some((d) => d.index === undefined) ? '; no index fields (order assumed)' : ''}`);
@@ -1960,8 +1991,8 @@ async function openaiGroup(run, S) {
     sample(`${S.sid} chat unknown model`, { status: q.r.status, body: q.r.ok ? q.s.chunks.slice(-1) : q.r.json ?? q.r.bodyText });
     if (q.r.ok) return PASS('the server ignores the model name and serves its loaded model');
     const code = H.classifyOpenAIError(q.r.status, q.s.errorText).code;
-    if (code === 'model_not_found') return PASS(`HTTP ${q.r.status} "${excerpt(q.s.errorText, 120)}" → model_not_found`);
-    return WARN(`HTTP ${q.r.status} "${excerpt(q.s.errorText, 160)}" → ${code}`, { fix: 'The UI would show a generic provider error instead of "model not found".' });
+    if (code === 'model_not_found') return PASS(`${hs(q.r)} "${excerpt(q.s.errorText, 120)}" → model_not_found`);
+    return WARN(`${hs(q.r)} "${excerpt(q.s.errorText, 160)}" → ${code}`, { fix: 'The UI would show a generic provider error instead of "model not found".' });
   }, { timeoutMs: 150000 });
 }
 
@@ -1979,13 +2010,15 @@ async function startRecordingProxy(target) {
     log.push(entry);
     try {
       const headers = {};
-      for (const [k, v] of Object.entries(req.headers)) if (!['host', 'content-length', 'connection'].includes(k)) headers[k] = v;
-      const r = await fetch(target + req.url, { method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : reqBuf });
-      const buf = Buffer.from(await r.arrayBuffer());
-      entry.status = r.status;
+      for (const [k, v] of Object.entries(req.headers)) if (!['host', 'connection'].includes(k)) headers[k] = v;
+      const { res: up, done } = await rawRequest(target + req.url, { method: req.method, headers, body: reqBuf.length ? reqBuf : undefined });
+      const chunks2 = [];
+      try { for await (const c of up) chunks2.push(c); } finally { done(); }
+      const buf = Buffer.concat(chunks2);
+      entry.status = up.statusCode;
       entry.ms = Date.now() - entry.at;
       entry.resBuf = buf;
-      res.writeHead(r.status, { 'content-type': r.headers.get('content-type') || 'application/octet-stream', 'content-length': buf.length });
+      res.writeHead(up.statusCode, { 'content-type': up.headers['content-type'] || 'application/octet-stream', 'content-length': buf.length });
       res.end(buf);
     } catch (e) {
       entry.error = errText(e);
@@ -2323,7 +2356,7 @@ async function comfyGroup(run, B) {
     const res = {};
     for (const c of classes) {
       const r = await http(url, `/object_info/${c}`, { timeoutMs: T(15000) });
-      res[c] = r.status === 200 && isObj(r.json) ? (r.json[c] ? 'present' : 'MISSING') : `HTTP ${r.status}`;
+      res[c] = r.status === 200 && isObj(r.json) ? (r.json[c] ? 'present' : 'MISSING') : `${hs(r)}`;
     }
     sample('comfyui node classes used by the default workflows', res);
     const missing = Object.entries(res).filter(([, v]) => v === 'MISSING').map(([k]) => k);
@@ -2354,7 +2387,8 @@ async function comfyGroup(run, B) {
     sample('comfyui GET /queue and GET /interrupt', { queue: { status: q.status, body: q.json ?? q.text }, interruptGet: { status: i.status, body: i.json ?? i.text } });
     const lines = [`GET /queue → ${q.status} ${isObj(q.json) ? `{${Object.keys(q.json).join(', ')}}` : ''}; GET /interrupt → ${i.status}`];
     if (!q.ok || !Array.isArray(q.json?.queue_running)) return WARN('GET /queue does not answer {queue_running, queue_pending}', { info: lines });
-    if (i.status === 404) return WARN('GET /interrupt → 404 (a POST-only route usually answers 405); not verified with POST without --allow-images', { info: lines });
+    if (i.status === 404 && !run.opts.allowImages) return WARN('GET /interrupt → 404 (a POST-only route usually answers 405); not verified with POST without --allow-images', { info: lines });
+    if (i.status === 404) return PASS(`${lines[0]} (POST /interrupt is exercised by comfyui.interrupt_during)`);
     return PASS(lines[0]);
   });
   await run.check('comfyui.websocket', async ({ sample }) => {
@@ -2375,7 +2409,7 @@ async function comfyGroup(run, B) {
     let harnessMsg = null;
     try { await H.imageJson({ baseUrl: url, name: 'ComfyUI', id: 'comfyui', apiKey: '' }, '/prompt', { method: 'POST', body: { prompt: wf, client_id: 'livecheck' }, timeoutMs: T(30000) }); } catch (e) { harnessMsg = e.message; }
     const detail = JSON.stringify(raw.json?.node_errors || {});
-    const lines = [`HTTP ${raw.status}; node_errors ${excerpt(raw.json?.node_errors ?? 'absent', 250)}`, `Harness would show: ${harnessMsg ? `"${excerpt(harnessMsg, 200)}"` : '(no error from imageJson — then comfyui.mjs checks node_errors itself)'}`];
+    const lines = [`${hs(raw)}; node_errors ${excerpt(raw.json?.node_errors ?? 'absent', 250)}`, `Harness would show: ${harnessMsg ? `"${excerpt(harnessMsg, 200)}"` : '(no error from imageJson — then comfyui.mjs checks node_errors itself)'}`];
     if (raw.ok && raw.json?.prompt_id && !Object.keys(raw.json?.node_errors || {}).length) return FAIL('an invalid checkpoint was accepted and queued', { info: lines });
     if (raw.ok) return PASS('HTTP 200 with node_errors (Harness throws "workflow error …" with the details)', { info: lines });
     const hasDetail = harnessMsg && /ckpt_name|not in list|livecheck-no-such/i.test(harnessMsg);
@@ -2401,7 +2435,7 @@ async function comfyGroup(run, B) {
       tSubmit = Date.now();
       const r = await http(url, '/prompt', { method: 'POST', body: { prompt: wf, client_id: clientId }, timeoutMs: T(30000) });
       sample('comfyui POST /prompt (Harness default workflow, 64×64, 2 steps)', { request: { prompt: wf, client_id: clientId }, status: r.status, body: r.json ?? r.text ?? r.error });
-      if (!r.ok) return FAIL(`HTTP ${r.status}: ${excerpt(r.json ?? r.text, 300)}`, { fix: 'The built-in workflow is rejected by this ComfyUI.' });
+      if (!r.ok) return FAIL(`${hs(r)}: ${excerpt(r.json ?? r.text, 300)}`, { fix: 'The built-in workflow is rejected by this ComfyUI.' });
       if (!r.json?.prompt_id) return FAIL('no prompt_id', { actual: r.text });
       promptId = r.json.prompt_id;
       return PASS(`prompt_id ${promptId}, number ${r.json.number}, node_errors ${JSON.stringify(r.json.node_errors ?? null)}`);
@@ -2442,14 +2476,14 @@ async function comfyGroup(run, B) {
       const r = await http(url, `/view?${qs}`, { timeoutMs: T(60000), binary: true });
       const d = r.buf ? decodeImage(r.buf) : null;
       sample('comfyui GET /view', { status: r.status, headers: r.headers, image: d && { mime: d.mime, width: d.width, height: d.height, bytes: d.bytes } });
-      if (!r.ok || !d?.recognized) return FAIL(`→ HTTP ${r.status}, ${d ? `${d.bytes} bytes, not an image` : r.error}`);
+      if (!r.ok || !d?.recognized) return FAIL(`→ ${hs(r)}, ${d ? `${d.bytes} bytes, not an image` : r.error}`);
       return PASS(`${d.width}×${d.height} ${d.mime} (${fmtBytes(d.bytes)})`);
     });
     await run.check('comfyui.interrupt_during', async ({ sample }) => {
       need(ckpt, 'no checkpoint installed', 'a checkpoint');
       const from = sock.msgs.length;
       const r = await http(url, '/prompt', { method: 'POST', body: { prompt: fill({ steps: 40, width: 256, height: 256 }), client_id: clientId }, timeoutMs: T(30000) });
-      if (!r.ok || !r.json?.prompt_id) return FAIL(`could not queue: HTTP ${r.status}`);
+      if (!r.ok || !r.json?.prompt_id) return FAIL(`could not queue: ${hs(r)}`);
       const id = r.json.prompt_id;
       const t0 = nowMs();
       while (nowMs() - t0 < T(60000)) {
@@ -2462,8 +2496,8 @@ async function comfyGroup(run, B) {
       const ir = await http(url, '/interrupt', { method: 'POST', body: {}, timeoutMs: T(10000) });
       const h = await waitHistory(url, id, run, { maxMs: T(300000) });
       sample('comfyui interrupt during a job', { interrupt: { status: ir.status, body: ir.json ?? ir.text }, history: h.entry?.status });
-      const lines = [`POST /interrupt → HTTP ${ir.status} after ${fmtMs(nowMs() - t0)}; history status ${excerpt(h.entry?.status, 200)}`];
-      if (!ir.ok) return FAIL(`POST /interrupt → HTTP ${ir.status}`, { info: lines, fix: 'Cancelling a ComfyUI job would not stop it.' });
+      const lines = [`POST /interrupt → ${hs(ir)} after ${fmtMs(nowMs() - t0)}; history status ${excerpt(h.entry?.status, 200)}`];
+      if (!ir.ok) return FAIL(`POST /interrupt → ${hs(ir)}`, { info: lines, fix: 'Cancelling a ComfyUI job would not stop it.' });
       const msgs = JSON.stringify(h.entry?.status?.messages || []);
       if (h.entry?.status?.status_str === 'error' || /interrupt/i.test(msgs)) return PASS('the run was interrupted', { info: lines });
       return WARN('the job finished normally (too fast to interrupt, or interrupt ignored)', { info: lines });
@@ -2584,7 +2618,7 @@ async function e2eGroup(run, B) {
   const api = (method, p, body, timeoutMs = 60000) => http(base, p, { method, body, timeoutMs: T(timeoutMs) });
   const newChat = async (chatSettings) => {
     const r = await api('POST', '/api/chats', { settings: chatSettings });
-    if (r.status !== 201) throw new Error(`POST /api/chats → HTTP ${r.status}: ${excerpt(r.json ?? r.text, 200)}`);
+    if (r.status !== 201) throw new Error(`POST /api/chats → ${hs(r)}: ${excerpt(r.json ?? r.text, 200)}`);
     return r.json.chat.id;
   };
   const turn = (chatId, content, { timeoutMs = 600000, onEvent } = {}) => harnessSse(base, `/api/chats/${chatId}/messages`, { content }, { timeoutMs: T(timeoutMs), onEvent });
@@ -2792,7 +2826,7 @@ async function e2eGroup(run, B) {
       const list = await api('GET', '/api/memories');
       sample('harness POST /api/memories/extract', { extract: r.json ?? r.text, memories: list.json?.memories });
       if (!r.ok) return FAIL(`→ ${httpSummary(r)}`, { fix: 'extractMemories failed with the real model (format rejected? see ollama.format.json_schema).' });
-      const added = [...(r.json.added || []), ...(r.json.updated || [])];
+      const added = [...new Map([...(r.json.added || []), ...(r.json.updated || [])].map((m) => [m.id, m])).values()];
       const info = [...added.map((m) => `memory: ${m.content} (${m.category})`), ...(r.json.skipped || []).map((s) => `skipped: ${s}`)];
       if (!added.length) return WARN('no memory extracted from a clear self-introduction (model quality or format problem)', { info });
       return PASS(`${added.length} memor${added.length === 1 ? 'y' : 'ies'} extracted`, { info });
@@ -2868,7 +2902,7 @@ async function e2eGroup(run, B) {
         if (!img) return FAIL('done without images', { info });
         const f = await http(base, `/api/images/${img.id}/file`, { timeoutMs: T(30000), binary: true });
         const d = f.buf ? decodeImage(f.buf) : null;
-        info.push(`stored ${img.id}: ${d ? `${d.width}×${d.height} ${d.mime} ${fmtBytes(d.bytes)}` : `HTTP ${f.status}`}, seed ${img.seed}, model ${img.model}`);
+        info.push(`stored ${img.id}: ${d ? `${d.width}×${d.height} ${d.mime} ${fmtBytes(d.bytes)}` : `${hs(f)}`}, seed ${img.seed}, model ${img.model}`);
         if (!d?.recognized) return FAIL('stored file is not an image', { info });
         return PASS(`${d.width}×${d.height} ${d.mime}`, { info });
       }, { timeoutMs: 1000000 });
@@ -2926,7 +2960,7 @@ async function cleanup(run) {
       for (const m of [...O.pulledByUs]) {
         const r = await http(O.url, '/api/delete', { method: 'DELETE', body: { model: m }, timeoutMs: run.T(30000) });
         sample(`ollama DELETE /api/delete ${m}`, { status: r.status, body: r.json ?? r.text });
-        out.push(`${m}: HTTP ${r.status}`);
+        out.push(`${m}: ${hs(r)}`);
         if (r.ok) O.pulledByUs.delete(m);
       }
       if (O.pulledByUs.size) return FAIL(`could not delete ${[...O.pulledByUs].join(', ')}`, { info: out });

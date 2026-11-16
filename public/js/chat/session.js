@@ -242,7 +242,7 @@ function handleEvent(model, ev) {
       if (ev.phase === 'loading') model.reloadStarted = Date.now();
       if (ev.phase === 'ready') {
         const secs = model.reloadStarted ? (Date.now() - model.reloadStarted) / 1000 : null;
-        addTrail(model, { key: 'reload', icon: 'regenerate', text: `Reloaded the chat model after the image${secs != null ? ` (${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s)` : ''}` });
+        addTrail(model, { key: 'reload', icon: 'regenerate', text: `Reloaded the chat model after the image${secs != null && secs >= 0.1 ? ` (${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s)` : ''}` });
       }
       setLive(model, { modelStatus: ev.phase === 'loading' ? ev : null });
       changed(model, model.live?.assistantId);

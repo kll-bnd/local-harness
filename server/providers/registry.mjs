@@ -52,9 +52,10 @@ export class ProviderRegistry {
     }
     for (const c of p.custom || []) {
       if (c.enabled === false) continue;
+      if (!c || typeof c.id !== 'string' || typeof c.baseUrl !== 'string') continue; // never let one bad entry break the app
       reuse(c.id, () => (c.kind === 'ollama'
-        ? new OllamaProvider({ id: c.id, name: c.name, baseUrl: c.baseUrl, builtin: false })
-        : new OpenAICompatProvider({ id: c.id, name: c.name, baseUrl: c.baseUrl, apiKey: c.apiKey || '', flavor: 'generic', builtin: false })));
+        ? new OllamaProvider({ id: c.id, name: c.name || c.id, baseUrl: c.baseUrl, builtin: false })
+        : new OpenAICompatProvider({ id: c.id, name: c.name || c.id, baseUrl: c.baseUrl, apiKey: c.apiKey || '', flavor: 'generic', builtin: false })));
     }
     this._providers = next;
     this._modelsCache = null;

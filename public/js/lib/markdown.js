@@ -33,7 +33,9 @@ const SAFE_DATA_IMG = /^data:image\/(png|jpe?g|gif|webp);base64,[a-z0-9+/=\s]+$/
 const EXTERNAL = /^(https?:|mailto:)/i;
 
 const purify = DOMPurify(window);
+let sanitizingHighlight = false; // highlight.js output: <span class="hljs-…"> only, classes allowed
 purify.addHook('uponSanitizeAttribute', (node, data) => {
+  if (sanitizingHighlight) { data.keepAttr = data.attrName === 'class' && /^(hljs-[\w-]+|language_|function_|class_)( [\w-]+)*$/.test(data.attrValue); return; }
   if (data.attrName === 'class') {
     data.keepAttr = node.nodeName === 'CODE' && /^language-[\w+#.-]{1,40}$/.test(data.attrValue);
   } else if ((data.attrName === 'width' || data.attrName === 'height') && !/^\d{1,4}$/.test(data.attrValue)) {
@@ -100,7 +102,8 @@ function highlightCode(codeEl) {
   try {
     const out = hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
     const tpl = document.createElement('template');
-    tpl.innerHTML = purify.sanitize(out, HL_PURIFY);
+    sanitizingHighlight = true;
+    try { tpl.innerHTML = purify.sanitize(out, HL_PURIFY); } finally { sanitizingHighlight = false; }
     mount(codeEl, tpl.content);
     codeEl.classList.add('hljs');
   } catch { /* leave plain */ }

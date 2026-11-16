@@ -241,5 +241,7 @@ code { font-size: 0.92em; }
 .nowrap { white-space: nowrap; }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; scroll-behavior: auto !important; }
+  /* No motion — except activity spinners, which carry meaning (something is running). */
+  *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; }
+  *:not(.spinner):not(.dot.busy), *::before, *::after { animation: none !important; }
 }

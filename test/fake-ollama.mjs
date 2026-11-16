@@ -6,7 +6,8 @@
 // Implements: GET /api/version, /api/tags, /api/ps; POST /api/show, /api/chat (NDJSON stream or not),
 // /api/generate (load / unload via keep_alive 0), /api/embed, /api/pull (progress stream), DELETE /api/delete.
 // Test hooks: fake.requests (recorded bodies), fake.failNext({path, status, error, match, count}),
-// fake.setDelay(ms), fake.loaded (Map), fake.unloads (array of model names).
+// fake.setDelay(ms), fake.loaded (Map), fake.unloads (array of model names),
+// fake.chatScript = ({model, messages, tools}) => ({thinking, content, toolCalls:[{name, arguments}]}) | null  (override a reply).
 import http from 'node:http';
 import { respond, chunkText, fakeEmbedding, fakeTokenCount, readBody, sendJson, sleep, parseArgs, isCli } from './fake-model.mjs';
 
@@ -190,7 +191,7 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
         if (body.think && !m.caps.includes('thinking')) return sendJson(res, 400, { error: `"${name}" does not support thinking` });
         const numCtx = body.options?.num_ctx || 4096;
         markLoaded(name, body.keep_alive, numCtx);
-        const out = respond({ model: name, messages: body.messages || [], tools: body.tools, think: body.think, capabilities: m.caps });
+        const out = fake.chatScript?.({ model: name, messages: body.messages || [], tools: body.tools }) || respond({ model: name, messages: body.messages || [], tools: body.tools, think: body.think, capabilities: m.caps });
         const promptTokens = Math.min(numCtx, fakeTokenCount(body.messages || [], body.tools));
         const evalCount = Math.max(1, Math.ceil((out.content.length + out.thinking.length) / 3.5));
         const final = { model: name, created_at: now(), message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop', total_duration: 120e6, load_duration: 5e6, prompt_eval_count: promptTokens, prompt_eval_duration: 40e6, eval_count: evalCount, eval_duration: 75e6 };

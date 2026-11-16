@@ -263,6 +263,7 @@
 .composer-input::placeholder { color: var(--fg-4); }
 .composer { container: composer / inline-size; }
 @container composer (max-width: 780px) { .toggle-label { display: none; } .toggle { padding: 0 6px; } }
+@container composer (max-width: 700px) { .preset-picker .picker-label, .preset-picker .icon-chevronDown { display: none; } .ctx-mini .ctx-bar { width: 40px; } .bar-sep { display: none; } }
 @container composer (max-width: 560px) { .picker { max-width: 140px; } .preset-picker { display: none; } }
 .composer-bar { display: flex; align-items: center; gap: 4px; padding: 4px 6px 6px 8px; }
 .composer-left { display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0; flex-wrap: wrap; }

@@ -70,7 +70,13 @@ export class Sidebar {
 
   findChat(id) { return [...(store.get('chats') || []), ...(store.get('archived') || [])].find((c) => c.id === id); }
 
-  focusSearch() { this.search.focus(); this.search.select(); }
+  focusSearch() {
+    const go = () => { if (document.activeElement !== this.search) { this.search.focus(); this.search.select(); } };
+    // Focus now, and again after layout settles (the sidebar may have just been revealed).
+    go();
+    requestAnimationFrame(go);
+    setTimeout(go, 60);
+  }
 
   // ------------------------------------------------------------------------------------------ nav + footer
   renderNav() {
@@ -92,7 +98,8 @@ export class Sidebar {
     const others = (sys?.providers || []).filter((p) => p.id !== 'ollama' && p.status === 'running');
     const loaded = sys?.loadedModels || [];
     const unloadedForImage = sys?.modelState?.unloadedForImage;
-    const img = (sys?.imageProviders || []).find((p) => p.status === 'running');
+    const imgs = (sys?.imageProviders || []).filter((p) => p.status === 'running');
+    const img = imgs.find((p) => p.id === 'a1111') || imgs[0];
     const ram = sys?.machine?.totalMemBytes;
     const lines = [];
     if (!sys) lines.push(h('span.m-line', h('span.dot'), h('span.m-label', 'Connecting…')));

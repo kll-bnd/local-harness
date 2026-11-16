@@ -25,9 +25,10 @@ export const arrayOf = (item, { nullable = false, max = 1000 } = {}) => Object.a
   for (let i = 0; i < v.length; i++) { const e = validateValue(item, v[i], `${p}[${i}]`); if (e) return e; }
   return null;
 }, { nullable }), { item, max });
-export const obj = (shape, { nullable = false, open = false } = {}) => {
+export const obj = (shape, { nullable = false, open = false, required = [] } = {}) => {
   const v = new V((val, p) => {
     if (!isPlainObject(val)) return `${p} must be an object`;
+    for (const k of required) if (val[k] === undefined || val[k] === null) return `${p ? `${p}.` : ''}${k} is required`;
     for (const [k, x] of Object.entries(val)) {
       if (!(k in shape)) { if (open) continue; return `Unknown setting ${p ? `${p}.` : ''}${k}`; }
       const e = validateValue(shape[k], x, p ? `${p}.${k}` : k);
@@ -36,6 +37,8 @@ export const obj = (shape, { nullable = false, open = false } = {}) => {
     return null;
   }, { nullable });
   v.shape = shape;
+  v.open = open;
+  v.required = required;
   return v;
 };
 
@@ -78,6 +81,8 @@ export function sanitizeValue(validator, value, path = '') {
       dropped.push(...r.dropped);
       if (r.value !== undefined) out[k] = r.value;
     }
+    // An entry that lost a required field is dropped as a whole (e.g. a provider without a baseUrl).
+    if ((validator.required || []).some((k) => out[k] === undefined || out[k] === null)) return { value: undefined, dropped: [...dropped, here] };
     return { value: out, dropped };
   }
   if (validator.item) {

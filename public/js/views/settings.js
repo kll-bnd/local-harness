@@ -57,6 +57,7 @@ function fieldsFor(section) {
       { path: 'context.lowRamCap', label: 'Cap on 8 GB machines', type: 'number', min: 2048, step: 1024, nullable: true, adv: true, unit: 'tokens', help: 'Long prompts are slow to process on small Macs; empty removes the cap.' },
       { path: 'context.replyReserve', label: 'Reply reserve', type: 'number', min: 64, max: 65536, step: 64, auto: true, adv: true, unit: 'tokens', help: 'Auto: 15 % of the window (384–8192).' },
       { path: 'context.kvCacheType', label: 'KV cache precision (estimate)', type: 'select', options: [['auto', 'Auto'], ['f16', 'f16'], ['q8_0', 'q8_0'], ['q4_0', 'q4_0']], adv: true },
+      { path: 'context.useMeasurements', label: 'Learn real memory use', type: 'switch', adv: true, help: 'Correct the RAM estimate from what Ollama actually uses for each model, so the window adapts after the first reply.' },
       { path: 'context.memoryFraction', label: 'Safe RAM fraction', type: 'number', min: 0.1, max: 1, step: 0.05, nullable: true, adv: true, help: 'Override how much of RAM Harness plans to use. Empty = automatic.' },
     ];
     case 'summarizer': return [
@@ -204,7 +205,7 @@ export class SettingsView {
 
   async save(f, value) {
     this.errors.delete(f.path || f.ui);
-    if (f.ui) { setUiPref(f.ui, value); this.render(); return true; }
+    if (f.ui) { setUiPref(f.ui, value); this.flash({ path: `ui.${f.ui}` }); this.render(); return true; }
     try {
       await patchSettings(patchFor(f.path, value));
       this.flash(f);
@@ -240,7 +241,7 @@ export class SettingsView {
       h('div.form-control', control,
         h('div.form-meta',
           err ? h('span.field-error', { role: 'alert' }, err) : null,
-          this.savedKey === f.path ? h('span.saved', icon('check', { size: 12 }), 'Saved') : null,
+          (f.path || f.ui) && this.savedKey === (f.path || `ui.${f.ui}`) ? h('span.saved', icon('check', { size: 12 }), 'Saved') : null,
           changed && f.type !== 'switch' && d !== undefined ? h('button.btn-link.small.reset-link', { type: 'button', on: { click: () => this.save(f, d) } }, 'Reset') : null)));
   }
 

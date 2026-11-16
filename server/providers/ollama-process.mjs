@@ -100,7 +100,8 @@ export class OllamaProcess {
       return { started: false, error: this.lastError, code: 'spawn_failed' };
     }
     // Attach the error listener before anything else: a spawn ENOENT/EACCES must never become an uncaught error.
-    child.on('error', (e) => { this.lastError = `Could not start ${bin}: ${e.code || e.message}`; if (this.child === child) this.child = null; });
+    let spawnError = null;
+    child.on('error', (e) => { spawnError = `Could not start ${bin}: ${e.code || e.message}`; this.lastError = spawnError; if (this.child === child) this.child = null; });
     this.child = child;
     const onData = (d) => {
       for (const line of String(d).split('\n')) if (line.trim()) this.logTail.push(line.slice(0, 500));
@@ -127,7 +128,8 @@ export class OllamaProcess {
         return { started: true, managed: true, pid: child.pid, version: s2.version, env: this.env };
       }
     }
-    this.lastError = 'Ollama did not become ready in time.';
+    if (spawnError) return { started: false, error: spawnError, code: 'spawn_failed' };
+    this.lastError = this.child ? 'Ollama did not become ready in time.' : `Ollama exited during start-up.${this.logTail.length ? ` Last log line: ${this.logTail.at(-1)}` : ''}`;
     await this.stop();
     return { started: false, error: this.lastError, code: 'start_timeout', logTail: this.logTail.slice(-20) };
   }

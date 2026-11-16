@@ -174,7 +174,8 @@ export class ChatView {
         } else mount(advice);
       }).catch(() => {});
     }
-    const img = (sys?.imageProviders || []).find((p) => p.status === 'running');
+    const running = (sys?.imageProviders || []).filter((p) => p.status === 'running');
+    const img = running.find((p) => p.id === 'a1111') || running[0];
     const card = (ic, title, desc, run) => h('button.intro-card', { type: 'button', on: { click: run } }, h('span.intro-card-icon', icon(ic)), h('span.intro-card-text', h('b', title), h('span', desc)));
     add(intro, h('div.intro-inner',
       h('div.intro-mark', pending.incognito ? h('span.row', icon('incognito', { size: 14 }), 'Incognito chat') : 'Harness'),

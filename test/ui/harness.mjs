@@ -72,15 +72,25 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
     const ct = res.headers.get('content-type') || '';
     return { status: res.status, data: ct.includes('json') ? await res.json() : await res.text() };
   };
-  return {
+  const sys = { totalMem: ram * GiB, platform: 'darwin', arch: 'arm64' };
+  const stack = {
     url: srv.url, dataDir, fake, a1111, srv, api,
+    /** Stop the Harness server (the page sees it disappear). */
+    async stopServer() { await stack.srv.close(); },
+    /** Start it again on the same port and data dir. */
+    async startServerAgain() {
+      const port = Number(new URL(stack.url).port);
+      stack.srv = await startServer({ port, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false });
+      if (stack.srv.url !== stack.url) throw new Error(`restarted on ${stack.srv.url}, expected ${stack.url}`);
+    },
     async close() {
-      await srv.close().catch(() => {});
+      await stack.srv.close().catch(() => {});
       await fake?.close().catch(() => {});
       await a1111?.close().catch(() => {});
       await fs.rm(dataDir, { recursive: true, force: true }).catch(() => {});
     },
   };
+  return stack;
 }
 
 let browserPromise = null;

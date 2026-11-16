@@ -8,7 +8,7 @@ import { respond, chunkText, fakeEmbedding, fakeTokenCount, readBody, sendJson, 
 import { makePng } from './png.mjs';
 
 export async function startFakeOpenAI({ port = 0, host = '127.0.0.1', delayMs = 0, nCtx = 8192, models = ['fake-llama', 'fake-reasoner', 'fake-notools', 'fake-embed'], images = true, imageDelayMs = 0, llamacpp = true } = {}) {
-  const fake = { requests: [], delayMs, failures: [], failNext(f) { this.failures.push({ count: 1, status: 500, error: 'injected failure', ...f }); } };
+  const fake = { requests: [], delayMs, nCtx, failures: [], failNext(f) { this.failures.push({ count: 1, status: 500, error: 'injected failure', ...f }); } };
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const raw = await readBody(req);
@@ -18,7 +18,7 @@ export async function startFakeOpenAI({ port = 0, host = '127.0.0.1', delayMs = 
     const fi = fake.failures.findIndex((f) => !f.path || f.path === url.pathname);
     if (fi >= 0) { const f = fake.failures[fi]; if (--f.count <= 0) fake.failures.splice(fi, 1); return sendJson(res, f.status, { error: { message: f.error } }); }
     if (url.pathname === '/health') return sendJson(res, 200, { status: 'ok' });
-    if (url.pathname === '/props' && llamacpp) return sendJson(res, 200, { default_generation_settings: { n_ctx: nCtx, temperature: 0.8 }, total_slots: 1, model_path: '/models/fake-llama.gguf', modalities: { vision: false } });
+    if (url.pathname === '/props' && llamacpp) return sendJson(res, 200, { default_generation_settings: { n_ctx: fake.nCtx, temperature: 0.8 }, total_slots: 1, model_path: '/models/fake-llama.gguf', modalities: { vision: false } });
     if (url.pathname === '/v1/models') return sendJson(res, 200, { object: 'list', data: models.map((id) => ({ id, object: 'model', created: 1700000000, owned_by: 'llamacpp', meta: { n_ctx_train: 32768, n_params: 1.5e9, size: 1.1e9 } })) });
     if (url.pathname === '/v1/embeddings') {
       const input = Array.isArray(body.input) ? body.input : [body.input];

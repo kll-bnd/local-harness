@@ -39,9 +39,10 @@ export class A1111Provider {
     const opts = await probe('/sdapi/v1/options');
     if (opts.error) return { ok: false, error: opts.error.message };
     if (opts.status === 200 && isObj(opts.json)) return { ok: true, currentModel: opts.json.sd_model_checkpoint || opts.json.model || null };
-    for (const path of ['/sdapi/v1/sd-models', '/sdapi/v1/samplers']) {
+    // A list endpoint counts only when it lists what A1111 lists (an API that answers [] everywhere is not A1111).
+    for (const [path, keys] of [['/sdapi/v1/sd-models', ['title', 'model_name']], ['/sdapi/v1/samplers', ['name']]]) {
       const r = await probe(path);
-      if (r.status === 200 && Array.isArray(r.json)) return { ok: true, currentModel: null };
+      if (r.status === 200 && Array.isArray(r.json) && r.json.length && r.json.every((x) => isObj(x) && keys.some((k) => typeof x[k] === 'string'))) return { ok: true, currentModel: null };
     }
     const t2i = await probe('/sdapi/v1/txt2img');
     if ([405, 422].includes(t2i.status) && isObj(t2i.json) && ('detail' in t2i.json || 'error' in t2i.json)) return { ok: true, currentModel: null };

@@ -140,7 +140,7 @@ export class Composer {
       toggle('Tools', 'tools', toolsOn, toolsOn ? 'Tools on: calculator, time, memory, images… (click to turn off for this chat)' : 'Tools off for this chat', () => this.patchChat({ settings: { tools: { enabled: !toolsOn } } })),
       caps.includes('thinking') ? toggle('Think', 'think', thinkOn, thinkOn ? 'Thinking on: the model reasons before answering (slower, often better)' : 'Thinking off: faster answers', () => this.patchChat({ settings: { reasoning: { think: thinkOn ? 'off' : 'on' } } })) : null,
       toggle('Memory', 'memory', memOn, incog ? 'Memory is off in incognito chats' : memOn ? 'Memory on: relevant memories are added and new facts may be saved' : 'Memory off for this chat', () => this.patchChat({ settings: { memory: { enabled: !memOn } } }), { disabled: incog }),
-      !this.host.getModel() || incog ? toggle('Incognito', 'incognito', incog, incog ? 'Incognito: nothing from this chat is remembered or recalled' : 'Make this chat incognito (no memory, not recalled later)', () => this.patchChat({ incognito: !incog }), { class: 'toggle-incognito' }) : null,
+      incog ? toggle('Incognito', 'incognito', incog, incog ? 'Incognito: nothing from this chat is remembered or recalled' : 'Make this chat incognito (no memory, not recalled later)', () => this.patchChat({ incognito: !incog }), { class: 'toggle-incognito' }) : null,
     );
     this.box.classList.toggle('incognito', incog);
     this.renderSend();

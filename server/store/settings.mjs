@@ -79,8 +79,8 @@ export const PARAMS_SCHEMA = obj({
   seed: num(-1, 2 ** 53, { int: true }), num_predict: num(-2, 1e6, { int: true }), stop: arrayOf(str({ nullable: false, max: 100 }), { nullable: true, max: 16 }),
   presence_penalty: num(-2, 2), frequency_penalty: num(-2, 2),
 });
-const providerEntry = obj({ id: str({ nullable: false, max: 64 }), name: str({ nullable: false, max: 100 }), kind: oneOf(['ollama', 'openai']), baseUrl: url(), apiKey: str({ max: 500 }), enabled: bool() }, { open: false });
-const imageProviderEntry = obj({ id: str({ nullable: false, max: 64 }), name: str({ nullable: false, max: 100 }), kind: oneOf(['a1111', 'comfyui', 'openai']), baseUrl: url(), apiKey: str({ max: 500 }), enabled: bool(), workflow: any() });
+const providerEntry = obj({ id: str({ nullable: false, max: 64 }), name: str({ nullable: false, max: 100 }), kind: oneOf(['ollama', 'openai']), baseUrl: url(), apiKey: str({ max: 500 }), enabled: bool() }, { open: false, required: ['id', 'kind', 'baseUrl'] });
+const imageProviderEntry = obj({ id: str({ nullable: false, max: 64 }), name: str({ nullable: false, max: 100 }), kind: oneOf(['a1111', 'comfyui', 'openai']), baseUrl: url(), apiKey: str({ max: 500 }), enabled: bool(), workflow: any() }, { required: ['id', 'kind', 'baseUrl'] });
 const toolFlags = obj({ remember: bool(), recall: bool(), get_current_time: bool(), calculate: bool(), fetch_url: bool(), generate_image: bool() });
 const modelOrNull = modelRef();
 const embedModel = custom((v, p) => (v === 'auto' || v === 'off' || (v && typeof v === 'object' && typeof v.model === 'string') ? null : `${p} must be 'auto', 'off' or {providerId, model}`), { nullable: true });

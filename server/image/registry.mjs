@@ -31,7 +31,8 @@ export class ImageProviderRegistry {
     }
     for (const c of s.custom || []) {
       if (c.enabled === false) continue;
-      const o = { id: c.id, name: c.name, baseUrl: c.baseUrl, apiKey: c.apiKey || '' };
+      if (!c || typeof c.id !== 'string' || typeof c.baseUrl !== 'string') continue; // never let one bad entry break the app
+      const o = { id: c.id, name: c.name || c.id, baseUrl: c.baseUrl, apiKey: c.apiKey || '' };
       if (c.kind === 'a1111') next.set(c.id, new A1111Provider(o));
       else if (c.kind === 'comfyui') next.set(c.id, new ComfyUIProvider({ ...o, workflow: c.workflow || null, getWorkflow: c.workflow ? null : getWorkflow }));
       else next.set(c.id, new OpenAIImagesProvider(o));
