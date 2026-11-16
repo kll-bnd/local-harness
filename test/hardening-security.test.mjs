@@ -459,6 +459,26 @@ describe('#16 one server per data directory', () => {
     assert.equal(D.app.memories.items.size, 1);
     await D.close();
   });
+
+  test('a lock file is a claim: its URL is never used — another computer gets no address at all, a local one only 127.0.0.1:<port> (review R3-5)', async () => {
+    const os = await import('node:os');
+    const { lockPort } = await import('../server/lib/instance-lock.mjs');
+    const dir = await tmpDir();
+    try {
+      // another computer (a shared or synced folder): refused, and the error carries no URL, port or pid
+      await fs.writeFile(path.join(dir, 'harness.lock'), JSON.stringify({ pid: process.ppid, url: 'http://203.0.113.7:4747', port: 1, startedAt: new Date().toISOString(), hostname: `${os.hostname()}-elsewhere` }));
+      await assert.rejects(startServer({ port: 0, dataDir: dir, autodetect: false, logLevel: 'silent' }), (e) => e.code === 'HARNESS_ALREADY_RUNNING' && e.otherComputer === true && e.url === null && e.port === null && e.pid === null && /another computer/.test(e.message));
+      // this computer, a live process, a URL that is not loopback: still starting (fresh lock), and the error builds no URL from it
+      await fs.writeFile(path.join(dir, 'harness.lock'), JSON.stringify({ pid: process.ppid, url: 'http://203.0.113.7:4747', startedAt: new Date().toISOString(), hostname: os.hostname() }));
+      await assert.rejects(startServer({ port: 0, dataDir: dir, autodetect: false, logLevel: 'silent' }), (e) => e.code === 'HARNESS_ALREADY_RUNNING' && e.otherComputer === false && e.url === null && e.port === null);
+      // a loopback URL or a valid port: only the port is taken, the address is always 127.0.0.1
+      assert.equal(lockPort({ url: 'http://localhost:5000' }), 5000);
+      assert.equal(lockPort({ url: 'http://127.0.0.2:5000' }), null);
+      assert.equal(lockPort({ url: 'http://evil.example:5000' }), null);
+      assert.equal(lockPort({ port: 70000, url: 'http://127.0.0.1:1' }), 1);
+      assert.equal(lockPort({ port: 4747, url: 'http://203.0.113.7:9' }), 4747);
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('#20 keep_alive values Ollama accepts', () => {

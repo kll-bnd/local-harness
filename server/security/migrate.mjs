@@ -47,14 +47,14 @@ async function walkFiles(root, out, { limit = 200000 } = {}) {
   }
 }
 
-/** Every data file the backend owns under `dir` (sorted, so progress is stable); stale temporaries removed. */
-export async function listDataFiles(dir) {
+/** Every data file the backend owns under `dir` (sorted, so progress is stable); stale temporaries removed unless `clean: false`. */
+export async function listDataFiles(dir, { clean = true } = {}) {
   const all = [];
   for (const f of OWNED_FILES) { try { if ((await fs.lstat(path.join(dir, f))).isFile()) all.push(path.join(dir, f)); } catch { /* absent */ } }
   for (const d of OWNED_DIRS) await walkFiles(path.join(dir, d), all);
   const out = [];
   for (const f of all) {
-    if (f.endsWith(TMP_SUFFIX)) { await fs.rm(f, { force: true }); continue; }
+    if (f.endsWith(TMP_SUFFIX)) { if (clean) await fs.rm(f, { force: true }); continue; }
     if (isDataFile(f, dir)) out.push(f);
   }
   return out.sort();
@@ -91,7 +91,7 @@ export async function repairForeignFiles(dir) {
 
 /** True when any 0.1-style (plain) data file exists — an upgrade that needs a password to encrypt it. */
 export async function hasPlainData(dir) {
-  for (const f of await listDataFiles(dir)) {
+  for (const f of await listDataFiles(dir, { clean: false })) {
     const head = await readHead(f);
     if (head.length && !isHXC(head) && !isHXL(head)) return true;
   }
@@ -105,11 +105,21 @@ async function readHead(file, n = HEADER_C) {
 
 /** True when any file under `dir` is encrypted (then the key store must exist: never offer a fresh setup). */
 export async function hasEncryptedData(dir) {
-  for (const f of await listDataFiles(dir)) {
+  for (const f of await listDataFiles(dir, { clean: false })) {
     const head = await readHead(f).catch(() => Buffer.alloc(0));
     if (isHXC(head) || isHXL(head)) return true;
   }
   return false;
+}
+
+/** The key ids (hex) the encrypted data files are under — a read-only scan of their headers (HXC1 and HXL1 alike). */
+export async function keyIdsInUse(dir) {
+  const ids = new Map();
+  for (const f of await listDataFiles(dir, { clean: false })) {
+    const head = await readHead(f, 16).catch(() => Buffer.alloc(0));
+    if (head.length >= 16 && (isHXC(head) || isHXL(head))) { const id = head.subarray(8, 16).toString('hex'); ids.set(id, (ids.get(id) || 0) + 1); }
+  }
+  return ids;
 }
 
 /** Fix permissions of what the backend owns: the data folder 0700; its own files 0600, its own folders 0700. */

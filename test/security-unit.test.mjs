@@ -141,33 +141,83 @@ describe('key store (vault.json)', () => {
     assert.equal(r.status, 'stale');
     assert.equal(r.record.offlineLock, true);
     // the plain fields can be edited, the record cannot: a byte changed, or one sealed under another key → invalid
+    // (in both copies; one intact copy in vault.json.bak is used instead — below)
+    const both = (text) => { for (const f of [file, `${file}.bak`]) fss.writeFileSync(f, text); };
     fss.writeFileSync(file, second);
     const m = JSON.parse(second);
     const data = Buffer.from(m.state.data, 'base64');
     data[3] ^= 1;
-    fss.writeFileSync(file, JSON.stringify({ ...m, state: { ...m.state, data: data.toString('base64') } }));
+    both(JSON.stringify({ ...m, state: { ...m.state, data: data.toString('base64') } }));
     assert.equal((await open()).readState().status, 'invalid');
     const { seal } = await import('../server/security/crypto.mjs');
     const forged = seal(key(), Buffer.from(JSON.stringify({ v: 1, seq: 99, keyId: m.keyId, ...base, offlineLock: false, tamper: null, prevKeyId: null })), `harness-state-v1:${m.keyId}`);
-    fss.writeFileSync(file, JSON.stringify({ ...m, state: { seq: 99, ...forged } }));
+    both(JSON.stringify({ ...m, state: { seq: 99, ...forged } }));
     assert.equal((await open()).readState().status, 'invalid');
-    // no record (a 0.2.0 key store) → missing; the counter file removed while the record is past its first write → stale
+    // an unlock attempt (its throttle count is saved before the key is derived) never carries a damaged record over
+    // the intact copy in vault.json.bak
+    fss.writeFileSync(`${file}.bak`, second);
+    fss.writeFileSync(file, JSON.stringify({ ...m, state: { ...m.state, data: data.toString('base64') } }));
+    await assert.rejects(new Vault(dir, { kdf: FAST }).load().unlockWithPassword('wrong password'), (e) => e.code === 'wrong_password');
+    assert.equal(JSON.parse(fss.readFileSync(`${file}.bak`, 'utf8')).state.data, m.state.data, 'the intact record in vault.json.bak survived the counted attempt');
+    // the record taken out of vault.json: its copy in vault.json.bak is used (and put back)
     fss.writeFileSync(file, JSON.stringify({ ...m, state: undefined }));
-    assert.equal((await open()).readState().status, 'missing');
+    let w2 = await open();
+    assert.equal(w2.readState().status, 'ok');
+    assert.equal(w2.restoredRecord, true);
+    // the counter file removed while the record is past its first write → stale
     fss.writeFileSync(file, second);
     fss.rmSync(path.join(dir, 'vault-seq.json'));
     assert.equal((await open()).readState().status, 'stale');
-    // a new data key: the record moves to it; a counter file still under the old key (crash in between) is accepted
+    // a new data key: the counter covers both keys while the key changes, then only the new one (review R3-4)
     w = await open();
     w.readState();
     w.commit({});
     const oldSeq = fss.readFileSync(path.join(dir, 'vault-seq.json'));
+    const oldVault = fss.readFileSync(path.join(dir, 'vault.json'));
+    const writes = [];
+    const orig = w._writeMirror.bind(w);
+    w._writeMirror = (e) => { const ok = orig(e); writes.push(fss.readFileSync(path.join(dir, 'vault-seq.json'))); return ok; };
     await w.replaceKey(crypto.randomBytes(32), 'correct horse', { state: { migration: null } });
     assert.equal(w.readState().status, 'ok');
+    assert.equal(writes.length, 2);
+    assert.equal(JSON.parse(writes[0]).entries.length, 2, 'both keys while the key changes');
+    assert.equal(JSON.parse(writes[1]).entries.length, 1, 'then the new key only');
+    // a crash between: whichever vault.json is on disk, its counter entry is there
+    fss.writeFileSync(path.join(dir, 'vault-seq.json'), writes[0]);
+    assert.equal((await open()).readState().status, 'ok', 'the new key store');
+    const newVault = fss.readFileSync(path.join(dir, 'vault.json'));
+    fss.writeFileSync(path.join(dir, 'vault.json'), oldVault);
+    assert.equal((await open()).readState().status, 'ok', 'the old key store (the crash came before its replacement)');
+    // after the change: the old key store is stale, also with the old counter file or a counter naming only its key
+    fss.writeFileSync(path.join(dir, 'vault-seq.json'), writes[1]);
+    assert.equal((await open()).readState().status, 'stale', 'an older vault.json under the previous key');
+    fss.writeFileSync(path.join(dir, 'vault.json'), newVault);
     fss.writeFileSync(path.join(dir, 'vault-seq.json'), oldSeq);
     r = (await open()).readState();
+    assert.equal(r.status, 'stale', 'a counter for another key only is never taken as current');
+    fss.writeFileSync(path.join(dir, 'vault-seq.json'), JSON.stringify({ version: 1, keyId: m.keyId, seq: 1, nonce: 'AAAAAAAAAAAAAAAA', data: 'AAAA' }));
+    assert.equal((await open()).readState().status, 'stale', 'a forged counter naming the previous key id (review 33)');
+    fss.writeFileSync(path.join(dir, 'vault-seq.json'), writes[1]);
+    // a damaged record in vault.json is taken from vault.json.bak (and restored); a removed one with a counter is "removed"
+    const good = fss.readFileSync(path.join(dir, 'vault.json'), 'utf8');
+    const mm = JSON.parse(good);
+    const bad = Buffer.from(mm.state.data, 'base64');
+    bad[2] ^= 0xff;
+    fss.writeFileSync(path.join(dir, 'vault.json'), JSON.stringify({ ...mm, state: { ...mm.state, data: bad.toString('base64') } }));
+    w = await open();
+    r = w.readState();
     assert.equal(r.status, 'ok');
-    assert.equal(r.record.prevKeyId, m.keyId);
+    assert.equal(w.restoredRecord, true);
+    assert.equal(JSON.parse(fss.readFileSync(path.join(dir, 'vault.json'), 'utf8')).state.data, mm.state.data, 'restored');
+    for (const f of ['vault.json', 'vault.json.bak']) fss.writeFileSync(path.join(dir, f), JSON.stringify({ ...mm, state: undefined }));
+    assert.equal((await open()).readState().status, 'removed', 'vault-seq.json shows a record existed');
+    fss.rmSync(path.join(dir, 'vault-seq.json'));
+    assert.equal((await open()).readState().status, 'missing', 'nothing shows one existed (a 0.2.0 key store)');
+    fss.mkdirSync(path.join(dir, 'vault-seq.json'));
+    fss.writeFileSync(path.join(dir, 'vault.json'), good);
+    r = (await open()).readState();
+    assert.deepEqual([r.status, r.mirror.reason], ['unverifiable', 'a folder'], 'a counter that is not a file is reported as such');
+    fss.rmSync(path.join(dir, 'vault-seq.json'), { recursive: true });
     // the record key is not the data key, and off mode keeps only it
     w = await open();
     assert.ok(w.stateKey && !w.stateKey.equals(w.dek));
@@ -495,17 +545,26 @@ describe('instance proof and key-derivation bounds (review F6)', () => {
     // the proof: deterministic, bound to nonce and binding, under a subkey (not a MAC with the data key itself)
     const n1 = crypto.randomBytes(32);
     const n2 = crypto.randomBytes(32);
-    const p = instanceProof(k, n1, proofBinding({ port: 4747 }));
+    const b = proofBinding({ address: '127.0.0.1', port: 4747 });
+    assert.equal(b, 'addr:127.0.0.1:4747');
+    for (const a of ['::ffff:127.0.0.1', '[::ffff:7f00:1]']) assert.equal(proofBinding({ address: a, port: 4747 }), b, a);
+    assert.equal(proofBinding({ address: '0:0:0:0:0:0:0:1', port: 4747 }), 'addr:[::1]:4747');
+    assert.equal(proofBinding({ bridge: true }), 'bridge');
+    const p = instanceProof(k, n1, b);
     assert.equal(p.length, 32);
-    assert.deepEqual(instanceProof(k, n1, 'port:4747'), p);
-    assert.notDeepEqual(instanceProof(k, n2, 'port:4747'), p, 'another nonce');
-    assert.notDeepEqual(instanceProof(k, n1, 'port:5555'), p, 'another port (a relay)');
+    assert.deepEqual(instanceProof(k, n1, 'addr:127.0.0.1:4747'), p);
+    assert.notDeepEqual(instanceProof(k, n2, b), p, 'another nonce');
+    assert.notDeepEqual(instanceProof(k, n1, 'addr:127.0.0.1:5555'), p, 'another port (a relay)');
+    assert.notDeepEqual(instanceProof(k, n1, 'addr:127.0.0.2:4747'), p, 'the same port at another loopback address (a relay, review R3-5)');
+    assert.notDeepEqual(instanceProof(k, n1, 'addr:[::1]:4747'), p);
     assert.notDeepEqual(instanceProof(k, n1, 'bridge'), p);
-    assert.notDeepEqual(instanceProof(crypto.randomBytes(32), n1, 'port:4747'), p, 'another key');
-    assert.notDeepEqual(crypto.createHmac('sha256', k).update(Buffer.concat([Buffer.from('harness-instance-proof-v1'), Buffer.from([0]), n1, Buffer.from([0]), Buffer.from('port:4747')])).digest(), p, 'a subkey, not the data key');
-    assert.throws(() => instanceProof(k, crypto.randomBytes(8), 'port:4747'), RangeError);
+    assert.notDeepEqual(instanceProof(crypto.randomBytes(32), n1, b), p, 'another key');
+    assert.notDeepEqual(crypto.createHmac('sha256', k).update(Buffer.concat([Buffer.from('harness-instance-proof-v1'), Buffer.from([0]), n1, Buffer.from([0]), Buffer.from(b)])).digest(), p, 'a subkey, not the data key');
+    assert.throws(() => instanceProof(k, crypto.randomBytes(8), b), RangeError);
     assert.throws(() => instanceProof(k, n1), TypeError, 'a binding is required');
-    assert.throws(() => proofBinding({}), RangeError);
+    assert.throws(() => instanceProof(k, n1, 'port:4747'), TypeError, 'the port-only binding is gone (no fallback)');
+    assert.throws(() => proofBinding({ address: '127.0.0.1' }), RangeError);
+    assert.throws(() => proofBinding({ address: 'localhost', port: 4747 }), TypeError, 'names are refused: connect to 127.0.0.1');
     assert.equal(parseNonce(n1.toString('base64url')).length, 32);
     for (const bad of [undefined, '', 'a', crypto.randomBytes(8).toString('base64url'), crypto.randomBytes(65).toString('base64url'), n1.toString('base64'), `${n1.toString('base64url')}=`]) assert.equal(parseNonce(bad), null, String(bad));
     k.fill(0);

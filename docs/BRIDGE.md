@@ -91,8 +91,10 @@ reads a length above 1,048,581 treats the stream as corrupt and stops.
 - `{ "type": "fatal", "code": "wrong_key" | "data_dir_locked" | "…", "message": "…", "url": null }` when the
   backend cannot start; it exits non-zero right after. Codes: `wrong_key` (keychain mode: the key in
   `hello` does not open the data — the app should fall back to the password: start again with
-  `dataKey: null`), `data_dir_locked`, `bad_hello` (first frame missing or invalid), `startup_failed`. For `data_dir_locked`, `url` is the address of the
-  instance that holds the lock when that instance has one.
+  `dataKey: null`), `data_dir_locked`, `bad_hello` (first frame missing or invalid), `startup_failed`. For `data_dir_locked`, `url` is
+  `http://127.0.0.1:<port>` of the instance that holds the lock when the lock names a valid port on this computer
+  (built from that port — never the lock file's own URL), and `null` when it has none or the folder is in use on
+  another computer (the message says so).
 - `{ "type": "restart-required", "reason": "offline_lock" | "…" }`: the app should shut the backend down
   and start it again (re-reading `launch.json`, below), then reload the UI.
 - `{ "type": "pong" }`.

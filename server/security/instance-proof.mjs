@@ -4,18 +4,20 @@
 //   const key = await openDataKeyWithPassword(vaultJson, password)  // null: wrong password — checked LOCALLY
 //   const nonce = crypto.randomBytes(32)
 //   POST /api/security/prove { "nonce": "<base64url>" }   → { "proof": "<base64url>" }
-//   ok = timingSafeEqual(proof, instanceProof(key, nonce, `port:${the port you connected to}`)); key.fill(0)
+//   ok = timingSafeEqual(proof, instanceProof(key, nonce, proofBinding({ address: '127.0.0.1', port })));
+//   key.fill(0)          // address and port: exactly what the tool connected to (an IP literal, never a name)
 //
 // proof = HMAC-SHA256(K, "harness-instance-proof-v1" || 0x00 || nonce || 0x00 || binding), with
 // K = HKDF-SHA256(data key, empty salt, info "harness-instance-proof-v1") — a subkey used for nothing else, so a
 // proof reveals nothing about the data key and is worthless anywhere else. `binding` is where the instance received
-// the request: "port:<its own local port>" over HTTP, "bridge" over the bridge. It defeats a relay: a program on
-// another port that forwards the nonce to the real Harness gets a proof for the real Harness's port, which does not
-// match the port the tool talked to.
+// the request — its own local address and port, "addr:127.0.0.1:4747" ("addr:[::1]:4747" for IPv6), or "bridge"
+// over the bridge. It defeats a relay: a program at any other address or port that forwards the nonce to the real
+// Harness gets a proof for the real Harness's address and port, which do not match what the tool talked to.
 //
 // Both helpers are PURE: no throttle bookkeeping, no file written, nothing logged. The callers own the data key
 // openDataKeyWithPassword returns and must wipe it.
 import crypto from 'node:crypto';
+import net from 'node:net';
 import { hkdf, wipe } from './crypto.mjs';
 export { openDataKeyWithPassword } from './vault.mjs';
 
@@ -32,11 +34,26 @@ export function parseNonce(text) {
   return b;
 }
 
-/** The binding of a request: the local port it arrived on (listener) or "bridge". */
-export function proofBinding({ port, bridge = false } = {}) {
+/**
+ * The binding of a request: "addr:<address>:<port>" — the IP literal and port the request arrived on (the server
+ * passes its socket's localAddress/localPort; a tool passes what it connected to) — or "bridge". IPv4-mapped IPv6
+ * addresses become plain IPv4, IPv6 is written canonically in brackets; host names are refused.
+ */
+export function proofBinding({ address, port, bridge = false } = {}) {
   if (bridge) return 'bridge';
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new RangeError('instance proof: a port 1–65535 is needed');
-  return `port:${port}`;
+  let a = String(address ?? '').replace(/^\[|\]$/g, '').toLowerCase();
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(a);
+  if (mapped) a = mapped[1];
+  if (net.isIPv4(a)) return `addr:${a}:${port}`;
+  if (net.isIPv6(a)) {
+    let c = a;
+    try { c = new URL(`http://[${a}]/`).hostname.slice(1, -1); } catch { throw new TypeError('instance proof: not an IP address'); }
+    const m = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(c); // the mapped form in hex → IPv4
+    if (m) { const v = (parseInt(m[1], 16) << 16) | parseInt(m[2], 16); return `addr:${[24, 16, 8, 0].map((sh) => (v >>> sh) & 255).join('.')}:${port}`; }
+    return `addr:[${c}]:${port}`;
+  }
+  throw new TypeError('instance proof: the address must be an IP literal (connect to 127.0.0.1, not a name)');
 }
 
 /**
@@ -44,14 +61,14 @@ export function proofBinding({ port, bridge = false } = {}) {
  * outside 16–64 bytes or a missing binding.
  * @param {Buffer} dataKey
  * @param {Buffer|Uint8Array} nonce
- * @param {string} binding  "port:<n>" or "bridge" (proofBinding)
+ * @param {string} binding  "addr:<ip>:<port>" or "bridge" (proofBinding)
  * @returns {Buffer}
  */
 export function instanceProof(dataKey, nonce, binding) {
   if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) throw new TypeError('instance proof: the data key must be 32 bytes');
   const n = Buffer.from(nonce);
   if (n.length < NONCE_MIN_BYTES || n.length > NONCE_MAX_BYTES) throw new RangeError(`instance proof: the nonce must be ${NONCE_MIN_BYTES}–${NONCE_MAX_BYTES} bytes`);
-  if (typeof binding !== 'string' || !/^(port:\d{1,5}|bridge)$/.test(binding)) throw new TypeError('instance proof: binding must be "port:<n>" or "bridge"');
+  if (typeof binding !== 'string' || !/^(addr:(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\]):\d{1,5}|bridge)$/.test(binding)) throw new TypeError('instance proof: binding must be "addr:<ip>:<port>" (proofBinding) or "bridge"');
   const k = hkdf(dataKey, Buffer.alloc(0), PROOF_LABEL);
   try {
     return crypto.createHmac('sha256', k).update(Buffer.concat([Buffer.from(PROOF_LABEL), Buffer.from([0]), n, Buffer.from([0]), Buffer.from(binding)])).digest();

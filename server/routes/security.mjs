@@ -90,10 +90,10 @@ export function registerSecurityRoutes(r, core) {
   });
 
   // Proof that this process holds the data folder's key (§10.3), for a tool about to send the password. No session
-  // (the caller has none yet); bound to the port the request arrived on, so a program relaying it gets a useless one.
+  // (the caller has none yet); bound to the address and port the request arrived on, so a relay gets a useless one.
   r.post('/api/security/prove', async ({ req, bridge }) => {
     const body = await readJson(req, { limit: 4096 });
-    return core.proveInstance(body?.nonce, proofBinding(bridge ? { bridge: true } : { port: req.socket?.localPort }));
+    return core.proveInstance(body?.nonce, proofBinding(bridge ? { bridge: true } : { address: req.socket?.localAddress, port: req.socket?.localPort }));
   }, open);
 
   // The owner has seen the notice that plain settings disagreed with the security record (§10.2).

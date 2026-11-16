@@ -48,7 +48,7 @@ const { port, url, close } = await startServer({ port: 4747, dataDir, openBrowse
   `HARNESS_TOTALMEM_BYTES` (simulate a different RAM size).
 * Static files are served from `public/` (`GET /` → `public/index.html`; extension-less unknown paths fall back to `index.html` for SPA routing).
 * Zero runtime dependencies; Node ≥ 20.
-* **One server per data directory.** `startServer()` takes a lock file `<dataDir>/harness.lock` (`{ pid, url, port, startedAt, hostname, dataDir }`, written with the final URL once listening, removed on `close()`/exit). A second start on the same data dir rejects with an error whose `code` is `"HARNESS_ALREADY_RUNNING"` and whose `url`/`pid` name the running instance; the CLI then prints `Harness is already running at <url> (same data folder).`, opens it with `--open`, and exits 0. A lock left by a dead process (or a non-answering URL after a 60 s grace) is taken over; a lock from another host is never stolen. `electron/lib/instance.cjs` reads the same file to attach to a running CLI server.
+* **One server per data directory.** `startServer()` takes a lock file `<dataDir>/harness.lock` (`{ pid, url, port, startedAt, hostname, dataDir }`, written with the final URL once listening, removed on `close()`/exit). A second start on the same data dir rejects with an error whose `code` is `"HARNESS_ALREADY_RUNNING"`, with `pid` and `port` (validated) and `url` = `http://127.0.0.1:<port>` — built from the port, never the lock file's own `url`, which is a claim anyone who can write the folder can make; the CLI then prints `Harness is already running at <url> (same data folder).`, opens it with `--open`, and exits 0. A lock left by a dead process (or one that does not answer on 127.0.0.1:<port> after a 60 s grace) is taken over; a lock from another host is never stolen, and its error says the folder is in use by Harness on another computer, with `otherComputer: true` and no `url`, `port` or `pid` at all. `electron/lib/instance.cjs` reads the same file to attach to a running CLI server.
 
 ## 2. Conventions
 
@@ -963,7 +963,7 @@ authenticated security record and never lowers protection because of `launch.jso
 |---|---|
 | `"password"` (default) | The user types a password to open Harness. A random **data key** encrypts the data; it is stored only wrapped under a key derived from the password (scrypt) and under a **recovery key** shown once. Nothing on disk or in the Keychain can unwrap it. Forgetting both the password and the recovery key means the data is gone, by design. |
 | `"keychain"` | Opt-in convenience ("don't ask for a password on this Mac"): the data key is also wrapped under a random key kept in the login Keychain (service `local.harness`, account `data-key`, label `Harness data key`, value base64 of 32 bytes), so Harness opens without a prompt. Weaker: any program running as the user can ask the Keychain for that item (macOS may show a prompt first, depending on the item's access list); it protects against other user accounts, a copied disk and a stolen backup, not against software running as this user. The password and recovery key still work. **Prompts:** an item created by the native app cannot be read by `/usr/bin/security` (the listener-mode launchers) without a macOS prompt, and vice versa, and an app rebuilt with a new signature gets one prompt — so each side may ask the user once. A Keychain call that is denied or waits for a prompt nobody answers ends after at most 60 s (never hangs): Harness stays `locked`, `GET /api/security` → `unlock.keychainError` says why, and the password still opens it. Leaving keychain mode answers `rekeyRecommended: true` (the Keychain key could have been read by other programs; see `POST /api/security/rekey`). **Which item:** service `local.harness`, account `data-key` for the default data folder (the name the native app uses), and `data-key-<first 16 hex digits of SHA-256 of the folder's real path>` for any other folder, so two installations never clobber each other's key. The real Keychain is used only for the default folder and never by a test run, unless `HARNESS_KEYCHAIN=mac` (or `startServer({ keychain: "mac" })`) opts in; `HARNESS_KEYCHAIN=file` / `keychain: "file"` selects the development stand-in (a `.dev-keychain` file in the data folder — not a protection); a folder that may not use the Keychain answers keychain unlocks with **503** `keychain_unavailable` `details.reason: "not_allowed"`. **Never destroyed by accident:** an existing item whose value does not open this data is never overwritten without the password typed for that action (`POST /api/security/mode` / `rekey`; a setup in keychain mode leaves it alone, stays in password mode and reports **`keychainError.code: "keychain_item_exists"`**); a failed or refused read never deletes anything; leaving keychain mode (password-confirmed) deletes the item only when it holds this data's key. |
-| `"off"` | Plain-text data. Only reachable as a deliberate, password-confirmed choice (10.4); the password is kept (as a verifier) for confirmations — and, since the security record that says "off" can only be opened with it, Harness starts `locked` and the password opens it (the data stays plain on disk). Off mode that never had a password (no key store) opens directly. |
+| `"off"` | Plain-text data. Only reachable as a deliberate, password-confirmed choice (10.4); the password is kept (as a verifier) for confirmations — and, since the security record that says "off" can only be opened with it, Harness starts `locked` and the password opens it (the data stays plain on disk). Off mode without a key store (no password ever set) exists only as a development option of the process itself (`security.mode` / `HARNESS_ENCRYPTION`); `launch.json` cannot select it (10.2). |
 
 States (`GET /api/security` → `state`):
 
@@ -1016,25 +1016,35 @@ No session needed (it contains no user data). Also embedded in `GET /api/system`
   "Security settings were changed outside Harness and were ignored" — with the fields and a dismiss button. Field
   names: `launch.json: encryption`, `launch.json: offlineLock`, `launch.json: offlineLockSuspendedUntil`, `vault.json:
   encrypted`, `vault.json: migration`, `vault.json: security record (an older copy)`, `vault.json: security record
-  (not sealed with this key)`, `vault.json: security record (says the data is not encrypted)`.
+  (not sealed with this key)`, `vault.json: security record (removed)`, `vault.json: security record (damaged;
+  restored from vault.json.bak)`, `vault.json: security record (says the data is not encrypted)`, and `vault-seq.json:
+  <what is wrong> — an older vault.json cannot be told from the current one, …` when the counter file is not a
+  readable file (then the most protective settings apply at every unlock until it is one again; logged once).
 
 **The security record.** Whatever lowers protection — running without the password (keychain or off mode), writing
 or accepting the `api-token`, decrypting the data, the internet blocker off, an allow window — comes only from the
 owner's password in this process or from the security record: `{ v, seq, at, keyId, prevKeyId, mode, encrypted,
 offlineLock, allowedUntil, allowFrom, migration: null | { op, id, startedAt, oldKey? }, tamper }`, sealed with
 AES-256-GCM under a key derived from the data key (HKDF-SHA256, salt = the key id, its own info string; additional
-data `harness-state-v1:<keyId>`) and stored in `vault.json` as `state: { seq, nonce, data }`. It is written only
-while that key is in memory — by setup, a mode change, re-keying, the blocker's on/off/allow/block (and the end of a
-window), the start and end of a conversion, dismissing `tamper`, and an unlock that settled a disagreement. Its
-counter `seq` is also kept, sealed the same way, in `vault-seq.json`; a `vault.json` whose record is older than that
-counter (an older copy put back) is not current. Everything else in `vault.json` (`encrypted`, `migration` progress,
-`throttle`) and all of `launch.json` are hints that may only ever make Harness more protective.
+data `harness-state-v1:<keyId>`) and stored in `vault.json` as `state: { seq, nonce, data }` (and, like everything in
+it, in `vault.json.bak`). It is written only while that key is in memory — by setup, a mode change, re-keying, the
+blocker's on/off/allow/block (and the end of a window), the start and end of a conversion, dismissing `tamper`, and an
+unlock that settled a disagreement — and every sealed value is opened again before it is written. Its counter `seq`
+is also kept in `vault-seq.json` — `{ "version": 2, "entries": [{ "keyId", "seq", "nonce", "data" }] }`, one entry
+per key id, sealed the same way (both keys' entries only while the key changes, so a crash leaves each `vault.json`
+its own) — and a `vault.json` whose record is older than its entry there, or that has no entry for its key id (an
+older copy put back after a re-key), is not current. Everything else in `vault.json` (`encrypted`, `migration`
+progress, `throttle`) and all of `launch.json` are hints that may only ever make Harness more protective.
 
 * **Before the key** (from start until the first unlock of the process): a key store means `locked` in an encrypted
   mode. `launch.json` `"off"` is ignored (`mode` says `password`; `"keychain"` only makes Harness try the Keychain's
   key), no `api-token` exists (one found at start is deleted) and none is accepted, the blocker is on with no allow
-  window, and no conversion is reported. Without a key store and in off mode nothing changes: Harness opens directly
-  and `launch.json` is the setting (the API lets anyone turn the blocker off then anyway).
+  window, and no conversion is reported. **Without a key store** (before the first setup) `launch.json` decides
+  nothing either: Harness is in `needs_setup` (password mode) with the blocker on and no window, and the first
+  record — written at setup — is the most protective one (password mode, blocker on, no window), whatever
+  `launch.json` said before. Only this process's own start option or environment (`security.mode`,
+  `HARNESS_ENCRYPTION`, `offlineLock`, `HARNESS_OFFLINE_LOCK` — development and tests) can run it in off mode
+  without a key store; then nothing is protected by a password and `launch.json` is the blocker setting.
 * **After the key:** the record decides the mode, the blocker and its window (honoured while it runs and at most 120
   min from when it was allowed) and any conversion: a decryption or a re-key starts or resumes only from the record;
   an encryption may also resume from the plain hint (it only raises protection). Keychain mode counts only when the
@@ -1048,19 +1058,34 @@ counter (an older copy put back) is not current. Everything else in `vault.json`
   migration in `vault.json`) is ignored, logged once at WARN and reported in `tamper`; one that claims **more** is
   harmless: the blocker on or a shorter window is applied (and written into the record), a stricter `"encryption"` is
   just rewritten.
-* **No record, or none that is authentic and current** (a key store written by 0.2.0; a record not sealed with this
-  key; an older copy): the most protective reading of the folder — password mode (keychain only for a 0.2.0 key store
-  the Keychain itself opened, with `launch.json` saying keychain); encrypted, unless the folder holds no encrypted
-  file and both `vault.json` and `launch.json` say plain; the blocker on, no window; no decryption (an interrupted
-  0.2.0 decryption is not resumed — the log says so — and files it had already decrypted are encrypted again); a
-  re-key resumed only with the old key sealed under the current one. The record is written at that unlock, and
-  everything but a 0.2.0 key store is reported in `tamper`. Encrypted files under a record that says "not encrypted"
-  are read the same way.
+* **A damaged record** in `vault.json` (one that does not open, or is missing) is taken from `vault.json.bak` when the
+  copy there is intact, and put back (`tamper` says so). An unlock attempt never carries a damaged record or wrap over
+  the copy in `vault.json.bak`: key material that this process has not opened or written itself (a wrap, the record)
+  is never written into the backup copy — the attempt counter saved before the password is even checked included. A
+  password or recovery-key wrap that does not open in `vault.json` is tried from `vault.json.bak` too.
+* **No record, or none that is authentic and current** (a key store written by 0.2.0; a record removed, not sealed
+  with this key, or older than its counter; a counter file that cannot be read): the most protective reading — **never
+  below password mode**, whatever `vault.json`, `launch.json` or the folder's contents say (keychain only for a 0.2.0
+  key store that the Keychain itself opened, with `launch.json` saying keychain); encrypted (plain files are encrypted
+  at that unlock — a genuine 0.2.0 folder stored without encryption included; its owner chooses off again with the
+  password, and the log says so); the blocker on, no window; no decryption (an interrupted one is not resumed — the
+  log says so — and files it had already decrypted are encrypted again); a re-key is resumed (re-encrypting to the
+  current key never lowers protection), with its previous key from the record, its copy in `vault.json.bak`, or the
+  previous-key wraps (below). The record is written at that unlock; every case but a genuine 0.2.0 key store
+  (no record anywhere and nothing — `vault-seq.json`, `vault.json.bak`, a migration id — showing one existed) is
+  reported in `tamper`. Encrypted files under a record that says "not encrypted" are read the same way.
+* **Key material is never lost.** While a re-key runs, the previous data key exists in the record (sealed under the
+  new key) **and** in `wraps.previous` — wrapped under the password and under the new recovery key, removed in the
+  same save that ends the conversion — so one damaged copy cannot cost the data still under it (a Keychain unlock
+  cannot open those wraps: then the password is asked, **401** `password_needed`). If, without an intact record,
+  any encrypted file is under a key this key store no longer holds, Harness writes nothing and goes to state
+  `error`, `vault_corrupt`, saying that a re-key was interrupted and its copy of the previous key is damaged or
+  missing (restore `vault.json` and `vault.json.bak` from a backup made before the re-key).
 * **Leaving off mode makes a new data key** (and a new recovery key, shown once — `POST /api/security/mode` returns
   it), so nothing recorded under the old key, such as a decryption in progress, can ever apply to the data encrypted
   from then on: the old key does not open it.
 * **Limits.** Someone who can write the whole folder can put back a complete earlier copy — `vault.json` together
-  with `vault-seq.json`. That restores an earlier state the owner had set themselves (for instance the blocker off),
+  with its own `vault-seq.json`. That restores an earlier state the owner had set themselves (for instance the blocker off),
   never one the owner did not choose, never an allow window that has ended, never a decryption of data encrypted
   under a newer key, and never keychain mode without this data's key in the Keychain. Detecting even that would need
   a counter outside the folder.
@@ -1076,8 +1101,8 @@ counter (an older copy put back) is not current. Everything else in `vault.json`
 | `POST /api/security/password` | `{ "password": "<current>", "newPassword": "…" }` (or without `password` inside a `passwordReset` window) → **200** `{ "ok": true }`. Re-wraps the data key; nothing is re-encrypted. |
 | `POST /api/security/recovery-key` | `{ "password": "…" }` → **200** `{ "recoveryKey": "HRK1-…", "createdAt": "…" }`: a **new** recovery key (the old one stops working; the old one cannot be shown again because it is not stored). |
 | `POST /api/security/mode` | `{ "password": "…", "mode": "password" \| "keychain" \| "off" }` → **200** `{ "mode": "…", "state": "unlocked" \| "migrating", "rekeyRecommended"?: true, "recoveryKey"?: "HRK1-…" }`. From off mode with no password ever set, turning encryption on takes `{ "mode": "password", "newPassword": "…" }` and returns the new `recoveryKey` once. `keychain` adds the Keychain wrap (listener mode: written with `/usr/bin/security`, the value passed on its stdin, never in argv or the environment; bridge mode: sent to the app as the event `keychain-key`, `docs/BRIDGE.md`); leaving keychain mode deletes it. `off` decrypts every file; leaving `off` encrypts them again under a **new data key** and returns a new `recoveryKey` (shown once; the old one stops working) — so it needs `"password"` in the body, not a confirmation header (both resumable, with progress). Writes the security record, then `launch.json` (10.2). |
-| `POST /api/security/rekey` | `{ "password": "…" }` → **200** `{ "state": "migrating", "recoveryKey": "HRK1-…", "migration": {…} }`: a **new data key**; every file is re-encrypted under it (resumable, `migration.op: "reencrypt"`), and a **new recovery key** replaces the old one (shown once). Offer it after leaving keychain mode. |
-| `POST /api/security/prove` | `{ "nonce": "<base64url of 16–64 random bytes>" }` → **200** `{ "proof": "<base64url>" }` — proof that this running Harness holds the data folder's key, for a command-line tool that found it through `harness.lock` and is about to send it the password (the tool checks the password against `vault.json` locally first and compares in constant time). `proof = HMAC-SHA256(K, "harness-instance-proof-v1" ‖ 0x00 ‖ nonce ‖ 0x00 ‖ binding)` with `K = HKDF-SHA256(data key, empty salt, "harness-instance-proof-v1")` and `binding` = `"port:<the local port the request arrived on>"` (or `"bridge"` over the bridge), so a program on another port that relays the nonce to the real Harness gets a proof that does not match the port the tool talked to. No session needed (the caller has none yet); the Host/Origin checks apply; never logged; cheap. Safe to expose: an HMAC under a subkey used for nothing else reveals nothing about the data key and is worthless anywhere else. **423** `locked` when the data key is not in memory (locked, or not yet unlocked), **409** `not_encrypted` in off mode, **400** `bad_request` for a missing or malformed nonce. The tools use `server/security/instance-proof.mjs`: `openDataKeyWithPassword(vaultJson, password)` (pure: no throttle count, nothing written; `null` for a wrong password; the caller wipes the key) and `instanceProof(dataKey, nonce, binding)`. |
+| `POST /api/security/rekey` | `{ "password": "…" }` → **200** `{ "state": "migrating", "recoveryKey": "HRK1-…", "migration": {…} }`: a **new data key**; every file is re-encrypted under it (resumable, `migration.op: "reencrypt"`), and a **new recovery key** replaces the old one (shown once). Until every file is converted, the previous key is kept in the security record and wrapped under the password and the new recovery key (10.2, "Key material is never lost"). Offer it after leaving keychain mode. |
+| `POST /api/security/prove` | `{ "nonce": "<base64url of 16–64 random bytes>" }` → **200** `{ "proof": "<base64url>" }` — proof that this running Harness holds the data folder's key, for a command-line tool that found it through `harness.lock` and is about to send it the password (the tool checks the password against `vault.json` locally first and compares in constant time). `proof = HMAC-SHA256(K, "harness-instance-proof-v1" ‖ 0x00 ‖ nonce ‖ 0x00 ‖ binding)` with `K = HKDF-SHA256(data key, empty salt, "harness-instance-proof-v1")` and `binding` = `"addr:<ip>:<port>"` — the local address and port the request arrived on, IPv4 dotted (IPv4-mapped IPv6 becomes IPv4), IPv6 canonical in brackets: `"addr:127.0.0.1:4747"`, `"addr:[::1]:4747"` — or `"bridge"` over the bridge. A program at any other address or port (the same port number on 127.0.0.2 or `::1` included) that relays the nonce to the real Harness gets a proof that does not match what the tool connected to. The tool connects to the literal `127.0.0.1:<port>` (never a URL from `harness.lock`) and computes `proofBinding({ address: "127.0.0.1", port })`; host names are refused, and there is no port-only binding. No session needed (the caller has none yet); the Host/Origin checks apply; never logged; cheap. Safe to expose: an HMAC under a subkey used for nothing else reveals nothing about the data key and is worthless anywhere else. **423** `locked` when the data key is not in memory (locked, or not yet unlocked), **409** `not_encrypted` in off mode, **400** `bad_request` for a missing or malformed nonce. The tools use `server/security/instance-proof.mjs`: `openDataKeyWithPassword(vaultJson, password)` (pure: no throttle count, nothing written; `null` for a wrong password; the caller wipes the key), `proofBinding({ address, port })` and `instanceProof(dataKey, nonce, binding)`. |
 | `POST /api/security/confirm` | `{ "password": "…" }` → **200** `{ "confirmation": "<opaque>", "expiresAt": "…" }` — a single-use confirmation valid 2 minutes for this session, for confirmable requests whose body is not ours (header `X-Harness-Confirm: <confirmation>`). No password set → **409** `no_password`. A used or expired confirmation → **401** `wrong_password`. |
 
 **Confirmation.** These actions lower protection and need the password **in the same request** — a `"password"` field in the JSON body, or the header `X-Harness-Confirm` from `POST /api/security/confirm`: allowing internet access (`POST /api/network/allow`), turning the blocker off (`PUT /api/network`), full backups (`POST /api/export`), restoring over existing data (`POST /api/restore`), a new recovery key, changing the password, changing the mode. Missing → **403** `confirmation_required`; wrong → **401** `wrong_password` (same throttle). In off mode without any password ever set (development), no confirmation is asked.

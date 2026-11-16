@@ -17,6 +17,7 @@ import { HttpError } from '../lib/errors.mjs';
 export const MIN_PASSWORD = 8;
 const AAD = (name) => `harness-wrap-v1:${name}`;
 const STATE_AAD = (keyId) => `harness-state-v1:${keyId}`;
+const WRAPS = ['password', 'recovery', 'keychain', 'previous'];
 const MIRROR_AAD = (keyId) => `harness-state-mirror-v1:${keyId}`;
 export const STATE_MIRROR = 'vault-seq.json';
 export const STATE_MODES = Object.freeze(['password', 'keychain', 'off']);
@@ -57,6 +58,8 @@ export function validVault(m) {
   if (!isSealed(w.password) || !kdfWithinBounds(w.password.kdf)) return false;
   if (w.recovery !== undefined && w.recovery !== null && (!isSealed(w.recovery) || typeof w.recovery.kdf?.salt !== 'string')) return false;
   if (w.keychain !== undefined && !isSealed(w.keychain)) return false;
+  const pv = w.previous;
+  if (pv !== undefined && pv !== null && !(typeof pv.keyId === 'string' && /^[0-9a-f]{16}$/.test(pv.keyId) && isSealed(pv.password) && (pv.recovery === undefined || isSealed(pv.recovery)))) return false;
   if (m.state !== undefined && m.state !== null && !isSealed(m.state)) return false;
   return true;
 }
@@ -69,10 +72,43 @@ export function validVault(m) {
  * @returns {Promise<Buffer|null>}
  */
 export async function openDataKeyWithPassword(vault, password) {
-  if (typeof password !== 'string' || !password || !validVault(vault)) return null;
+  const { dek, previous } = await openPasswordWraps(vault, password);
+  wipe(previous);
+  return dek;
+}
+
+/**
+ * Like openDataKeyWithPassword, plus — while a re-key runs — the PREVIOUS data key, which the same password-derived
+ * key also wraps (`wraps.previous`), so the old key never exists in one place only. PURE; the caller wipes both.
+ * @returns {Promise<{ dek: Buffer|null, previous: Buffer|null }>}
+ */
+export async function openPasswordWraps(vault, password) {
+  if (typeof password !== 'string' || !password || !validVault(vault)) return { dek: null, previous: null };
   const w = vault.wraps.password;
   const kek = await deriveKey(password, w.kdf);
-  try { return unseal(kek, w, AAD('password')); } finally { wipe(kek); }
+  try {
+    const dek = unseal(kek, w, AAD('password'));
+    return { dek, previous: dek ? openPrevious(kek, vault.wraps.previous, 'password') : null };
+  } finally { wipe(kek); }
+}
+
+/** The previous data key from its wrap under `kek` (the same key that opened the current one), checked by key id. */
+function openPrevious(kek, pv, which) {
+  if (!pv?.[which]) return null;
+  const k = unseal(kek, pv[which], AAD(`previous-${which}`));
+  if (k && keyIdOf(k).toString('hex') === pv.keyId) return k;
+  wipe(k);
+  return null;
+}
+
+/** Seal `key` under `kek` and check it opens again before anything is written (key material is never written unread). */
+function sealChecked(kek, key, aad) {
+  const w = seal(kek, key, aad);
+  const back = unseal(kek, w, aad);
+  const ok = !!back && back.equals(key);
+  wipe(back);
+  if (!ok) throw new HttpError(500, 'vault_write_failed', 'Could not write the Harness key store safely; nothing was changed.');
+  return w;
 }
 
 function readVaultFile(file) {
@@ -91,7 +127,11 @@ export class Vault {
     this.stateKey = null; // seals the security record; derived from the data key (kept alone in off mode)
     this.stateSeq = 0; // the highest record counter seen or written in this process
     this.record = null; // the last security record opened (current) or written in this process
+    this.previousKey = null; // during a re-key: the previous data key, opened from wraps.previous with the password
     this.mirrorFile = path.join(dataDir, STATE_MIRROR);
+    // key material in memory that this process opened or wrote itself (wraps by name, and 'state'): only that may
+    // replace the copy in vault.json.bak — anything else there is kept, so an edited vault.json cannot overwrite it
+    this.verified = new Set();
   }
 
   /**
@@ -124,8 +164,8 @@ export class Vault {
    * copy vault.json.bak — so at every moment at least one of the two is a complete, valid key store.
    */
   save() {
-    const text = JSON.stringify(this.meta, null, 2) + '\n';
-    for (const target of [this.file, this.file + '.bak']) {
+    for (const [target, meta] of [[this.file, this.meta], [this.file + '.bak', this._bakMetaFor(this.meta)]]) {
+      const text = JSON.stringify(meta, null, 2) + '\n';
       const tmp = `${target}.${process.pid}.tmp`;
       const fd = fs.openSync(tmp, 'w', 0o600);
       try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
@@ -136,6 +176,30 @@ export class Vault {
       fs.renameSync(tmp, target);
     }
     try { const dfd = fs.openSync(path.dirname(this.file), 'r'); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch { /* not supported everywhere */ }
+  }
+
+  /**
+   * What goes into vault.json.bak: `meta`, except key material this process has not opened or written itself —
+   * for that, the copy already in vault.json.bak stays (so a throttle count saved before the password is even
+   * checked, say, never carries a damaged or replaced wrap or record over the intact copy).
+   */
+  _bakMetaFor(meta) {
+    const cur = readVaultFile(this.file + '.bak');
+    if (!cur.ok || cur.meta.keyId !== meta.keyId) return meta;
+    const out = structuredClone(meta);
+    const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    for (const w of WRAPS) {
+      if (this.verified.has(w) || same(cur.meta.wraps[w], meta.wraps[w])) continue;
+      if (cur.meta.wraps[w] === undefined) delete out.wraps[w]; else out.wraps[w] = cur.meta.wraps[w];
+    }
+    if (!this.verified.has('state') && !same(cur.meta.state, meta.state)) { if (cur.meta.state === undefined) delete out.state; else out.state = cur.meta.state; }
+    return validVault(out) ? out : meta;
+  }
+
+  /** A wrap that did not open from vault.json: the one in vault.json.bak, if it differs (null otherwise). */
+  _bakWraps() {
+    const cur = readVaultFile(this.file + '.bak');
+    return cur.ok && cur.meta.keyId === this.meta?.keyId ? cur.meta : null;
   }
 
   // ----------------------------------------------------------------------------------------- creation
@@ -149,28 +213,34 @@ export class Vault {
     this.dek = dek;
     this._deriveStateKey();
     this.record = null;
+    this.verified = new Set([...WRAPS, 'state']);
     const rec = state ? this._sealState({ prevKeyId: null, tamper: null, ...state }) : null;
     this.save();
     if (rec) { this.record = rec; this.stateSeq = rec.seq; this._writeMirror(rec.seq); }
     return recoveryKey;
   }
 
-  async _wrapPassword(dek, password, meta = this.meta) {
+  /** The password wrap of `dek` — and with `previous`, that key too, under the same password-derived key. */
+  async _wrapPassword(dek, password, meta = this.meta, { previous = null } = {}) {
     const kdf = newKdf(this.kdfParams || kdfDefaultsNow());
     const kek = await deriveKey(password, kdf);
-    meta.wraps.password = { kdf, ...seal(kek, dek, AAD('password')) };
-    wipe(kek);
+    try {
+      meta.wraps.password = { kdf, ...sealChecked(kek, dek, AAD('password')) };
+      if (previous) meta.wraps.previous = { ...(meta.wraps.previous || {}), keyId: keyIdOf(previous).toString('hex'), password: sealChecked(kek, previous, AAD('previous-password')) };
+      if (meta === this.meta) { this.verified.add('password'); if (previous) this.verified.add('previous'); }
+    } finally { wipe(kek); }
   }
 
-  _wrapRecovery(dek, meta = this.meta) {
+  _wrapRecovery(dek, meta = this.meta, { previous = null } = {}) {
     const rk = crypto.randomBytes(32);
     const salt = crypto.randomBytes(16);
     const kek = hkdf(rk, salt, 'harness recovery v1');
-    meta.wraps.recovery = { kdf: { name: 'hkdf-sha256', salt: salt.toString('base64') }, ...seal(kek, dek, AAD('recovery')), createdAt: new Date().toISOString() };
-    const text = formatRecoveryKey(rk);
-    wipe(kek);
-    wipe(rk);
-    return text;
+    try {
+      meta.wraps.recovery = { kdf: { name: 'hkdf-sha256', salt: salt.toString('base64') }, ...sealChecked(kek, dek, AAD('recovery')), createdAt: new Date().toISOString() };
+      if (previous) meta.wraps.previous = { ...(meta.wraps.previous || {}), keyId: keyIdOf(previous).toString('hex'), recovery: sealChecked(kek, previous, AAD('previous-recovery')) };
+      if (meta === this.meta) { this.verified.add('recovery'); if (previous) this.verified.add('previous'); }
+      return formatRecoveryKey(rk);
+    } finally { wipe(kek); wipe(rk); }
   }
 
   // ----------------------------------------------------------------------------------------- unlocking
@@ -214,7 +284,27 @@ export class Vault {
   }
 
   async _openPassword(password) {
-    return this.meta ? openDataKeyWithPassword(this.meta, password) : null;
+    if (!this.meta) return null;
+    let { dek, previous } = await openPasswordWraps(this.meta, password);
+    if (!dek) {
+      // a damaged or replaced password wrap in vault.json: the copy in vault.json.bak (only when it differs)
+      const bak = this._bakWraps();
+      if (bak && JSON.stringify(bak.wraps.password) !== JSON.stringify(this.meta.wraps.password)) {
+        ({ dek, previous } = await openPasswordWraps(bak, password));
+        if (dek) {
+          this.meta = { ...this.meta, wraps: { ...this.meta.wraps, password: bak.wraps.password, ...(bak.wraps.previous ? { previous: bak.wraps.previous } : {}) } };
+          this.restoredWraps = true;
+        }
+      }
+    }
+    if (dek) { this.verified.add('password'); if (previous) this.verified.add('previous'); this._setPrevious(previous); } else wipe(previous);
+    return dek;
+  }
+
+  _setPrevious(k) {
+    if (this.previousKey && k && this.previousKey.equals(k)) { wipe(k); return; }
+    wipe(this.previousKey);
+    this.previousKey = k || null;
   }
 
   // Key ownership: unlockWith*() return the vault's OWN data-key buffer (the one the file ciphers hold) — callers
@@ -231,12 +321,23 @@ export class Vault {
     const rk = parseRecoveryKey(text);
     const w = this.meta?.wraps?.recovery;
     let dek = null;
+    const tryWrap = (wrap, meta) => {
+      const kek = hkdf(rk, Buffer.from(wrap.kdf.salt, 'base64'), 'harness recovery v1');
+      try {
+        const d = unseal(kek, wrap, AAD('recovery'));
+        if (d) { this.verified.add('recovery'); const p = openPrevious(kek, meta.wraps.previous, 'recovery'); if (p) this.verified.add('previous'); this._setPrevious(p); }
+        return d;
+      } finally { wipe(kek); }
+    };
     if (rk && w) {
-      const kek = hkdf(rk, Buffer.from(w.kdf.salt, 'base64'), 'harness recovery v1');
-      dek = unseal(kek, w, AAD('recovery'));
-      wipe(kek);
-      wipe(rk);
+      dek = tryWrap(w, this.meta);
+      const bak = dek ? null : this._bakWraps();
+      if (!dek && bak?.wraps.recovery && JSON.stringify(bak.wraps.recovery) !== JSON.stringify(w)) {
+        dek = tryWrap(bak.wraps.recovery, bak);
+        if (dek) { this.meta = { ...this.meta, wraps: { ...this.meta.wraps, recovery: bak.wraps.recovery, ...(bak.wraps.previous ? { previous: bak.wraps.previous } : {}) } }; this.restoredWraps = true; }
+      }
     }
+    wipe(rk);
     if (!dek) throw this._fail('wrong_recovery_key', 'That recovery key does not open this data.');
     return this._succeed(dek);
   }
@@ -246,6 +347,7 @@ export class Vault {
     const w = this.meta?.wraps?.keychain;
     const dek = w && kek ? unseal(Buffer.from(kek), w, AAD('keychain')) : null;
     if (!dek) return null;
+    this.verified.add('keychain');
     if (this.dek) { if (this.dek.equals(dek)) { wipe(dek); return this.dek; } wipe(this.dek); }
     this.dek = dek;
     this._deriveStateKey();
@@ -278,13 +380,13 @@ export class Vault {
   async changePassword(newPassword) {
     this._need();
     if (typeof newPassword !== 'string' || newPassword.length < MIN_PASSWORD) throw new HttpError(400, 'weak_password', `Choose a password of at least ${MIN_PASSWORD} characters.`);
-    await this._wrapPassword(this.dek, newPassword);
+    await this._wrapPassword(this.dek, newPassword, this.meta, { previous: this.previousKey });
     this.save();
   }
 
   newRecoveryKey() {
     this._need();
-    const text = this._wrapRecovery(this.dek);
+    const text = this._wrapRecovery(this.dek, this.meta, { previous: this.previousKey });
     this.save();
     return { recoveryKey: text, createdAt: this.meta.wraps.recovery.createdAt };
   }
@@ -297,12 +399,13 @@ export class Vault {
     this._need();
     if (!enabled) { this._saveWith((m) => { delete m.wraps.keychain; }, state); return null; }
     const kek = crypto.randomBytes(32);
-    const wrap = seal(kek, this.dek, AAD('keychain'));
+    const wrap = sealChecked(kek, this.dek, AAD('keychain'));
     this._saveWith((m) => { m.wraps.keychain = wrap; }, state);
     return kek;
   }
 
   _saveWith(mutate, state) {
+    this.verified.add('keychain'); // written by this process
     if (state) { this.commit(state, { mutate }); return; }
     mutate(this.meta);
     this.save();
@@ -314,14 +417,18 @@ export class Vault {
    * carrying `state` — for a re-key the old key sealed under the new one) — all in one save, so a crash leaves
    * either the old or the new key store, never a mix.
    */
-  async replaceKey(newDek, password, { migration = null, state = {}, mutate } = {}) {
+  async replaceKey(newDek, password, { migration = null, state = {}, mutate, keepPrevious = false } = {}) {
     this._need();
     const meta = structuredClone(this.meta);
     const oldKeyId = meta.keyId;
+    // keepPrevious (re-keying): the old key stays wrapped under the password and the new recovery key until every
+    // file is converted — besides inside the record — so one damaged copy can never cost the data under it
+    const previous = keepPrevious ? this.dek : null;
+    delete meta.wraps.previous;
     let newStateKey = null;
     try {
-      await this._wrapPassword(newDek, password, meta);
-      const recoveryKey = this._wrapRecovery(newDek, meta);
+      await this._wrapPassword(newDek, password, meta, { previous });
+      const recoveryKey = this._wrapRecovery(newDek, meta, { previous });
       delete meta.wraps.keychain;
       meta.keyId = keyIdOf(newDek).toString('hex');
       meta.migration = migration;
@@ -329,9 +436,14 @@ export class Vault {
       mutate?.(meta);
       newStateKey = stateKeyOf(newDek, meta.keyId);
       const rec = this._sealState({ ...state, prevKeyId: oldKeyId }, { meta, key: newStateKey });
+      // the counter for BOTH keys first: whichever vault.json a crash leaves, its own counter entry is current
+      this._writeMirror([{ keyId: oldKeyId, seq: this.stateSeq, key: this.stateKey }, { keyId: meta.keyId, seq: rec.seq, key: newStateKey }]);
       const saved = this.meta;
+      const savedVerified = this.verified;
       this.meta = meta;
-      try { this.save(); } catch (e) { this.meta = saved; throw e; }
+      this.verified = new Set([...WRAPS, 'state']); // every wrap and the record were written just now
+      try { this.save(); } catch (e) { this.meta = saved; this.verified = savedVerified; throw e; }
+      if (previous) this.previousKey = Buffer.from(previous); else { wipe(this.previousKey); this.previousKey = null; }
       wipe(this.dek);
       wipe(this.stateKey);
       this.dek = newDek;
@@ -339,10 +451,13 @@ export class Vault {
       newStateKey = null;
       this.record = rec;
       this.stateSeq = rec.seq;
-      this._writeMirror(rec.seq);
+      this._writeMirror(rec.seq); // now only the new key's entry: an older vault.json under the old key is stale
       return recoveryKey;
     } finally { wipe(newStateKey); }
   }
+
+  /** The re-key finished (every file is under the current key): the previous key's wraps go, with the record change. */
+  dropPrevious(meta) { delete meta.wraps.previous; }
 
   setEncrypted(flag) { this.meta.encrypted = !!flag; this.save(); }
   setMigration(m) { this.meta.migration = m; this.save(); }
@@ -362,7 +477,7 @@ export class Vault {
       ...(this.record || {}), ...patch, seq, at: new Date().toISOString(), keyId: meta.keyId,
     };
     if (!validState(rec)) throw new HttpError(500, 'state_invalid', 'Could not write the Harness security record; nothing was changed.');
-    meta.state = { seq, ...seal(key, Buffer.from(JSON.stringify(rec)), STATE_AAD(meta.keyId)) };
+    meta.state = { seq, ...sealChecked(key, Buffer.from(JSON.stringify(rec)), STATE_AAD(meta.keyId)) };
     return rec;
   }
 
@@ -375,9 +490,11 @@ export class Vault {
     if (!this.stateKey) throw new HttpError(423, 'locked', 'Harness is locked.');
     const meta = structuredClone(this.meta);
     mutate?.(meta);
+    for (const w of WRAPS) if (JSON.stringify(meta.wraps[w] ?? null) !== JSON.stringify(this.meta.wraps[w] ?? null)) this.verified.add(w);
     const rec = this._sealState(patch, { meta });
     const saved = this.meta;
     this.meta = meta;
+    this.verified.add('state');
     try { this.save(); } catch (e) { this.meta = saved; throw e; }
     this.record = rec;
     this.stateSeq = rec.seq;
@@ -385,52 +502,101 @@ export class Vault {
     return rec;
   }
 
+  /** The record sealed in `sealed` (of a key store with this key id), or null. */
+  _openRecord(sealed, keyId) {
+    if (!isSealed(sealed)) return null;
+    const buf = unseal(this.stateKey, sealed, STATE_AAD(keyId));
+    if (!buf) return null;
+    try { const r = JSON.parse(buf.toString('utf8')); return validState(r) && r.keyId === keyId ? r : null; } catch { return null; }
+  }
+
   /**
    * Open the security record with the key now in memory → { status, record, mirror }:
-   *   ok       authentic and current — it decides
-   *   missing  a key store from before records existed (Harness 0.2.0)
-   *   invalid  present, but not sealed under this key (written by someone who does not have it)
-   *   stale    authentic, but older than the counter in vault-seq.json (an older vault.json was put back)
+   *   ok           authentic and current — it decides
+   *   missing      no record anywhere and nothing shows one ever existed (a key store from Harness 0.2.0)
+   *   removed      no record, but vault-seq.json, vault.json.bak or the plain hints show that one existed
+   *   invalid      present, but not sealed under this key (written by someone who does not have it)
+   *   stale        authentic, but older than its counter in vault-seq.json, or that counter is for another key
+   *                (an older vault.json was put back)
+   *   unverifiable authentic, but vault-seq.json cannot be read (not a file, no permission): current or not cannot
+   *                be told, so it is not treated as current
+   * A record in vault.json that is missing or does not open is first looked for in vault.json.bak (the verified
+   * copy written with it); an intact one there is used and restored (`restoredRecord`).
    */
   readState() {
     if (!this.stateKey) throw new HttpError(423, 'locked', 'Harness is locked.');
+    this.restoredRecord = false;
     const mirror = this._readMirror();
     if (mirror.status === 'ok') this.stateSeq = Math.max(this.stateSeq, mirror.seq);
-    const sealed = this.meta?.state;
-    if (!sealed) return { status: 'missing', record: null, mirror };
-    let rec = null;
-    const buf = isSealed(sealed) ? unseal(this.stateKey, sealed, STATE_AAD(this.meta.keyId)) : null;
-    if (buf) { try { const r = JSON.parse(buf.toString('utf8')); if (validState(r) && r.keyId === this.meta.keyId) rec = r; } catch { /* not a record */ } }
-    if (!rec) return { status: 'invalid', record: null, mirror };
+    const keyId = this.meta.keyId;
+    let rec = this._openRecord(this.meta.state, keyId);
+    if (rec) this.verified.add('state');
+    const present = !!this.meta.state;
+    let bakHadRecord = false;
+    if (!rec) {
+      const bak = readVaultFile(this.file + '.bak');
+      bakHadRecord = !!(bak.ok && bak.meta.state);
+      const fromBak = bak.ok && bak.meta.keyId === keyId ? this._openRecord(bak.meta.state, keyId) : null;
+      if (fromBak) {
+        // the verified copy holds the intact record: use it and put it back (nothing in it is dropped)
+        this.meta = { ...this.meta, state: bak.meta.state };
+        this.verified.add('state');
+        this.save();
+        this.restoredRecord = true;
+        rec = fromBak;
+      }
+    }
+    if (!rec) {
+      if (present) return { status: 'invalid', record: null, mirror };
+      const existed = mirror.status !== 'missing' || bakHadRecord || typeof this.meta.migration?.id === 'string';
+      return { status: existed ? 'removed' : 'missing', record: null, mirror };
+    }
     this.stateSeq = Math.max(this.stateSeq, rec.seq);
-    let fresh;
-    if (mirror.status === 'ok') fresh = mirror.seq <= rec.seq; // the mirror is written after the record: it may lag, never lead
-    else if (mirror.status === 'other_key') fresh = !!rec.prevKeyId && mirror.keyId === rec.prevKeyId; // lags a key change
-    else if (mirror.status === 'missing') fresh = rec.seq === 1; // the very first record, the mirror not yet written
-    else fresh = false;
-    this.record = fresh ? rec : null;
-    return { status: fresh ? 'ok' : 'stale', record: rec, mirror };
+    let status;
+    if (mirror.status === 'ok') status = mirror.seq <= rec.seq ? 'ok' : 'stale'; // written after the record: it may lag, never lead
+    else if (mirror.status === 'missing') status = rec.seq === 1 ? 'ok' : 'stale'; // the very first record, the counter not yet written
+    else if (mirror.status === 'unusable') status = 'unverifiable';
+    else status = 'stale'; // a counter for another key only (an older vault.json), or one that does not open
+    this.record = status === 'ok' ? rec : null;
+    return { status, record: rec, mirror };
   }
 
+  /**
+   * vault-seq.json: { version: 2, entries: [{ keyId, seq, nonce, data }] } — the sealed counter per key id (two
+   * entries only around a key change). Version 1 (one entry at the top level) is read too.
+   */
   _readMirror() {
+    let st;
+    try { st = fs.lstatSync(this.mirrorFile); } catch (e) { return { status: e.code === 'ENOENT' ? 'missing' : 'unusable', reason: e.code || 'unreadable', seq: 0 }; }
+    if (!st.isFile()) return { status: 'unusable', reason: st.isDirectory() ? 'a folder' : 'not a file', seq: 0 };
     let raw;
-    try { raw = JSON.parse(fs.readFileSync(this.mirrorFile, 'utf8')); } catch (e) { return { status: e.code === 'ENOENT' ? 'missing' : 'invalid', seq: 0 }; }
-    if (!raw || typeof raw !== 'object' || typeof raw.keyId !== 'string' || !isSealed(raw)) return { status: 'invalid', seq: 0 };
-    if (raw.keyId !== this.meta?.keyId || !this.stateKey) return { status: 'other_key', keyId: raw.keyId, seq: 0 };
+    try { raw = JSON.parse(fs.readFileSync(this.mirrorFile, 'utf8')); } catch (e) { return e.code ? { status: 'unusable', reason: e.code, seq: 0 } : { status: 'invalid', seq: 0 }; }
+    const entries = Array.isArray(raw?.entries) ? raw.entries : raw && typeof raw === 'object' ? [raw] : [];
+    const mine = entries.find((e) => e && e.keyId === this.meta?.keyId && isSealed(e));
+    if (!mine) return { status: entries.length ? 'other_key' : 'invalid', seq: 0 };
     let seq = 0;
-    try { const j = JSON.parse(unseal(this.stateKey, raw, MIRROR_AAD(raw.keyId))?.toString('utf8') || 'null'); if (Number.isInteger(j?.seq) && j.seq > 0) seq = j.seq; } catch { /* invalid */ }
-    return seq ? { status: 'ok', seq, keyId: raw.keyId } : { status: 'invalid', seq: 0 };
+    try { const j = JSON.parse(unseal(this.stateKey, mine, MIRROR_AAD(mine.keyId))?.toString('utf8') || 'null'); if (Number.isInteger(j?.seq) && j.seq > 0) seq = j.seq; } catch { /* invalid */ }
+    return seq ? { status: 'ok', seq, keyId: mine.keyId } : { status: 'invalid', seq: 0 };
   }
 
-  /** Best effort: a failed mirror write only weakens the detection of an older vault.json put back. */
-  _writeMirror(seq) {
+  /**
+   * Best effort: a failed write only weakens the detection of an older vault.json put back (and is reported:
+   * `mirrorError`). `entries`: a seq for the current key, or [{ keyId, seq, key }] around a key change.
+   */
+  _writeMirror(entries) {
+    const list = Array.isArray(entries) ? entries : [{ keyId: this.meta.keyId, seq: entries, key: this.stateKey }];
     try {
-      const body = { version: 1, keyId: this.meta.keyId, seq, ...seal(this.stateKey, Buffer.from(JSON.stringify({ seq })), MIRROR_AAD(this.meta.keyId)) };
+      const body = { version: 2, entries: list.filter((e) => e.key).map((e) => ({ keyId: e.keyId, seq: e.seq, ...seal(e.key, Buffer.from(JSON.stringify({ seq: e.seq })), MIRROR_AAD(e.keyId)) })) };
       const tmp = `${this.mirrorFile}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(body, null, 2) + '\n', { mode: 0o600 });
       fs.renameSync(tmp, this.mirrorFile);
+      this.mirrorError = null;
       return true;
-    } catch { return false; }
+    } catch (e) {
+      this.mirrorError = e.code || 'write_failed';
+      try { fs.rmSync(`${this.mirrorFile}.${process.pid}.tmp`, { force: true }); } catch { /* ignore */ }
+      return false;
+    }
   }
 
   /** The file cipher while unlocked. */
@@ -440,6 +606,8 @@ export class Vault {
   lock({ keepStateKey = false } = {}) {
     wipe(this.dek);
     this.dek = null;
+    wipe(this.previousKey);
+    this.previousKey = null;
     if (!keepStateKey) { wipe(this.stateKey); this.stateKey = null; }
   }
 }

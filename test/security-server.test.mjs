@@ -874,9 +874,11 @@ describe('plain files cannot lower protection (review 01, 05, 06)', () => {
         await v.unlockWithPassword(PW);
         const startedAt = new Date().toISOString();
         if (legacy) {
-          delete v.meta.state;
-          v.meta.migration = { op: 'encrypt', done: 0, total: 9, startedAt, error: null };
-          v.save();
+          // a 0.2.0 key store: no record in either copy, no counter file
+          const meta = { ...v.meta, migration: { op: 'encrypt', done: 0, total: 9, startedAt, error: null } };
+          delete meta.state;
+          for (const f of ['vault.json', 'vault.json.bak']) fss.writeFileSync(path.join(dataDir, f), JSON.stringify(meta));
+          fss.rmSync(path.join(dataDir, 'vault-seq.json'), { force: true });
         } else {
           assert.equal(v.readState().status, 'ok');
           v.commit({ migration: { op: 'encrypt', id: 'crash-test', startedAt } }, { mutate: (m) => { m.migration = { op: 'encrypt', id: 'crash-test', done: 3, total: 9, startedAt, error: null }; } });
@@ -980,8 +982,8 @@ describe('plain files cannot lower protection (review 01, 05, 06)', () => {
 
 // Review round 2, finding F6: the command-line tools must not send the password to whatever wrote harness.lock.
 describe('instance proof (review F6)', () => {
-  test('POST /api/security/prove: no session; unlocked → a proof the helper verifies; bound to the port; locked 423, off 409, bad nonce 400', async () => {
-    const { openDataKeyWithPassword, instanceProof } = await import('../server/security/instance-proof.mjs');
+  test('POST /api/security/prove: no session; unlocked → a proof the helper verifies; bound to address and port; locked 423, off 409, bad nonce 400', async () => {
+    const { openDataKeyWithPassword, instanceProof, proofBinding } = await import('../server/security/instance-proof.mjs');
     let s = await stack();
     await s.setup();
     const dataDir = s.dataDir;
@@ -998,11 +1000,13 @@ describe('instance proof (review F6)', () => {
       const r1 = await prove(n1);
       assert.equal(r1.status, 200, JSON.stringify(r1.data));
       const p1 = Buffer.from(r1.data.proof, 'base64url');
-      assert.ok(crypto.timingSafeEqual(p1, instanceProof(key, n1, `port:${port}`)), 'verifies with the helper');
-      assert.ok(!p1.equals(instanceProof(key, n1, `port:${port + 1}`)), 'a relay on another port gets a proof that does not match');
-      assert.ok(!p1.equals(instanceProof(crypto.randomBytes(32), n1, `port:${port}`)), 'a wrong data key does not verify');
+      const here = proofBinding({ address: '127.0.0.1', port });
+      assert.ok(crypto.timingSafeEqual(p1, instanceProof(key, n1, here)), 'verifies with the helper');
+      assert.ok(!p1.equals(instanceProof(key, n1, proofBinding({ address: '127.0.0.1', port: port + 1 }))), 'a relay on another port gets a proof that does not match');
+      assert.ok(!p1.equals(instanceProof(key, n1, proofBinding({ address: '127.0.0.2', port }))), 'a relay on the same port at another loopback address does not either (review R3-5)');
+      assert.ok(!p1.equals(instanceProof(crypto.randomBytes(32), n1, here)), 'a wrong data key does not verify');
       const p2 = Buffer.from((await prove(n2)).data.proof, 'base64url');
-      assert.ok(!p2.equals(p1) && p2.equals(instanceProof(key, n2, `port:${port}`)), 'two nonces, two proofs');
+      assert.ok(!p2.equals(p1) && p2.equals(instanceProof(key, n2, here)), 'two nonces, two proofs');
       for (const bad of [{}, { nonce: 'x' }, { nonce: crypto.randomBytes(8).toString('base64url') }, { nonce: crypto.randomBytes(80).toString('base64url') }, { nonce: n1.toString('base64') + '+' }]) {
         const r = await s.call('POST', '/api/security/prove', bad, { token: null });
         assert.equal(r.status, 400, JSON.stringify(bad));
@@ -1018,5 +1022,212 @@ describe('instance proof (review F6)', () => {
       assert.deepEqual([off.status, off.data.error.code], [409, 'not_encrypted']);
       key.fill(0);
     } finally { await s.close(); }
+  });
+});
+
+// Review round 3: key material is never lost (R3-2), no record never means less than password mode (R3-1), nothing
+// from before the first password reaches the first record (R3-3), a counter for another key is not current (R3-4).
+describe('key material is never lost; without an intact record only the most protective reading (review round 3)', () => {
+  const readJ = (dir, f) => JSON.parse(fss.readFileSync(path.join(dir, f), 'utf8'));
+  const writeJ = (dir, f, v) => fss.writeFileSync(path.join(dir, f), JSON.stringify(v, null, 2));
+  const editLaunch = (dir, patch) => writeJ(dir, 'launch.json', { ...readJ(dir, 'launch.json'), ...patch });
+  const sec = async (s) => (await s.call('GET', '/api/security')).data;
+  const hasMemory = async (s, text) => (await s.call('GET', '/api/memories')).data.memories.some((m) => m.content === text);
+  /** Flip one byte of the sealed record in the given copies (the schema stays valid). */
+  const damageRecord = (dir, files) => {
+    for (const f of files) {
+      const v = readJ(dir, f);
+      const b = Buffer.from(v.state.data, 'base64');
+      b[5] ^= 0xff;
+      writeJ(dir, f, { ...v, state: { ...v.state, data: b.toString('base64') } });
+    }
+  };
+  /** A re-key stopped half-way by a file it cannot read (as a crash would): memories.json is still under the old key. */
+  async function interruptedRekey({ keychain = false } = {}) {
+    const s = await stack();
+    await s.setup();
+    await s.call('POST', '/api/memories', { content: 'REKEY-SURVIVES' });
+    if (keychain) assert.equal((await s.call('POST', '/api/security/mode', { mode: 'keychain', password: PW })).status, 200);
+    const stop = path.join(s.dataDir, 'index', 'zz-broken.items.jsonl');
+    fss.mkdirSync(path.dirname(stop), { recursive: true });
+    fss.writeFileSync(stop, Buffer.concat([Buffer.from('HXL1'), Buffer.alloc(4), Buffer.alloc(8, 7), Buffer.from([0, 0, 0, 40]), Buffer.alloc(40, 1)]));
+    const rk = await s.call('POST', '/api/security/rekey', { password: PW });
+    assert.equal(rk.status, 200, JSON.stringify(rk.data));
+    await waitFor(async () => (await sec(s)).migration?.error, { timeout: 15000 });
+    await s.close({ keep: true });
+    fss.rmSync(stop);
+    assert.ok(readJ(s.dataDir, 'vault.json').wraps.previous, 'while the re-key runs, the previous key is wrapped too');
+    return { dataDir: s.dataDir, recoveryKey: rk.data.recoveryKey };
+  }
+
+  test('review 31: a damaged record during an interrupted re-key is taken from vault.json.bak — an unlock attempt never overwrites it', async () => {
+    const { dataDir } = await interruptedRekey();
+    damageRecord(dataDir, ['vault.json']);
+    const s = await stack({ dataDir, mode: 'launch' });
+    try {
+      assert.equal((await s.call('POST', '/api/security/unlock', { password: 'wrong wrong' }, { token: null })).status, 401);
+      assert.equal((await s.unlock()).status, 200);
+      assert.ok(await hasMemory(s, 'REKEY-SURVIVES'), 'the data under the old key was converted, not lost');
+      const st = await sec(s);
+      assert.equal(st.migration, null);
+      assert.ok(st.tamper.fields.includes('vault.json: security record (damaged; restored from vault.json.bak)'), JSON.stringify(st.tamper));
+      assert.equal(readJ(dataDir, 'vault.json').wraps.previous, undefined, 'the previous key goes once every file is under the new one');
+    } finally { await s.close(); }
+  });
+
+  test('review 31: with the record damaged in both copies, the previous-key wraps finish the re-key (password or recovery key); the Keychain alone asks for the password', async () => {
+    for (const how of ['password', 'recoveryKey', 'keychain']) {
+      const { dataDir, recoveryKey } = await interruptedRekey({ keychain: how === 'keychain' });
+      damageRecord(dataDir, ['vault.json', 'vault.json.bak']);
+      const s = await stack({ dataDir, mode: how === 'keychain' ? 'keychain' : 'launch' });
+      try {
+        if (how === 'keychain') assert.equal((await sec(s)).state, 'locked', 'the Keychain does not open the previous key');
+        assert.equal((await s.unlock(how === 'recoveryKey' ? { recoveryKey } : { password: PW })).status, 200, how);
+        assert.ok(await hasMemory(s, 'REKEY-SURVIVES'), `${how}: nothing lost`);
+        const st = await sec(s);
+        assert.equal(st.mode, 'password', 'no authentic record: the most protective reading');
+        assert.ok(st.tamper.fields.includes('vault.json: security record (not sealed with this key)'));
+        assert.equal(readJ(dataDir, 'vault.json').wraps.previous, undefined);
+      } finally { await s.close(); }
+    }
+  });
+
+  test('review 31: when no intact copy of the previous key is left anywhere, Harness goes to state error and changes nothing', async () => {
+    const { dataDir } = await interruptedRekey();
+    damageRecord(dataDir, ['vault.json', 'vault.json.bak']);
+    for (const f of ['vault.json', 'vault.json.bak']) { const v = readJ(dataDir, f); delete v.wraps.previous; v.migration = null; writeJ(dataDir, f, v); }
+    const strip = (buf, f) => (/vault\.json/.test(f) ? JSON.stringify({ ...JSON.parse(buf), throttle: null }) : buf.toString('base64'));
+    const files = () => new Map(filesUnder(dataDir).filter((f) => !/harness\.lock|\.log$/.test(f)).map((f) => [f, strip(fss.readFileSync(f), f)]));
+    const before = files();
+    const s = await stack({ dataDir, mode: 'launch' });
+    try {
+      const u = await s.call('POST', '/api/security/unlock', { password: PW, session: 'token' }, { token: null });
+      assert.deepEqual([u.status, u.data.error?.code], [503, 'vault_corrupt'], JSON.stringify(u.data));
+      assert.match(u.data.error.message, /re-key was interrupted.*Nothing has been changed/s);
+      const st = await sec(s);
+      assert.deepEqual([st.state, st.error.code], ['error', 'vault_corrupt']);
+      assert.equal((await s.call('GET', '/api/memories')).status, 503);
+    } finally { await s.close({ keep: true }); }
+    const after = files();
+    assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort(), 'no file added or removed');
+    for (const [f, b] of before) assert.equal(after.get(f), b, `${path.relative(dataDir, f)} unchanged (apart from the attempt counter)`);
+    await fs.rm(dataDir, { recursive: true, force: true });
+  });
+
+  test('review 30: a removed record never means off mode — whatever both hints and the folder say; reported, new data encrypted', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    await s.close({ keep: true });
+    try {
+      for (const f of ['vault.json', 'vault.json.bak']) { const v = readJ(dataDir, f); delete v.state; v.encrypted = false; writeJ(dataDir, f, v); }
+      editLaunch(dataDir, { encryption: 'off' });
+      for (const f of filesUnder(dataDir)) { const h = fss.readFileSync(f).subarray(0, 4).toString(); if (h === 'HXC1' || h === 'HXL1') fss.rmSync(f); }
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.deepEqual([(await sec(s)).state, (await sec(s)).mode], ['locked', 'password']);
+      assert.equal((await s.unlock()).status, 200);
+      const st = await sec(s);
+      assert.equal(st.mode, 'password');
+      assert.ok(st.idleLockAt, 'idle lock on');
+      assert.ok(st.tamper.fields.includes('vault.json: security record (removed)'), JSON.stringify(st.tamper));
+      assert.ok(!fss.existsSync(path.join(dataDir, 'api-token')));
+      await s.call('POST', '/api/memories', { content: 'STRIPPED-RECORD-NEW' });
+      await s.close({ keep: true });
+      assert.deepEqual(grepDir(dataDir, 'STRIPPED-RECORD-NEW'), []);
+      assert.ok(readJ(dataDir, 'vault.json').state, 'the record is written again');
+    } finally { await s.close(); }
+  });
+
+  test('a genuine 0.2.0 folder stored without encryption (no record, no counter) is encrypted at its first unlock — off only by choosing it again', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      await s.call('POST', '/api/chats', { title: 'OFF-020-MARKER' });
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'off', password: PW })).status, 200);
+      await waitFor(async () => (await sec(s)).state === 'unlocked' && (await sec(s)).mode === 'off', { timeout: 15000 });
+      await s.close({ keep: true });
+      assert.ok(grepDir(dataDir, 'OFF-020-MARKER').length >= 1);
+      for (const f of ['vault.json', 'vault.json.bak']) { const v = readJ(dataDir, f); delete v.state; writeJ(dataDir, f, v); }
+      fss.rmSync(path.join(dataDir, 'vault-seq.json'));
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await s.unlock()).status, 200);
+      const st = await sec(s);
+      assert.deepEqual([st.mode, st.tamper], ['password', null], 'a 0.2.0 key store is not reported as tampered');
+      await s.close({ keep: true });
+      assert.deepEqual(grepDir(dataDir, 'OFF-020-MARKER'), [], 'encrypted at that unlock');
+    } finally { await s.close(); }
+  });
+
+  test('review 32: nothing from before the first password reaches the first record — the blocker is on before and after setup, whatever launch.json says', async () => {
+    for (const variant of ['fresh', '0.1 data']) {
+      for (const lj of [{ offlineLock: false }, { offlineLockSuspendedUntil: new Date(Date.now() + 3600000).toISOString() }, { encryption: 'off' }, { encryption: 'keychain' }]) {
+        let s = await stack({ mode: 'launch', prepare: (dir) => {
+          writeJ(dir, 'launch.json', { version: 1, offlineLock: true, offlineLockSuspendedUntil: null, encryption: 'password', ...lj });
+          if (variant !== 'fresh') { fss.mkdirSync(path.join(dir, 'chats')); writeJ(dir, 'chats/chat_0mabcdefgh00aa11bb22.json', { version: 1, id: 'chat_0mabcdefgh00aa11bb22', title: 'old', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', messages: {}, settings: {}, summaries: [] }); }
+        } });
+        const dataDir = s.dataDir;
+        const label = `${variant} ${JSON.stringify(lj)}`;
+        try {
+          const st0 = await sec(s);
+          assert.equal(st0.state, 'needs_setup', label);
+          assert.deepEqual([st0.offlineLock.enabled, st0.offlineLock.blocked, st0.offlineLock.allowedUntil], [true, true, null], `${label}: before setup`);
+          await s.setup();
+          const st1 = await sec(s);
+          assert.deepEqual([st1.mode, st1.offlineLock.enabled, st1.offlineLock.allowedUntil, st1.tamper], ['password', true, null, null], `${label}: after setup`);
+          await s.close({ keep: true });
+          s = await stack({ dataDir, mode: 'launch' });
+          await s.unlock();
+          const st2 = await sec(s);
+          assert.deepEqual([st2.mode, st2.offlineLock.enabled, st2.offlineLock.allowedUntil], ['password', true, null], `${label}: after a restart`);
+        } finally { await s.close(); }
+      }
+    }
+  });
+
+  test('review 33: an older vault.json with a forged counter naming the previous key id is not current', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      const k1 = readJ(dataDir, 'vault.json').keyId;
+      await s.call('POST', '/api/security/rekey', { password: PW });
+      await waitFor(async () => (await sec(s)).state === 'unlocked', { timeout: 15000 });
+      assert.equal((await s.call('PUT', '/api/network', { enabled: false, password: PW })).status, 200);
+      const older = fss.readFileSync(path.join(dataDir, 'vault.json'));
+      assert.equal((await s.call('PUT', '/api/network', { enabled: true })).status, 200);
+      await s.close({ keep: true });
+      for (const f of ['vault.json', 'vault.json.bak']) fss.writeFileSync(path.join(dataDir, f), older);
+      writeJ(dataDir, 'vault-seq.json', { version: 1, keyId: k1, seq: 1, nonce: 'AAAAAAAAAAAAAAAA', data: 'AAAA' });
+      editLaunch(dataDir, { offlineLock: false });
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      const st = await sec(s);
+      assert.equal(st.offlineLock.enabled, true, 'the older record does not switch the blocker off');
+      assert.ok(st.tamper.fields.includes('vault.json: security record (an older copy)'), JSON.stringify(st.tamper));
+    } finally { await s.close(); }
+  });
+
+  test('a counter file that is not a file is reported as what it is (not as "an older copy"); the most protective settings apply', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      assert.equal((await s.call('PUT', '/api/network', { enabled: false, password: PW })).status, 200);
+      await s.close({ keep: true });
+      fss.rmSync(path.join(dataDir, 'vault-seq.json'));
+      fss.mkdirSync(path.join(dataDir, 'vault-seq.json'));
+      for (let i = 0; i < 2; i++) {
+        s = await stack({ dataDir, mode: 'launch' });
+        await s.unlock();
+        const st = await sec(s);
+        assert.equal(st.offlineLock.enabled, true);
+        const about = st.tamper.fields.filter((f) => f.startsWith('vault-seq.json'));
+        assert.equal(about.length, 1, JSON.stringify(st.tamper));
+        assert.match(about[0], /a folder — an older vault\.json cannot be told from the current one/);
+        assert.ok(!st.tamper.fields.some((f) => /an older copy/.test(f)), 'not misreported');
+        await s.close({ keep: true });
+      }
+    } finally { await fs.rm(dataDir, { recursive: true, force: true }); }
   });
 });
