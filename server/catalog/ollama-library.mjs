@@ -32,7 +32,21 @@ export function sizeChipToParams(chip) {
   return n * { k: 1e3, m: 1e6, b: 1e9 }[m[3].toLowerCase()];
 }
 
-/** Items of a library or search page: [{ name, description, capabilities, sizes, downloads, updatedAt }]. */
+const spanClass = (cls) => new RegExp(`<span\\b[^>]*\\bclass="[^"]*${cls}[^"]*"[^>]*>([^<]{1,60})</span>`, 'gi');
+const CAP_RE = () => spanClass('bg-indigo-50');
+const SIZE_RE = () => spanClass('bg-\\[#ddf4ff\\]');
+const PULLS_RE = /<span\s*>\s*([\d.,]+\s*[KMB]?)\s*<\/span>\s*<span\b[^>]*>(?:\s|&nbsp;)*Pulls/i;
+const DOWNLOADS_RE = /title="([\d,]+)\s+downloads"/i;
+const TAGS_RE = /<span\s*>\s*(\d+)\s*<\/span>\s*<span\b[^>]*>(?:\s|&nbsp;)*Tags|<span\s*>\s*(\d+)\s+tags?\s*<\/span>/i;
+const UPDATED_TITLE_RE = /title="Updated ([^"]{4,80})"/i;
+const UPDATED_SPAN_RE = /<span\b[^>]*\btitle="([^"]{4,80})"[^>]*>\s*(?:<svg\b[\s\S]*?(?:\/>|<\/svg>)\s*)?<span\b[^>]*>(?:\s|&nbsp;)*Updated/i;
+
+/**
+ * Items of a library or search page: [{ name, description, capabilities, sizes, downloads, tagCount, updatedAt }].
+ * Parsed by the page's own anchors (docs: real markup of ollama.com, Nov 2026): capability chips are spans with
+ * class bg-indigo-50, size chips spans with class bg-[#ddf4ff]; pulls = the span right before "Pulls" (library)
+ * or title="<n> downloads" (search); updated = the title of the span holding "Updated" (or title="Updated …").
+ */
 export function parseListPage(html) {
   const out = [];
   const seen = new Set();
@@ -44,22 +58,33 @@ export function parseListPage(html) {
     if (!NAME_RE.test(name) || seen.has(name)) continue;
     seen.add(name);
     const p = /<p\b[^>]*>([\s\S]*?)<\/p>/i.exec(chunk);
-    const spans = [...chunk.matchAll(/<span\b[^>]*>([^<]{1,40})<\/span>/gi)].map((m) => decodeEntities(m[1]).trim().toLowerCase());
-    const capabilities = [...new Set(spans.filter((t) => CAPS.has(t)))];
-    const sizes = [...new Set(spans.filter((t) => SIZE_CHIP.test(t)))];
-    const dl = /title="([\d,]+)\s+downloads"/i.exec(chunk) || /([\d.,]+\s*[KMB]?)\s*(?:<\/span>\s*)?(?:<span[^>]*>\s*)?Pulls/i.exec(chunk);
-    const upd = /title="Updated ([^"]{4,60})"/i.exec(chunk);
-    const updatedMs = upd ? Date.parse(upd[1]) : NaN;
+    const chips = (re) => [...new Set([...chunk.matchAll(re)].map((m) => decodeEntities(m[1]).trim().toLowerCase()).filter(Boolean))];
+    const capabilities = chips(CAP_RE()).filter((t) => /^[a-z][a-z-]{1,20}$/.test(t));
+    const sizes = chips(SIZE_RE()).filter((t) => SIZE_CHIP.test(t));
+    const dlExact = DOWNLOADS_RE.exec(chunk);
+    const pulls = dlExact ? null : PULLS_RE.exec(chunk);
+    const tags = TAGS_RE.exec(chunk);
+    const upd = UPDATED_TITLE_RE.exec(chunk) || UPDATED_SPAN_RE.exec(chunk);
+    const updatedMs = upd ? Date.parse(decodeEntities(upd[1])) : NaN;
     out.push({
       name,
       description: p ? textOf(p[1]).slice(0, 600) || null : null,
       capabilities,
       sizes,
-      downloads: dl ? parseCount(dl[1]) : null,
+      downloads: dlExact ? parseCount(dlExact[1]) : pulls ? parseCount(pulls[1]) : null,
+      tagCount: tags ? Number(tags[1] || tags[2]) : null,
       updatedAt: Number.isFinite(updatedMs) ? new Date(updatedMs).toISOString() : null,
     });
   }
   return out;
+}
+
+/** The "load more" element of a search page: the next page number, or null. */
+export function nextSearchPage(html) {
+  const m = /hx-get="\/search\?([^"]*)"/i.exec(String(html || ''));
+  if (!m) return null;
+  const page = Number(new URLSearchParams(decodeEntities(m[1])).get('page'));
+  return Number.isInteger(page) && page > 1 && page < 100 ? page : null;
 }
 
 /** Tags of /library/<name>/tags: [{ tag, digest, sizeBytes, contextLength, inputs }]. */
@@ -105,13 +130,16 @@ function itemFor(m, { fits, installedNames, curated }) {
   const caps = m.capabilities.filter((c) => c !== 'cloud');
   const params = m.sizes.map(sizeChipToParams).filter(Boolean);
   const smallest = params.length ? Math.min(...params) : null;
+  // the largest size that would still fit, for the list's at-a-glance answer
+  const fitting = params.map((n) => ({ n, f: fits.listFit({ parameters: n, name: m.name, vision: caps.includes('vision') }) })).filter((x) => x.f);
+  const best = fitting.filter((x) => x.f.verdict === 'fits').sort((a, b) => b.n - a.n)[0] || fitting.filter((x) => x.f.verdict === 'fits_smaller').sort((a, b) => b.n - a.n)[0] || fitting.sort((a, b) => a.n - b.n)[0];
   const lower = m.name.toLowerCase();
   return {
     source: 'ollama', id: m.name, name: m.name, publisher: m.name.includes('/') ? m.name.split('/')[0] : 'ollama', description: m.description,
     kind: kindOf(caps), capabilities: caps, parameters: smallest, architecture: null, contextLength: null,
     downloads: m.downloads, likes: null, trendingScore: null, updatedAt: m.updatedAt, gated: false, license: null,
-    tags: m.sizes, sizes: m.sizes,
-    fit: smallest ? fits.listFit({ parameters: smallest, name: m.name }) : null,
+    tags: m.sizes, sizes: m.sizes, tagCount: m.tagCount ?? null,
+    fit: best ? { ...best.f, size: m.sizes[params.indexOf(best.n)] || null } : null,
     installed: [...installedNames].some((n) => n === lower || n.startsWith(`${lower}:`)),
     recommended: [...curated].some((n) => n === lower || n.startsWith(`${lower}:`)),
     url: `https://ollama.com/library/${m.name}`,
@@ -131,10 +159,40 @@ export async function ollamaList(q, { fits, installedNames, curated, cache }) {
   let offset = 0;
   if (q.cursor) {
     const c = decodeCursor(q.cursor);
-    if (!c || c.s !== 'ol' || c.f !== filterKey || !Number.isInteger(c.o) || c.o < 0) throw new HttpError(400, 'bad_cursor', 'This cursor belongs to another listing; start again without it.');
+    if (!c || c.s !== 'ol' || c.f !== filterKey || !Number.isInteger(c.o) || c.o < 0 || c.o > 100000) throw new HttpError(400, 'bad_cursor', 'This cursor belongs to another listing; start again without it.');
     offset = c.o;
   }
-  const url = q.q ? `${B.ollama}/search?q=${encodeURIComponent(q.q.slice(0, 100))}` : `${B.ollama}/library?sort=${siteSort}`;
+  const keep = (list) => {
+    // Cloud-only entries (no local size) cannot be downloaded.
+    let items = list.filter((m) => !(m.capabilities.includes('cloud') && !m.sizes.length)).map((m) => itemFor(m, { fits, installedNames, curated }));
+    if (q.kind) items = items.filter((i) => i.kind === q.kind);
+    if (q.fits) items = items.filter((i) => i.fit?.fits);
+    return items;
+  };
+  if (q.q) {
+    // The site's search: 20 per page, `c=local` (never cloud-only models), `o` = its sort, `s` = its size filter
+    // ("up to N GB": the bucket at or above this Mac's memory budget when fits=true); later pages are the
+    // htmx "load more" requests (HX-Request: true). Our cursor is the next page number.
+    const page = q.cursor ? offset : 1;
+    const u = new URL(`${B.ollama}/search`);
+    u.searchParams.set('q', q.q.slice(0, 100));
+    u.searchParams.set('c', 'local');
+    u.searchParams.set('o', siteSort);
+    if (q.fits) u.searchParams.set('s', sizeBucket(fits.budgetBytes));
+    if (page > 1) u.searchParams.set('page', String(page));
+    const key = `ol:search:${u.href}`;
+    let res = cache.get(key);
+    const cached = !!res;
+    if (!res) {
+      const r = await catalogGet(u.href, { source: 'ollama', accept: 'text/html', maxBytes: 4 * 1024 * 1024, headers: page > 1 ? { 'hx-request': 'true' } : {} });
+      if (r.status !== 200) throw new CatalogUnavailable('ollama', `ollama.com answered ${r.status}.`);
+      res = { models: parseListPage(r.text), next: nextSearchPage(r.text), fetchedAt: new Date().toISOString() };
+      cache.set(key, res, r.text.length / 4);
+    }
+    const next = res.next && res.next > page && res.models.length ? encodeCursor({ s: 'ol', f: filterKey, o: res.next }) : null;
+    return { items: keep(res.models), nextCursor: next, sourceNote: ['read from the ollama.com website (its search)', ...notes].join('; '), fetchedAt: res.fetchedAt, cached };
+  }
+  const url = `${B.ollama}/library?sort=${siteSort}`;
   const key = `ol:list:${url}`;
   let page = cache.get(key);
   const cached = !!page;
@@ -142,18 +200,21 @@ export async function ollamaList(q, { fits, installedNames, curated, cache }) {
     const r = await catalogGet(url, { source: 'ollama', accept: 'text/html', maxBytes: 6 * 1024 * 1024 });
     if (r.status !== 200) throw new CatalogUnavailable('ollama', `ollama.com answered ${r.status}.`);
     const models = parseListPage(r.text);
-    if (!models.length && !q.q) throw new CatalogUnavailable('ollama', 'Could not read the model list on ollama.com (the page layout may have changed).');
+    if (!models.length) throw new CatalogUnavailable('ollama', 'Could not read the model list on ollama.com (the page layout may have changed).');
     page = { models, fetchedAt: new Date().toISOString() };
     cache.set(key, page, r.text.length / 4);
   }
-  if (q.q) notes.push(q.sort === 'updated' ? 'search results come in the website\'s order (its first page of matches)' : 'search shows the website\'s first page of matches');
-  // Cloud-only entries (no local size) cannot be downloaded.
-  let items = page.models.filter((m) => !(m.capabilities.includes('cloud') && !m.sizes.length)).map((m) => itemFor(m, { fits, installedNames, curated }));
-  if (q.kind) items = items.filter((i) => i.kind === q.kind);
-  if (q.fits) items = items.filter((i) => i.fit?.fits);
+  const items = keep(page.models);
   const slice = items.slice(offset, offset + q.limit);
   const next = offset + q.limit < items.length ? encodeCursor({ s: 'ol', f: filterKey, o: offset + q.limit }) : null;
   return { items: slice, nextCursor: next, sourceNote: ['read from the ollama.com website', ...notes].join('; '), fetchedAt: page.fetchedAt, cached };
+}
+
+/** The site's size filter value ("up to N GB") for a memory budget. */
+export function sizeBucket(budgetBytes) {
+  const gb = (budgetBytes || 0) / 1e9;
+  for (const v of [8, 16, 32, 64]) if (gb <= v) return String(v);
+  return 'over64';
 }
 
 export async function ollamaDetail(name, { fits, installedNames, curated, cache }) {

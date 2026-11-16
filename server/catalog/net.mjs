@@ -21,14 +21,14 @@ export class CatalogUnavailable extends HttpError {
  * GET `url` → { status, headers, text, url }. Follows up to 3 redirects to the same site. Never sends cookies or
  * credentials. Throws CatalogUnavailable on network errors / timeouts / oversize bodies.
  */
-export async function catalogGet(url, { source, accept = 'application/json', maxBytes = 4 * 1024 * 1024, timeoutMs = 15000, okStatuses = null } = {}) {
+export async function catalogGet(url, { source, accept = 'application/json', maxBytes = 4 * 1024 * 1024, timeoutMs = 15000, headers = {} } = {}) {
   let target = new URL(url);
   const origin = target.hostname.split('.').slice(-2).join('.');
   for (let hop = 0; hop < 4; hop++) {
     assertEgress(target, 'model_catalog');
     let res;
     try {
-      res = await httpRequest(target.href, { method: 'GET', headers: { 'user-agent': USER_AGENT, accept, 'accept-encoding': 'identity' }, signal: AbortSignal.timeout(timeoutMs) });
+      res = await httpRequest(target.href, { method: 'GET', headers: { ...headers, 'user-agent': USER_AGENT, accept, 'accept-encoding': 'identity' }, signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       if (e?.code === 'offline_lock') throw e;
       throw new CatalogUnavailable(source, `${source === 'ollama' ? 'ollama.com' : 'Hugging Face'} did not answer (${e?.name === 'TimeoutError' ? 'timeout' : e?.code || 'connection error'}).`);
@@ -53,7 +53,6 @@ export async function catalogGet(url, { source, accept = 'application/json', max
       throw new CatalogUnavailable(source, `Reading the answer failed (${e?.code || e?.name || 'error'}).`);
     }
     const text = Buffer.concat(chunks).toString('utf8');
-    if (okStatuses && !okStatuses.includes(res.status)) return { status: res.status, headers: res.headers, text, url: target.href };
     return { status: res.status, headers: res.headers, text, url: target.href };
   }
   throw new CatalogUnavailable(source, 'Too many redirects.');
