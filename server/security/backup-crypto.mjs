@@ -1,6 +1,6 @@
 // Passphrase-encrypted backups (docs/API.md §10.4): scrypt + AES-256-GCM over the whole harness.backup JSON.
 import crypto from 'node:crypto';
-import { deriveKey, newKdf, wipe } from './crypto.mjs';
+import { deriveKey, newKdf, wipe, kdfWithinBounds } from './crypto.mjs';
 import { HttpError } from '../lib/errors.mjs';
 
 export const ENCRYPTED_FORMAT = 'harness.backup.encrypted';
@@ -33,7 +33,7 @@ export async function openBackup(body, req) {
   if (!pass) throw new HttpError(400, 'encrypted_backup', 'This backup is encrypted: enter its passphrase.');
   if (body.version !== 1 || body.cipher !== 'aes-256-gcm' || body.kdf?.name !== 'scrypt') throw new HttpError(400, 'bad_backup', 'Unknown encrypted backup format.');
   const N = Number(body.kdf.N); const r = Number(body.kdf.r); const p = Number(body.kdf.p);
-  if (!(N >= 2 ** 10 && N <= 2 ** 18 && r >= 1 && r <= 32 && p >= 1 && p <= 16)) throw new HttpError(400, 'bad_backup', 'Unsupported backup key parameters.');
+  if (!kdfWithinBounds({ name: 'scrypt', N, r, p, salt: body.kdf.salt })) throw new HttpError(400, 'bad_backup', 'Unsupported backup key parameters.');
   const key = await deriveKey(pass, { name: 'scrypt', N, r, p, salt: body.kdf.salt, keyLen: 32 });
   const data = Buffer.from(String(body.data || ''), 'base64');
   try {

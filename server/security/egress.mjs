@@ -22,8 +22,12 @@ const normHost = (host) => {
 export function isLoopbackAddress(addr) {
   const h = normHost(addr);
   if (net.isIPv4(h)) return h.startsWith('127.');
-  if (net.isIPv6(h)) return h === '::1' || /^::ffff:127\./.test(h) || /^(0+:){7}0*1$/.test(h);
-  return false;
+  if (!net.isIPv6(h)) return false;
+  // canonical form (the URL parser's): ::1, and IPv4-mapped 127.0.0.0/8 — ::ffff:127.x.y.z, which URLs write in
+  // hex as ::ffff:7fXX:XXXX — and nothing else of ::ffff:0:0/96
+  let c = h.toLowerCase();
+  try { c = new URL(`http://[${h}]/`).hostname.slice(1, -1); } catch { /* zone id etc.: as written */ }
+  return c === '::1' || /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(c) || /^::ffff:127\./.test(c);
 }
 
 /** The exact name `localhost` (any case, with or without the trailing dot) — NOT `*.localhost`. */

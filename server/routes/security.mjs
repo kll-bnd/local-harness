@@ -4,6 +4,7 @@ import { HttpError } from '../lib/errors.mjs';
 import { Reply } from './common.mjs';
 import { runEgressSelfTest } from '../security/selftest.mjs';
 import { MAX_ALLOW_MINUTES } from '../security/network.mjs';
+import { proofBinding } from '../security/instance-proof.mjs';
 
 const selftestIntervalMs = () => Number(process.env.HARNESS_SELFTEST_INTERVAL_MS ?? 10000);
 const confirmHeader = (req) => (typeof req.headers['x-harness-confirm'] === 'string' ? req.headers['x-harness-confirm'] : null);
@@ -87,6 +88,13 @@ export function registerSecurityRoutes(r, core) {
     const body = await readJson(req);
     return core.rekey({ password: body.password, header: confirmHeader(req), sessionHash: auth.sessionHash });
   });
+
+  // Proof that this process holds the data folder's key (§10.3), for a tool about to send the password. No session
+  // (the caller has none yet); bound to the port the request arrived on, so a program relaying it gets a useless one.
+  r.post('/api/security/prove', async ({ req, bridge }) => {
+    const body = await readJson(req, { limit: 4096 });
+    return core.proveInstance(body?.nonce, proofBinding(bridge ? { bridge: true } : { port: req.socket?.localPort }));
+  }, open);
 
   // The owner has seen the notice that plain settings disagreed with the security record (§10.2).
   r.post('/api/security/tamper/dismiss', () => core.dismissTamper());

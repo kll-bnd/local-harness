@@ -458,4 +458,63 @@ describe('what counts as this Mac (review 03)', () => {
       untrackLocal();
     } finally { dns.lookup = orig; unregisterGuard(g); }
   });
+
+  test('IPv4-mapped loopback in the hex form URLs use (::ffff:7f00:1) is this Mac; the rest of ::ffff:0:0/96 is not', async () => {
+    const { isLoopbackHost, isLoopbackAddress, egressBlocked, registerGuard, unregisterGuard } = await import('../server/security/egress.mjs');
+    const host = new URL('http://[::ffff:127.0.0.1]:11434/').hostname;
+    assert.equal(host, '[::ffff:7f00:1]', 'what the URL parser makes of it');
+    for (const h of [host, '::ffff:7f00:1', '::ffff:7fff:ffff', '0:0:0:0:0:ffff:7f00:1', '::FFFF:7F00:1']) assert.equal(isLoopbackAddress(h), true, h);
+    for (const h of ['::ffff:8000:1', '::ffff:7e00:1', '::ffff:a00:1', '::ffff:0:7f00:1', '::7f00:1', '::ffff:10.0.0.1']) assert.equal(isLoopbackAddress(h), false, h);
+    const g = { blocked: true };
+    registerGuard(g);
+    try {
+      assert.equal(egressBlocked('http://[::ffff:127.0.0.1]:11434/api/version'), false, 'not refused as "the internet"');
+      assert.equal(egressBlocked('http://[::ffff:a00:1]/'), true);
+      assert.equal(isLoopbackHost('[::ffff:7f00:1]'), true);
+    } finally { unregisterGuard(g); }
+  });
+});
+
+describe('instance proof and key-derivation bounds (review F6)', () => {
+  test('openDataKeyWithPassword is pure; instanceProof binds the nonce and the port; out-of-range scrypt parameters are refused', async () => {
+    const { openDataKeyWithPassword, instanceProof, parseNonce, proofBinding } = await import('../server/security/instance-proof.mjs');
+    const { kdfWithinBounds } = await import('../server/security/crypto.mjs');
+    const dir = await tmpDir();
+    const v = new Vault(dir, { kdf: FAST });
+    await v.create('correct horse', { state: { mode: 'password', encrypted: true, offlineLock: true, allowedUntil: null, allowFrom: null, migration: null } });
+    const dek = Buffer.from(v.dek);
+    v.lock();
+    const before = fss.readFileSync(path.join(dir, 'vault.json'), 'utf8');
+    const json = JSON.parse(before);
+    const k = await openDataKeyWithPassword(json, 'correct horse');
+    assert.deepEqual(k, dek);
+    for (let i = 0; i < 5; i++) assert.equal(await openDataKeyWithPassword(json, `wrong ${i}`), null);
+    assert.equal(fss.readFileSync(path.join(dir, 'vault.json'), 'utf8'), before, 'no throttle bookkeeping, nothing written');
+    assert.equal(await openDataKeyWithPassword({ ...json, wraps: { recovery: json.wraps.recovery } }, 'correct horse'), null, 'no password wrap');
+    assert.equal(await openDataKeyWithPassword({ ...json, wraps: { ...json.wraps, password: { ...json.wraps.password, kdf: { ...json.wraps.password.kdf, N: 2 ** 30 } } } }, 'correct horse'), null, 'N out of bounds: not even tried');
+    // the proof: deterministic, bound to nonce and binding, under a subkey (not a MAC with the data key itself)
+    const n1 = crypto.randomBytes(32);
+    const n2 = crypto.randomBytes(32);
+    const p = instanceProof(k, n1, proofBinding({ port: 4747 }));
+    assert.equal(p.length, 32);
+    assert.deepEqual(instanceProof(k, n1, 'port:4747'), p);
+    assert.notDeepEqual(instanceProof(k, n2, 'port:4747'), p, 'another nonce');
+    assert.notDeepEqual(instanceProof(k, n1, 'port:5555'), p, 'another port (a relay)');
+    assert.notDeepEqual(instanceProof(k, n1, 'bridge'), p);
+    assert.notDeepEqual(instanceProof(crypto.randomBytes(32), n1, 'port:4747'), p, 'another key');
+    assert.notDeepEqual(crypto.createHmac('sha256', k).update(Buffer.concat([Buffer.from('harness-instance-proof-v1'), Buffer.from([0]), n1, Buffer.from([0]), Buffer.from('port:4747')])).digest(), p, 'a subkey, not the data key');
+    assert.throws(() => instanceProof(k, crypto.randomBytes(8), 'port:4747'), RangeError);
+    assert.throws(() => instanceProof(k, n1), TypeError, 'a binding is required');
+    assert.throws(() => proofBinding({}), RangeError);
+    assert.equal(parseNonce(n1.toString('base64url')).length, 32);
+    for (const bad of [undefined, '', 'a', crypto.randomBytes(8).toString('base64url'), crypto.randomBytes(65).toString('base64url'), n1.toString('base64'), `${n1.toString('base64url')}=`]) assert.equal(parseNonce(bad), null, String(bad));
+    k.fill(0);
+    // bounds: production and test parameters inside; huge or odd ones outside (vault.json is a plain file)
+    const salt = crypto.randomBytes(16).toString('base64');
+    assert.equal(kdfWithinBounds({ name: 'scrypt', N: 2 ** 17, r: 8, p: 1, keyLen: 32, salt }), true);
+    assert.equal(kdfWithinBounds({ name: 'scrypt', ...FAST, salt }), true);
+    for (const bad of [{ N: 2 ** 20, r: 8, p: 1 }, { N: 2 ** 17, r: 32, p: 1 }, { N: 3000, r: 8, p: 1 }, { N: 2 ** 9, r: 8, p: 1 }, { N: 2 ** 17, r: 8, p: 9 }, { N: 2 ** 17, r: 8, p: 1, keyLen: 64 }]) assert.equal(kdfWithinBounds({ name: 'scrypt', salt, ...bad }), false, JSON.stringify(bad));
+    assert.equal(kdfWithinBounds({ name: 'scrypt', N: 2 ** 17, r: 8, p: 1, salt: 'AAAA' }), false, 'a short salt');
+    assert.equal(validVault({ ...json, wraps: { ...json.wraps, password: { ...json.wraps.password, kdf: { ...json.wraps.password.kdf, N: 2 ** 24 } } } }), false, 'such a key store is not taken for one');
+  });
 });

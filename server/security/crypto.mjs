@@ -214,7 +214,22 @@ let kdfDefaults = { ...KDF_PRODUCTION };
 export function setKdfDefaults(p) { kdfDefaults = { ...KDF_PRODUCTION, ...(p || {}) }; }
 export function kdfDefaultsNow() { return { ...kdfDefaults }; }
 
+/**
+ * scrypt parameters Harness accepts from a key store (vault.json is a plain file: someone could write N = 2^30 into
+ * it to make every unlock attempt allocate gigabytes). N a power of two 2^10–2^18, r 1–16, p 1–4, at most 256 MiB,
+ * a salt of at least 16 bytes, a 32-byte key. The production parameters (2^17, 8, 1: 128 MiB) are inside with room.
+ */
+export function kdfWithinBounds(kdf) {
+  if (!kdf || typeof kdf !== 'object' || kdf.name !== 'scrypt') return false;
+  const { N, r, p } = kdf;
+  if (![N, r, p].every(Number.isInteger) || N < 2 ** 10 || N > 2 ** 18 || (N & (N - 1)) !== 0) return false;
+  if (r < 1 || r > 16 || p < 1 || p > 4 || 128 * N * r > 256 * 1024 * 1024) return false;
+  if (kdf.keyLen !== undefined && kdf.keyLen !== 32) return false;
+  return typeof kdf.salt === 'string' && Buffer.from(kdf.salt, 'base64').length >= 16;
+}
+
 export function deriveKey(password, kdf) {
+  if (!kdfWithinBounds(kdf)) return Promise.reject(new CryptoError('The key-derivation parameters are outside the accepted range.', 'kdf_out_of_bounds'));
   const salt = Buffer.from(kdf.salt, 'base64');
   const maxmem = 128 * kdf.N * kdf.r * 2 + 16 * 1024 * 1024;
   return new Promise((resolve, reject) => {

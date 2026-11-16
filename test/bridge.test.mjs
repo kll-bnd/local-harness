@@ -78,6 +78,14 @@ describe('bridge mode', () => {
       const su = await b.request('POST', '/api/security/setup', { body: { password: PW } });
       assert.equal(su.status, 200, su.text());
       assert.equal(su.json().sessionToken, undefined, 'no sessions over the bridge');
+      // the instance proof answers over the bridge too, bound to "bridge" (review F6)
+      const { openDataKeyWithPassword, instanceProof } = await import('../server/security/instance-proof.mjs');
+      const nonce = crypto.randomBytes(24);
+      const pr = await b.request('POST', '/api/security/prove', { body: { nonce: nonce.toString('base64url') } });
+      assert.equal(pr.status, 200, pr.text());
+      const key = await openDataKeyWithPassword(JSON.parse(fss.readFileSync(path.join(dir, 'vault.json'), 'utf8')), PW);
+      assert.ok(Buffer.from(pr.json().proof, 'base64url').equals(instanceProof(key, nonce, 'bridge')));
+      key.fill(0);
       assert.equal(su.headers['set-cookie'], undefined);
       await b.waitForEvent((e) => e.type === 'unlocked', 20000);
       // streamed chat, cancelled mid-stream (= a client disconnect: aborted, partial reply kept)

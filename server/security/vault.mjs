@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { seal, unseal, deriveKey, newKdf, hkdf, formatRecoveryKey, parseRecoveryKey, keyIdOf, wipe, kdfDefaultsNow } from './crypto.mjs';
+import { seal, unseal, deriveKey, newKdf, hkdf, formatRecoveryKey, parseRecoveryKey, keyIdOf, wipe, kdfDefaultsNow, kdfWithinBounds } from './crypto.mjs';
 import { HttpError } from '../lib/errors.mjs';
 
 export const MIN_PASSWORD = 8;
@@ -54,11 +54,25 @@ export function validVault(m) {
   if (typeof m.keyId !== 'string' || !/^[0-9a-f]{16}$/.test(m.keyId)) return false;
   const w = m.wraps;
   if (!w || typeof w !== 'object') return false;
-  if (!isSealed(w.password) || !w.password.kdf || w.password.kdf.name !== 'scrypt' || !Number.isInteger(w.password.kdf.N) || typeof w.password.kdf.salt !== 'string') return false;
+  if (!isSealed(w.password) || !kdfWithinBounds(w.password.kdf)) return false;
   if (w.recovery !== undefined && w.recovery !== null && (!isSealed(w.recovery) || typeof w.recovery.kdf?.salt !== 'string')) return false;
   if (w.keychain !== undefined && !isSealed(w.keychain)) return false;
   if (m.state !== undefined && m.state !== null && !isSealed(m.state)) return false;
   return true;
+}
+
+/**
+ * The data key from a parsed vault.json and a password — PURE: no throttle bookkeeping, no file written, nothing
+ * logged (the vault's own unlock uses it, then counts the attempt itself). null for a wrong password, a key store
+ * that is not valid (key-derivation parameters outside the accepted bounds included) or one without a password
+ * wrap. The CALLER OWNS the returned key and must wipe it (`buf.fill(0)`) when done.
+ * @returns {Promise<Buffer|null>}
+ */
+export async function openDataKeyWithPassword(vault, password) {
+  if (typeof password !== 'string' || !password || !validVault(vault)) return null;
+  const w = vault.wraps.password;
+  const kek = await deriveKey(password, w.kdf);
+  try { return unseal(kek, w, AAD('password')); } finally { wipe(kek); }
 }
 
 function readVaultFile(file) {
@@ -200,12 +214,7 @@ export class Vault {
   }
 
   async _openPassword(password) {
-    const w = this.meta?.wraps?.password;
-    if (!w) return null;
-    const kek = await deriveKey(password, w.kdf);
-    const dek = unseal(kek, w, AAD('password'));
-    wipe(kek);
-    return dek;
+    return this.meta ? openDataKeyWithPassword(this.meta, password) : null;
   }
 
   // Key ownership: unlockWith*() return the vault's OWN data-key buffer (the one the file ciphers hold) — callers

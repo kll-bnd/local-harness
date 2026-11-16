@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import fss from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { tmpDir, parseSse, GiB, waitFor } from './helpers.mjs';
 import { startFakeOllama } from './fake-ollama.mjs';
 import { startFakeA1111 } from './fake-a1111.mjs';
@@ -973,6 +974,49 @@ describe('plain files cannot lower protection (review 01, 05, 06)', () => {
       s = await stack({ dataDir, mode: 'launch' });
       assert.equal((await s.unlock()).status, 200, 'the current key store still opens everything');
       assert.ok((await s.call('GET', '/api/memories')).data.memories.some((m) => m.content === 'REPLAY-MARKER-AFTER'));
+    } finally { await s.close(); }
+  });
+});
+
+// Review round 2, finding F6: the command-line tools must not send the password to whatever wrote harness.lock.
+describe('instance proof (review F6)', () => {
+  test('POST /api/security/prove: no session; unlocked → a proof the helper verifies; bound to the port; locked 423, off 409, bad nonce 400', async () => {
+    const { openDataKeyWithPassword, instanceProof } = await import('../server/security/instance-proof.mjs');
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      const vaultBefore = fss.readFileSync(path.join(dataDir, 'vault.json'), 'utf8');
+      const key = await openDataKeyWithPassword(JSON.parse(vaultBefore), PW);
+      assert.ok(key, 'the helper opens a key store made by the real setup');
+      assert.equal(await openDataKeyWithPassword(JSON.parse(vaultBefore), 'wrong wrong'), null);
+      assert.equal(fss.readFileSync(path.join(dataDir, 'vault.json'), 'utf8'), vaultBefore, 'the helper wrote nothing (no throttle count)');
+      const port = Number(new URL(s.url).port);
+      const prove = (nonce, o) => s.call('POST', '/api/security/prove', { nonce: nonce.toString('base64url') }, { token: null, ...o });
+      const n1 = crypto.randomBytes(32);
+      const n2 = crypto.randomBytes(16);
+      const r1 = await prove(n1);
+      assert.equal(r1.status, 200, JSON.stringify(r1.data));
+      const p1 = Buffer.from(r1.data.proof, 'base64url');
+      assert.ok(crypto.timingSafeEqual(p1, instanceProof(key, n1, `port:${port}`)), 'verifies with the helper');
+      assert.ok(!p1.equals(instanceProof(key, n1, `port:${port + 1}`)), 'a relay on another port gets a proof that does not match');
+      assert.ok(!p1.equals(instanceProof(crypto.randomBytes(32), n1, `port:${port}`)), 'a wrong data key does not verify');
+      const p2 = Buffer.from((await prove(n2)).data.proof, 'base64url');
+      assert.ok(!p2.equals(p1) && p2.equals(instanceProof(key, n2, `port:${port}`)), 'two nonces, two proofs');
+      for (const bad of [{}, { nonce: 'x' }, { nonce: crypto.randomBytes(8).toString('base64url') }, { nonce: crypto.randomBytes(80).toString('base64url') }, { nonce: n1.toString('base64') + '+' }]) {
+        const r = await s.call('POST', '/api/security/prove', bad, { token: null });
+        assert.equal(r.status, 400, JSON.stringify(bad));
+      }
+      assert.equal((await prove(n1, { headers: { origin: 'https://evil.example' } })).status, 403, 'the Origin checks stay in front');
+      await s.call('POST', '/api/security/lock', {});
+      const locked = await prove(n1);
+      assert.deepEqual([locked.status, locked.data.error.code], [423, 'locked']);
+      await s.unlock();
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'off', password: PW })).status, 200);
+      await waitFor(async () => (await s.call('GET', '/api/security')).data.state === 'unlocked', { timeout: 15000 });
+      const off = await prove(n1);
+      assert.deepEqual([off.status, off.data.error.code], [409, 'not_encrypted']);
+      key.fill(0);
     } finally { await s.close(); }
   });
 });

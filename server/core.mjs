@@ -10,6 +10,7 @@ import { Auth } from './security/auth.mjs';
 import { chooseKeychain, KeychainError } from './security/keychain.mjs';
 import { listDataFiles, migrateDir, hasPlainData, hasEncryptedData, fixPermissions, repairForeignFiles } from './security/migrate.mjs';
 import { seal, unseal, wipe, keyIdOf, setKdfDefaults } from './security/crypto.mjs';
+import { instanceProof, parseNonce } from './security/instance-proof.mjs';
 import { setDirCipher, ensureDir, flushWrites } from './lib/fsx.mjs';
 import { HttpError } from './lib/errors.mjs';
 import { httpRequest } from './lib/http-client.mjs';
@@ -613,6 +614,19 @@ export class Core extends EventEmitter {
       return;
     }
     this.vault.commit({ offlineLock: v.enabled, allowedUntil: v.allowedUntil, allowFrom: v.allowFrom });
+  }
+
+  /**
+   * POST /api/security/prove: show that this process holds the data key, without a session and without revealing
+   * anything (an HMAC under a subkey used for nothing else, bound to where the request arrived — instance-proof.mjs).
+   * Never logged.
+   */
+  proveInstance(nonceText, binding) {
+    const nonce = parseNonce(nonceText);
+    if (!nonce) throw new HttpError(400, 'bad_request', 'nonce must be base64url of 16–64 random bytes');
+    if (this.mode === 'off' && this.modeVerified) throw new HttpError(409, 'not_encrypted', 'Harness runs without encryption: there is no data key to prove.');
+    if (!this.vault.dek) throw new HttpError(423, 'locked', 'Harness is locked: unlock it in its own window first.');
+    return { proof: instanceProof(this.vault.dek, nonce, binding).toString('base64url') };
   }
 
   /** POST /api/security/tamper/dismiss: the owner has seen the notice. */
