@@ -1,24 +1,27 @@
 #!/usr/bin/env node
-// CI-only fact-finding: the exact markup of one Ollama library list item, one search result and one
-// tag row, so the catalogue's page reader and its test fixtures match the real site.
-const get = async (url) => { const r = await fetch(url, { headers: { 'user-agent': 'harness-catalogue-probe', accept: 'text/html' }, signal: AbortSignal.timeout(30000) }); return r.text(); };
-const squeeze = (s) => s.replace(/<svg[\s\S]*?<\/svg>/g, '<svg/>').replace(/\s+/g, ' ').replace(/ class="[^"]*"/g, (m) => (m.length > 70 ? `${m.slice(0, 66)}…"` : m));
-function item(html, anchorRe, open, close, max = 3600) {
-  const m = anchorRe.exec(html); if (!m) return '(no match)';
-  const start = html.lastIndexOf(open, m.index); const end = html.indexOf(close, m.index);
-  return squeeze(html.slice(start, end + close.length)).slice(0, max);
+// CI-only fact-finding: how paging, sorting and the size/capability filters of ollama.com/search behave.
+const names = (html) => [...new Set([...html.matchAll(/<a[^>]*href="\/library\/([a-z0-9._-]+)"/g)].map((m) => m[1]))];
+async function get(label, url, headers = {}) {
+  const r = await fetch(url, { headers: { 'user-agent': 'harness-catalogue-probe', accept: 'text/html', ...headers }, redirect: 'manual', signal: AbortSignal.timeout(30000) });
+  const text = r.status >= 300 && r.status < 400 ? '' : await r.text();
+  const n = names(text);
+  const next = text.match(/hx-get="(\/search\?[^"]*)"[^>]*hx-trigger="revealed"/)?.[1]?.replace(/&amp;/g, '&') ?? null;
+  console.log(`${label}\n  GET ${url} ${JSON.stringify(headers)}\n  -> ${r.status}${r.headers.get('location') ? ` location=${r.headers.get('location')}` : ''} ${text.length} B, ${n.length} models, full page: ${/<html/i.test(text)}, next: ${next}\n  first: ${n.slice(0, 6).join(', ')}`);
+  return { n, next, text };
 }
-const lib = await get('https://ollama.com/library?sort=popular');
-console.log(`# library list item (first of ${[...lib.matchAll(/<a[^>]*href="\/library\/[a-z0-9._-]+"/g)].length})\n${item(lib, /<a[^>]*href="\/library\/[a-z0-9._-]+"/, '<li', '</li>')}`);
-console.log(`\n# library list item for qwen3\n${item(lib, /<a[^>]*href="\/library\/qwen3"/, '<li', '</li>')}`);
-const search = await get('https://ollama.com/search?q=qwen');
-console.log(`\n# search result item\n${item(search, /<a[^>]*href="\/library\/[a-z0-9._-]+"/, '<li', '</li>')}`);
-const opts = [...search.matchAll(/<option[^>]*value="([^"]*)"[^>]*>([^<]*)/g)].map((m) => `${m[1]}=${m[2].trim()}`);
-console.log(`\n# search form options: ${JSON.stringify(opts).slice(0, 600)}`);
-const inputs = [...search.matchAll(/<input[^>]*name="(c|s|o)"[^>]*value="([^"]*)"/g)].map((m) => `${m[1]}=${m[2]}`);
-console.log(`# search form inputs: ${JSON.stringify([...new Set(inputs)]).slice(0, 800)}`);
-const more = [...search.matchAll(/<[^>]*hx-get="\/search\?[^"]*"[^>]*>/g)].map((m) => squeeze(m[0])).slice(0, 3);
-console.log(`# search "load more" elements: ${JSON.stringify(more).slice(0, 900)}`);
-const tags = await get('https://ollama.com/library/qwen3/tags');
-const at = tags.search(/<a[^>]*href="\/library\/qwen3:0\.6b"/);
-console.log(`\n# tag row for qwen3:0.6b (both markups)\n${squeeze(tags.slice(tags.lastIndexOf('<div class="group', at), at + 2600)).slice(0, 2600)}`);
+const S = 'https://ollama.com/search';
+const p1 = await get('page 1', `${S}?q=qwen`);
+await get('page 2, plain', `${S}?page=2&q=qwen`);
+const p2 = await get('page 2, HX-Request', `${S}?page=2&q=qwen`, { 'HX-Request': 'true' });
+console.log(`  overlap with page 1: ${p2.n.filter((x) => p1.n.includes(x)).length} of ${p2.n.length}`);
+if (p2.next) await get('page 3 via the next link, HX-Request', `https://ollama.com${p2.next}`, { 'HX-Request': 'true' });
+await get('no query, default sort', `${S}`);
+await get('local only', `${S}?c=local`);
+await get('local, sort newest', `${S}?c=local&o=newest`);
+await get('local, sort popular', `${S}?c=local&o=popular`);
+await get('up to 8 GB', `${S}?s=8`);
+await get('local, up to 8 GB, tools', `${S}?c=local&c=tools&s=8`);
+await get('embedding', `${S}?c=embedding`);
+await get('vision, up to 8 GB', `${S}?c=vision&s=8`);
+const big = await get('last page probe (page 99, HX-Request)', `${S}?page=99&q=qwen`, { 'HX-Request': 'true' });
+console.log(`  page 99 body: ${JSON.stringify(big.text.slice(0, 200))}`);
