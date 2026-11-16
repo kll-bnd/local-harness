@@ -304,15 +304,15 @@ describe('which Keychain store (never the real one by accident)', () => {
     const def = await tmpDir('harness-default-');
     const other = await tmpDir('harness-other-');
     // a temp / test / custom folder: refused unless opted in — and a refused store never deletes anything
-    const refused = chooseKeychain(other, { platform: 'darwin', testRun: false, kind: undefined, defaultDir: def });
+    const refused = chooseKeychain(other, { platform: 'darwin', testRun: false, kind: null, defaultDir: def });
     assert.equal(refused.kind, 'refused');
     await assert.rejects(refused.get(), (e) => e instanceof KeychainError && e.reason === 'not_allowed');
     await assert.rejects(refused.set(Buffer.alloc(32)), (e) => e.reason === 'not_allowed');
     await refused.delete();
     // the default folder in a test run: refused too
-    assert.equal(chooseKeychain(def, { platform: 'darwin', testRun: true, kind: undefined, defaultDir: def }).kind, 'refused');
+    assert.equal(chooseKeychain(def, { platform: 'darwin', testRun: true, kind: null, defaultDir: def }).kind, 'refused');
     // the default folder outside tests: the agreed item name (the native app uses it)
-    const real = chooseKeychain(def, { platform: 'darwin', testRun: false, kind: undefined, defaultDir: def });
+    const real = chooseKeychain(def, { platform: 'darwin', testRun: false, kind: null, defaultDir: def });
     assert.equal(real.kind, 'keychain');
     assert.equal(real.service, 'local.harness');
     assert.equal(real.account, KEYCHAIN_ACCOUNT);
@@ -324,7 +324,7 @@ describe('which Keychain store (never the real one by accident)', () => {
     assert.equal(isDefaultDataDir(def, { defaultDir: def }), true);
     // the development stand-in, explicitly or outside macOS
     assert.equal(chooseKeychain(def, { platform: 'darwin', testRun: false, kind: 'file', defaultDir: def }).kind, 'file');
-    assert.equal(chooseKeychain(other, { platform: 'linux', testRun: false, kind: undefined }).kind, 'file');
+    assert.equal(chooseKeychain(other, { platform: 'linux', testRun: false, kind: null }).kind, 'file');
     // this very test process: the default choice is never the real Keychain
     assert.notEqual(chooseKeychain(other).kind, 'keychain');
   });

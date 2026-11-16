@@ -202,7 +202,6 @@ export class Core extends EventEmitter {
       this.app.bus.on('event', (ev) => { if (ev.type === 'settings.updated') this._cacheFromSettings(); });
       this.state = 'unlocked';
       this.lastActivity = Date.now();
-      this.keychainError = null;
       this._emitState();
       this.emit('unlocked', {});
       this.emitEvent({ type: 'unlocked' });
@@ -353,6 +352,7 @@ export class Core extends EventEmitter {
     if (!kek) throw new HttpError(503, 'keychain_unavailable', 'The Keychain holds no Harness key. Enter the password instead.', { reason: 'not_found' });
     const dek = this.vault.unlockWithKeychainKey(kek);
     wipe(kek);
+    if (dek) this.keychainError = null;
     if (!dek) {
       const e = new HttpError(401, 'wrong_key', 'The key from the Keychain does not open this data. Enter the password instead.');
       if (this.keychain.kind === 'app') e.fatal = true;

@@ -158,9 +158,9 @@ export function refusedKeychain(message) {
 /**
  * Where keychain mode keeps its key for `dataDir` (listener mode; the bridge uses appKeychain).
  * @param {object} [o]
- * @param {'mac'|'file'|undefined} [o.kind]  explicit choice (startServer option or HARNESS_KEYCHAIN)
+ * @param {'mac'|'file'|null} [o.kind]  explicit choice (startServer option or HARNESS_KEYCHAIN); null = none
  */
-export function chooseKeychain(dataDir, { kind = process.env.HARNESS_KEYCHAIN || undefined, platform = process.platform, testRun = !!process.env.NODE_TEST_CONTEXT, defaultDir } = {}) {
+export function chooseKeychain(dataDir, { kind = process.env.HARNESS_KEYCHAIN || null, platform = process.platform, testRun = !!process.env.NODE_TEST_CONTEXT, defaultDir } = {}) {
   if (kind === 'file' || kind === 'dev') return fileKeychain(dataDir);
   if (platform !== 'darwin') return fileKeychain(dataDir); // no Keychain outside macOS (development only)
   const opts = defaultDir ? { defaultDir } : undefined;
