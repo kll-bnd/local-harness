@@ -13,7 +13,15 @@ on:
         description: "Which jobs to run"
         type: choice
         default: all
-        options: [all, backend, ollama, nemotron]
+        options: [all, backend, live, ollama, nemotron]
+      live_groups:
+        description: "live-check groups to run"
+        type: string
+        default: env,ollama,e2e
+      live_samples:
+        description: "Comma-separated substrings of raw sample names to print"
+        type: string
+        default: ""
       nemotron_tag:
         description: "Nemotron quant tag to pull from hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF"
         type: string
@@ -70,9 +78,37 @@ jobs:
           wait "$pid" 2>/dev/null || true
           cat "$RUNNER_TEMP/server.log"
 
+  live:
+    name: Live check against a real Ollama
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'live' }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install and start Ollama, pull tiny models
+        run: |
+          set -euo pipefail
+          brew install ollama > /dev/null
+          OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 LLAMA_ARG_CACHE_RAM=512 \
+            nohup ollama serve > /tmp/harness-ci-ollama.log 2>&1 &
+          for _ in $(seq 1 100); do
+            curl -fsS "$O/api/version" > /dev/null 2>&1 && break
+            sleep 0.3
+          done
+          ollama pull qwen3:0.6b > /dev/null 2>&1
+          ollama pull gemma3:270m > /dev/null 2>&1
+      - name: Live check
+        run: |
+          node scripts/live-check.mjs --only "${{ inputs.live_groups || 'env,ollama,e2e' }}" --allow-pull --timeout-scale 4 --quiet --no-color \
+            --json /tmp/harness-live.json --markdown /tmp/harness-live.md || echo "live-check exit code $?"
+          node scripts/ci/summarize-live-check.mjs /tmp/harness-live.json "${{ inputs.live_samples }}"
+
   ollama:
     name: Real Ollama API behaviour
-    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'ollama' }}
+    if: ${{ inputs.jobs == 'ollama' }}
     runs-on: macos-latest
     timeout-minutes: 30
     env:
@@ -101,7 +137,7 @@ jobs:
 
   nemotron:
     name: Nemotron 3.5 Bolt E4B on a Mac runner
-    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'nemotron' }}
+    if: ${{ inputs.jobs == 'nemotron' }}
     runs-on: macos-latest
     timeout-minutes: 60
     env:

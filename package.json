@@ -19,7 +19,8 @@
     "dist:app": "electron-builder --mac dir --arm64",
     "dist:linux-dir": "electron-builder --linux dir",
     "test:e2e": "node electron/test/e2e.mjs",
-    "icons": "node scripts/make-icons.mjs"
+    "icons": "node scripts/make-icons.mjs",
+    "live-check": "node scripts/live-check.mjs"
   },
   "license": "UNLICENSED",
   "author": "Harness",
