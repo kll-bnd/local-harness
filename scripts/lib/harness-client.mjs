@@ -10,9 +10,17 @@
 //     written to disk.
 //   * First run (state `needs_setup`): the tools do NOT choose a password. The Harness window does that, because
 //     it shows the recovery key once with a "save it now" step — a terminal would leave it in scrollback.
+//   * A Harness this process did NOT start (found through <dataDir>/harness.lock, which any program running as the
+//     user can write) gets the password only after it PROVED it holds this folder's data key: the password is first
+//     checked locally against <dataDir>/vault.json (no request, no throttle counter), then the instance must answer
+//     a fresh random nonce with HMAC(subkey of the data key, nonce) — POST /api/security/prove. A locked instance
+//     cannot prove anything and never gets the password. The data key never leaves this process and is wiped
+//     right after the comparison.
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
+import { openDataKeyWithPassword, instanceProof } from './instance-proof.mjs';
 
 const require = createRequire(import.meta.url);
 const { findRunningHarness, findAppHarness } = require('../../electron/lib/instance.cjs');
@@ -112,6 +120,16 @@ export function vaultError(sec) {
   return new HarnessError(code, `${what} Your data is still encrypted and nothing was changed. Restore vault.json from a backup of the Harness data folder (Time Machine, or a copy you made), then open Harness again. Do not choose a new password: that cannot open the existing data.${sec?.error?.message ? `\n(Harness says: ${sec.error.message})` : ''}`, { security: sec });
 }
 const errMsg = (r) => r?.data?.error?.message || `HTTP ${r?.status}`;
+
+/** A discovered Harness that is locked: it cannot prove anything, so it does not get the password. */
+export function lockedInstanceError(base) {
+  return new HarnessError('instance_locked', `Harness is running at ${base} but it is locked. This tool does not send your password to a Harness it did not start while that Harness is locked. Unlock it in its own window (or quit it), then run this again.`);
+}
+
+/** A discovered program that could not prove it holds this data folder's key. The password was not sent. */
+export function unverifiedInstanceError(base, why) {
+  return new HarnessError('instance_unverified', `The program answering at ${base} could not prove that it has this Harness data folder open (${why}), so your password was NOT sent to it. Quit whatever is running there — or restart your Mac if you don't know what it is — then run \`npm run doctor\` and try again.`);
+}
 const fmtWait = (ms) => (ms >= 60000 ? `${Math.ceil(ms / 60000)} min` : `${Math.ceil(ms / 1000)} s`);
 
 /**
@@ -128,8 +146,14 @@ export class HarnessClient {
   #password = null; // only what the user typed during this run
   #via = null;
 
-  constructor({ base, dataDir, password = passwordSource(), log = (m) => process.stderr.write(`${m}\n`), maxAttempts = 3 }) {
+  /**
+   * @param {object} o
+   * @param {boolean} [o.inProcess=false]  true only for a backend THIS process started (reachHarness().srv): the
+   *   password then goes to our own process. Anything else must prove it holds the data key first.
+   */
+  constructor({ base, dataDir, password = passwordSource(), log = (m) => process.stderr.write(`${m}\n`), maxAttempts = 3, inProcess = false }) {
     this.base = base;
+    this.inProcess = inProcess === true;
     this.dataDir = dataDir;
     this.pw = password;
     this.log = log;
@@ -154,8 +178,61 @@ export class HarnessClient {
 
   /** The password typed during this run, asking for it once if needed (for confirmations, §10.3). */
   async password(prompt = 'Harness password: ') {
+    if (!this.inProcess) return this.#verifiedPassword(prompt);
     if (this.#password === null) this.#password = await this.#askPassword(prompt);
     return this.#password;
+  }
+
+  /**
+   * For a Harness we did not start: the password, checked LOCALLY against vault.json (asked again on a terminal
+   * when wrong — the instance sees nothing), and only returned once the instance proved it holds the data key.
+   */
+  async #verifiedPassword(prompt) {
+    let vault;
+    try { vault = JSON.parse(fs.readFileSync(path.join(this.dataDir, 'vault.json'), 'utf8')); } catch { vault = null; }
+    if (!vault?.wraps?.password) {
+      this.#password = null;
+      throw unverifiedInstanceError(this.base, 'this folder has no readable key store to check your password against');
+    }
+    for (let attempt = 1; ; attempt++) {
+      const pw = this.#password ?? await this.#askPassword(prompt);
+      const key = await openDataKeyWithPassword(vault, pw).catch(() => null);
+      if (!key) {
+        this.#password = null;
+        if (attempt >= this.maxAttempts) throw new HarnessError('wrong_password', 'Wrong Harness password.');
+        this.log('That is not the Harness password.');
+        continue;
+      }
+      try {
+        await this.#proveInstance(key);
+      } catch (e) {
+        this.#password = null;
+        throw e;
+      } finally {
+        key.fill(0);
+      }
+      this.#password = pw;
+      return pw;
+    }
+  }
+
+  /** Fresh nonce → POST /api/security/prove → constant-time comparison. Throws instance_unverified. */
+  async #proveInstance(key) {
+    const nonce = crypto.randomBytes(32);
+    let r;
+    try {
+      r = await call(this.base, 'POST', '/api/security/prove', { body: { nonce: nonce.toString('base64url') }, timeoutMs: 15000 });
+    } catch {
+      throw unverifiedInstanceError(this.base, 'it did not answer the proof request');
+    }
+    if (r.status === 423) throw unverifiedInstanceError(this.base, 'it says it is locked');
+    if (!r.ok) throw unverifiedInstanceError(this.base, `it answered the proof request with HTTP ${r.status}`);
+    const expected = instanceProof(key, nonce);
+    let got = null;
+    try { got = typeof r.data?.proof === 'string' ? Buffer.from(r.data.proof, 'base64url') : null; } catch { got = null; }
+    const ok = !!got && got.length === expected.length && crypto.timingSafeEqual(got, expected);
+    expected.fill(0);
+    if (!ok) throw unverifiedInstanceError(this.base, 'its proof does not match this folder\'s key');
   }
 
   /** Run fn(password); if Harness says the password is wrong, forget it and ask again (terminal only). */
@@ -230,6 +307,7 @@ export class HarnessClient {
       }
       // No token file, or the Keychain refused: fall through to the password.
     }
+    if (!this.inProcess && sec.state !== 'unlocked' && sec.state !== 'migrating') throw lockedInstanceError(this.base);
     for (let attempt = 1; ; attempt++) {
       const retry = sec.unlock?.retryAfterMs || 0;
       if (retry > 0) {
@@ -237,7 +315,10 @@ export class HarnessClient {
         this.log(`Harness asks to wait ${fmtWait(retry)} before the next password attempt…`);
         await sleep(retry);
       }
-      const pw = this.#password ?? await this.#askPassword(`Harness password (to ${reason}): `);
+      // A Harness we did not start gets the password only after proving it holds the data key (see above).
+      const pw = this.inProcess
+        ? this.#password ?? await this.#askPassword(`Harness password (to ${reason}): `)
+        : await this.#verifiedPassword(`Harness password (to ${reason}): `);
       // Ask explicitly for a bearer token: browsers only ever get the HttpOnly cookie (§10.3).
       const r = await call(this.base, 'POST', '/api/security/unlock', { body: { password: pw, session: 'token' }, timeoutMs: 120000 });
       if (r.ok && this.#takeSession(r)) {
@@ -311,6 +392,7 @@ export function appHarness(dataDir) {
  * @returns {Promise<{ base: string, srv: object|null, running: object|null, close(): Promise<void> }>}
  */
 export async function reachHarness({ dataDir, port = 4747, start = true, startOptions = {}, log = () => {} }) {
+  // `running` / no `srv`: an instance found through the lock file — NOT authenticated (HarnessClient proves it).
   const running = await findRunningHarness({ dataDir, timeoutMs: 1500 });
   if (running) return { base: running.url, srv: null, running, close: async () => {} };
   const app = findAppHarness({ dataDir });

@@ -5,8 +5,10 @@
 //
 // Uses only things that need no session and contain no user data: the backend's data-dir lock file
 // `<dataDir>/harness.lock` (written by server/lib/instance-lock.mjs: { pid, url, port, dataDir, … }) and
-// `GET /api/health` on the port it names. The lock lives inside the data dir, so an instance it names
-// serves that data dir; ports are not probed (another Harness on a nearby port may use another folder).
+// `GET /api/health` on the port it names. Ports are not probed (another Harness on a nearby port may use another
+// folder). NOTE: nothing here authenticates the instance — any program running as this user can write the lock
+// and answer /api/health. Use it to avoid two writers and to find where to go; never send a secret to what it
+// names without proof (scripts/lib/harness-client.mjs: POST /api/security/prove before a password is sent).
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -27,6 +29,9 @@ function getJson(port, p, timeoutMs) {
 
 const real = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
 
+/** A lock names this data folder only when it says so: a lock without `dataDir`, or for another folder, is ignored. */
+const lockIsFor = (info, dataDir) => !!info && typeof info.dataDir === 'string' && info.dataDir !== '' && real(info.dataDir) === real(dataDir);
+
 /** The lock file's contents, or null. */
 function readLock(dataDir) {
   try { return JSON.parse(fs.readFileSync(path.join(dataDir, 'harness.lock'), 'utf8')); } catch { return null; }
@@ -43,7 +48,7 @@ async function findRunningHarness({ dataDir, timeoutMs = 1500 } = {}) {
   const info = readLock(dataDir);
   const port = Number(info?.port);
   if (!Number.isInteger(port) || port <= 0 || port >= 65536) return null;
-  if (info.dataDir && real(info.dataDir) !== real(dataDir)) return null;
+  if (!lockIsFor(info, dataDir)) return null;
   const h = await getJson(port, '/api/health', timeoutMs);
   if (!(h && h.ok && h.name === 'harness')) return null;
   return { url: `http://127.0.0.1:${port}`, port, version: h.version, pid: Number.isInteger(info.pid) ? info.pid : null, state: h.state ?? null };
@@ -63,7 +68,7 @@ function pidAlive(pid) {
 function findAppHarness({ dataDir } = {}) {
   const info = readLock(dataDir);
   if (!info || info.transport !== 'bridge' || !pidAlive(info.pid)) return null;
-  if (info.dataDir && real(info.dataDir) !== real(dataDir)) return null;
+  if (!lockIsFor(info, dataDir)) return null;
   return { pid: info.pid, transport: 'bridge', startedAt: typeof info.startedAt === 'string' ? info.startedAt : null };
 }
 

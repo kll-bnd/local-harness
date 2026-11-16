@@ -9,7 +9,10 @@
 //   * it asks for your Harness password (on the terminal, not shown; or from stdin with --password-stdin);
 //   * the download needs internet: it asks before allowing it for a limited window (your password confirms),
 //     blocks it again as soon as the download is done, and prints the blocker's state at the end;
-//   * on a fresh install (no password chosen yet) it stops and tells you to open Harness first.
+//   * on a fresh install (no password chosen yet) it stops and tells you to open Harness first;
+//   * a Harness that is already running (found through the data folder's lock file) gets your password only after
+//     it proved it holds this folder's key — your password is checked locally first; a running Harness that is
+//     locked is never sent it: unlock it in its own window, or quit it, and run this again.
 //
 //   npm run get-model                        ask before each step
 //   npm run get-model -- --yes               accept the defaults (allow internet for the download, text-only copy)
@@ -61,7 +64,9 @@ try {
   process.exit(1);
 }
 if (h.running) console.log(`Using the Harness that is running at ${h.base}.`);
-const client = new HarnessClient({ base: h.base, dataDir, password: passwordSource({ fromStdin: pwStdin }) });
+// inProcess only when this run started the backend itself; a Harness found through the lock file must prove it
+// holds this folder's key before it gets the password (scripts/lib/harness-client.mjs).
+const client = new HarnessClient({ base: h.base, dataDir, password: passwordSource({ fromStdin: pwStdin }), inProcess: !!h.srv });
 let allowedByUs = false;
 let closing = false;
 

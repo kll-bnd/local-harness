@@ -175,7 +175,16 @@ View with ⌥⌘J (⌥⌘I is the Inspector). File and Help also have "Show Data
   `startServer().security` events (`state`, `locked`, `unlocked`).
 * **Damaged key store** (state `error`): the app starts normally and the page shows Harness's explanation; it never
   offers a new password there. `npm run test:e2e` covers this (`vault-error` scenario).
-* `electron/lib/instance.cjs` no longer calls `/api/system` (it needs a session in 0.2).
+* `electron/lib/instance.cjs` no longer calls `/api/system` (it needs a session in 0.2). A lock file counts only
+  when its `dataDir` names this folder. Nothing there authenticates the instance: any program running as the user
+  can write `harness.lock` and answer `/api/health`. The command-line tools therefore send the password to a
+  Harness they did not start only after it proves it holds the data key (`POST /api/security/prove`, checked
+  against a key unwrapped locally from `vault.json`), and never to a locked one. The Electron shell's
+  start-or-attach path still loads whatever the lock names into its window (in password mode the owner would type
+  the password into that page; in keychain/off mode the app sends the `api-token` to it). **Open item:** the shell cannot prove an instance in
+  password mode before the owner types the password; the safe change is to refuse to attach (a dialog naming the
+  other process: use it, or quit it) instead of loading it, and never to send the `api-token` to a discovered
+  instance. `Harness.command` (`scripts/launch.mjs`) opens the browser at a discovered instance the same way.
 
 ## Lifecycle and Mac niceties
 

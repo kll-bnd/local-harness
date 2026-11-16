@@ -9,7 +9,10 @@
 //   npm run doctor                             human-readable report
 //   npm run doctor -- --unlock                 also look inside the running Harness (asks for your password,
 //                                              not shown; --password-stdin reads it from stdin): loaded models'
-//                                              real memory use, Ollama protections, self-test in that process
+//                                              real memory use, Ollama protections, self-test in that process.
+//                                              The password is checked against vault.json locally and sent only
+//                                              after the running Harness proves it holds this folder's key; a
+//                                              locked Harness is never sent it (unlock it in its own window)
 //   npm run doctor -- --state                  print only the security state (setup script)
 //   npm run doctor -- --json                   machine-readable report
 //   npm run doctor -- --live                   also run the live conformance check (scripts/live-check.mjs)
@@ -212,6 +215,11 @@ if (running) {
   add(st === 'error' ? 'fail' : 'info', `Harness ${running.version} is running at ${running.url} — ${stText(st, runningSec)}`, `pid ${running.pid ?? '?'}${runningSec?.transport ? `, ${runningSec.transport}` : ''}`);
   if (runningSec?.unlock?.retryAfterMs > 0) add('warn', `Too many wrong passwords: the next attempt is accepted in ${Math.ceil(runningSec.unlock.retryAfterMs / 1000)} s`);
   if (runningSec?.unlock?.keychainError) add('warn', `The Keychain did not open Harness: ${runningSec.unlock.keychainError.message}`, 'Your password still opens it.');
+  if (runningSec?.tamper) {
+    add('warn', `Security settings were changed outside Harness and ignored (${new Date(runningSec.tamper.at).toLocaleString()}): ${runningSec.tamper.fields.join('; ')}`,
+      'Harness kept what it had recorded with your password (launch.json and vault.json can only make it MORE protective). If you did not edit these files, a program running as you did.',
+      'Dismiss the notice in Settings → Privacy & security once you know why.');
+  }
 } else if (inApp) {
   add('info', `Harness is open in the Harness app (pid ${inApp.pid})`,
     'The app has no local address (by design), so this tool cannot ask it whether it is locked, run its internet self-test or see the loaded model.\n      In the app: Settings → Privacy & security shows the protection and the blocker, with the button "Check that nothing can get out".');

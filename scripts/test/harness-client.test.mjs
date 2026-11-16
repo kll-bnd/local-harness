@@ -16,7 +16,7 @@ const scripted = (answers) => { const list = [...answers]; const prompts = []; r
 test('password from stdin: unlocks, uses the bearer token, logs out at the end', async () => {
   const f = await startFakeSecurity();
   try {
-    const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: passwordSource({ fromStdin: true, stdin: stdinOf('correct horse\nignored\n') }), log: quiet });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: passwordSource({ fromStdin: true, stdin: stdinOf('correct horse\nignored\n') }), log: quiet });
     const sec = await c.ensureSession({ reason: 'test' });
     assert.equal(sec.state, 'unlocked');
     assert.equal(c.via, 'password');
@@ -31,14 +31,14 @@ test('password from stdin: unlocks, uses the bearer token, logs out at the end',
 test('asks for a bearer token explicitly ("session": "token") and uses nothing else', async () => {
   const f = await startFakeSecurity();
   try {
-    const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: scripted(['correct horse']), log: quiet });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: scripted(['correct horse']), log: quiet });
     await c.ensureSession();
     assert.equal(f.unlockBodies.at(-1).session, 'token');
     assert.equal(c.authHeaders().cookie, undefined);
     assert.match(c.authHeaders().authorization, /^Bearer /);
     const g = await startFakeSecurity({ honourTokenRequest: false });
     try {
-      const d = new HarnessClient({ base: g.url, dataDir: tmp(), password: scripted(['correct horse']), log: quiet });
+      const d = new HarnessClient({ inProcess: true, base: g.url, dataDir: tmp(), password: scripted(['correct horse']), log: quiet });
       await assert.rejects(d.ensureSession(), (e) => e.code === 'no_session');
     } finally { await g.close(); }
   } finally { await f.close(); }
@@ -49,7 +49,7 @@ test('state error (damaged key store): reported plainly, never a password prompt
     const f = await startFakeSecurity({ state: 'error', error: { code, message: 'x' } });
     try {
       const pw = scripted(['should not be asked']);
-      const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: pw, log: quiet });
+      const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: pw, log: quiet });
       await assert.rejects(c.ensureSession(), (e) => e.code === code && /Restore vault\.json from a backup/.test(e.message) && /Do not choose a new password/.test(e.message));
       assert.equal(pw.prompts.length, 0);
       assert.equal(f.unlockBodies.length, 0);
@@ -61,11 +61,11 @@ test('wrong password: asks again on a terminal, fails at once from stdin', async
   const f = await startFakeSecurity();
   try {
     const pw = scripted(['nope', 'correct horse']);
-    const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: pw, log: quiet });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: pw, log: quiet });
     await c.ensureSession({ reason: 'download a model' });
     assert.equal(pw.prompts.length, 2);
     assert.match(pw.prompts[0], /Harness password \(to download a model\)/);
-    const s = new HarnessClient({ base: f.url, dataDir: tmp(), password: passwordSource({ fromStdin: true, stdin: stdinOf('nope\n') }), log: quiet });
+    const s = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: passwordSource({ fromStdin: true, stdin: stdinOf('nope\n') }), log: quiet });
     f.state = 'locked';
     await assert.rejects(s.ensureSession(), (e) => e.code === 'wrong_password');
   } finally { await f.close(); }
@@ -76,13 +76,13 @@ test('throttled unlock: waits for retryAfterMs, refuses waits over two minutes',
   try {
     f.failed = 3; f.lastFailAt = Date.now(); // next try allowed after 1 s
     const logs = [];
-    const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: scripted(['correct horse']), log: (m) => logs.push(m) });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: scripted(['correct horse']), log: (m) => logs.push(m) });
     const t0 = Date.now();
     await c.ensureSession();
     assert.ok(Date.now() - t0 >= 900, 'waited');
     assert.ok(logs.some((l) => /wait 1 s/.test(l)));
     f.state = 'locked'; f.failed = 12; f.lastFailAt = Date.now();
-    const d = new HarnessClient({ base: f.url, dataDir: tmp(), password: scripted(['x']), log: quiet });
+    const d = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: scripted(['x']), log: quiet });
     await assert.rejects(d.ensureSession(), (e) => e.code === 'unlock_throttled' && /min/.test(e.message));
   } finally { await f.close(); }
 });
@@ -91,7 +91,7 @@ test('needs_setup: the tool never chooses a password, it explains how to open Ha
   const f = await startFakeSecurity({ state: 'needs_setup' });
   try {
     const pw = scripted(['should not be asked']);
-    const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: pw, log: quiet });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: pw, log: quiet });
     await assert.rejects(c.ensureSession(), (e) => e.code === 'needs_setup' && /choose a password there/.test(e.message));
     assert.equal(pw.prompts.length, 0);
     assert.equal(f.unlockBodies.length, 0);
@@ -105,7 +105,7 @@ test('keychain mode: uses the api-token file, no password asked', async () => {
     fs.writeFileSync(path.join(dir, 'api-token'), 'tok-123\n');
     f.sessions.add('tok-123');
     const pw = scripted([]);
-    const c = new HarnessClient({ base: f.url, dataDir: dir, password: pw, log: quiet });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: dir, password: pw, log: quiet });
     await c.ensureSession();
     assert.equal(c.via, 'api-token');
     assert.equal(pw.prompts.length, 0);
@@ -119,7 +119,7 @@ test('keychain mode: uses the api-token file, no password asked', async () => {
 test('Harness locks during the run: the next request unlocks again once', async () => {
   const f = await startFakeSecurity();
   try {
-    const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: scripted(['correct horse', 'correct horse']), log: quiet });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: scripted(['correct horse', 'correct horse']), log: quiet });
     await c.ensureSession();
     await c.request('POST', '/api/security/lock', {});
     assert.equal(f.state, 'locked');
@@ -135,7 +135,7 @@ test('confirmations reuse the typed password; a wrong one is asked again', async
     fs.writeFileSync(path.join(dir, 'api-token'), 't');
     f.sessions.add('t');
     const pw = scripted(['wrong', 'correct horse']);
-    const c = new HarnessClient({ base: f.url, dataDir: dir, password: pw, log: quiet });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: dir, password: pw, log: quiet });
     await c.ensureSession();
     const r = await c.withPassword((p) => c.request('POST', '/api/network/allow', { minutes: 15, password: p }));
     assert.equal(r.status, 200);
@@ -152,7 +152,7 @@ test('migration progress is waited for after unlocking', async () => {
   try {
     f.password = 'pw-12345';
     const logs = [];
-    const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: scripted(['pw-12345']), log: (m) => logs.push(m) });
+    const c = new HarnessClient({ inProcess: true, base: f.url, dataDir: tmp(), password: scripted(['pw-12345']), log: (m) => logs.push(m) });
     f.state = 'locked';
     const orig = f.state;
     f.migration = null;
