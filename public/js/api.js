@@ -111,12 +111,33 @@ async function send(method, path, { body, signal, headers = {}, keepalive = fals
     else { payload = textEncoder.encode(JSON.stringify(body)); h['content-type'] = 'application/json'; }
   }
   for (const fn of requestHooks) { try { fn(method, path); } catch { /* observer failed */ } }
+  // Every request can be stopped by abortAll() (Harness locking); keepalive ones are meant to outlive the page.
+  const ctl = new AbortController();
+  if (signal) { if (signal.aborted) ctl.abort(); else signal.addEventListener('abort', () => ctl.abort(), { once: true }); }
+  if (!keepalive) inflight.add(ctl);
   try {
-    return await transport({ method, path, headers: h, body: payload, signal: signal || new AbortController().signal, keepalive });
+    const res = await transport({ method, path, headers: h, body: payload, signal: ctl.signal, keepalive });
+    return { ...res, body: settleWith(res.body, () => inflight.delete(ctl)) };
   } catch (e) {
-    if (e?.name === 'AbortError') throw e;
+    inflight.delete(ctl);
+    if (e?.name === 'AbortError' || ctl.signal.aborted) throw abortError();
     throw new ApiError(0, 'network', 'Harness is not reachable. Is the app still running?');
   }
+}
+
+const inflight = new Set();
+const abortError = () => { const e = new Error('Aborted'); e.name = 'AbortError'; return e; };
+async function* settleWith(body, done) {
+  try { for await (const c of body) yield c; } finally { done(); }
+}
+
+/**
+ * Stop every request in flight (Harness is locking and the page is about to be replaced): they end as quiet
+ * AbortErrors here instead of being cancelled by the navigation, which some engines report as page errors.
+ */
+export function abortAll() {
+  for (const c of inflight) { try { c.abort(); } catch { /* ignore */ } }
+  inflight.clear();
 }
 
 /** JSON (or text) request; non-2xx → ApiError. */

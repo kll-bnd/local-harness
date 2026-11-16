@@ -145,16 +145,14 @@ async function costBySize(page, text, sizes, chunkLines) {
       md.update(t.slice(0, pos));
       void host.scrollHeight;
       await new Promise((r) => requestAnimationFrame(r));
-      const times = [];
+      // Timed as one batch: WebKit's clock has 1 ms resolution, too coarse for a single update.
+      const a = performance.now();
       for (let k = 0; k < 40; k++) {
         pos = Math.min(t.length, pos + 28);
-        const a = performance.now();
         md.update(t.slice(0, pos));
         void host.scrollHeight;
-        times.push(performance.now() - a);
       }
-      times.sort((x, y) => x - y);
-      out[lines] = { median: times[20], p95: times[38] };
+      out[lines] = { mean: (performance.now() - a) / 40 };
     }
     host.remove();
     StreamingMarkdown.chunkLines = saved;
@@ -167,7 +165,8 @@ const median = (a) => pct(a, 0.5);
 function fifths(times) {
   const n = times.length;
   const part = (i) => times.slice(Math.floor((n * i) / 5), Math.floor((n * (i + 1)) / 5));
-  const stat = (a) => ({ median: +median(a).toFixed(2), p95: +pct(a, 0.95).toFixed(2) });
+  // mean: robust to a coarse clock (WebKit rounds performance.now() to 1 ms); median and p95 as measured.
+  const stat = (a) => ({ mean: +(a.reduce((x, y) => x + y, 0) / Math.max(1, a.length)).toFixed(3), median: +median(a).toFixed(2), p95: +pct(a, 0.95).toFixed(2) });
   return { updates: n, first: stat(part(0)), middle: stat(part(2)), last: stat(part(4)), p95: +pct(times, 0.95).toFixed(2) };
 }
 
@@ -194,7 +193,7 @@ test('perf: a 2,000-line code block renders once and streams in O(delta) per fra
     assert.ok(lines >= 2000);
     // O(delta): the last updates (2,000 lines already on screen) cost about what the first ones did. A ceiling
     // stays as a backstop, generous enough for a slow or busy machine.
-    assert.ok(f.last.median <= f.first.median * 3 + 1, `updates grow with the block: first fifth ${f.first.median} ms, last fifth ${f.last.median} ms`);
+    assert.ok(f.last.mean <= f.first.mean * 3 + 0.5, `updates grow with the block: first fifth ${f.first.mean} ms, last fifth ${f.last.mean} ms per update`);
     assert.ok(f.p95 < 40, `streaming update p95 ${f.p95} ms`);
     assert.ok(open < 4000, `opening took ${open} ms`);
     await app.assertClean(assert);
@@ -211,8 +210,8 @@ test('perf: one streamed update costs the same whether the open code block has 2
     // The app's renderer (code in chunks of lines) and, for comparison, one text node for the whole block.
     const chunked = await costBySize(page, text, sizes, null);
     const single = await costBySize(page, text, sizes, 0);
-    const r = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, `${v.median.toFixed(2)} / ${v.p95.toFixed(2)} ms`]));
-    console.log('PERF update cost by block size (median / p95)', JSON.stringify({ chunked: r(chunked), singleTextNode: r(single) }));
+    const r = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, `${v.mean.toFixed(3)} ms`]));
+    console.log('PERF update cost by block size (mean of 40 updates)', JSON.stringify({ chunked: r(chunked), singleTextNode: r(single) }));
     // Whole streams of a 500- and a 2,000-line block, both strategies (first / middle / last fifth).
     const full = {};
     for (const n of [500, 2000]) {
@@ -223,9 +222,9 @@ test('perf: one streamed update costs the same whether the open code block has 2
       assert.equal(a.streamedHeight, b.streamedHeight, 'chunks render exactly like one block');
     }
     console.log('PERF streaming by fifths', JSON.stringify(full));
-    const small = chunked[250].median;
-    const large = chunked[4000].median;
-    assert.ok(large <= small * 3 + 1, `an update at 4,000 lines (${large.toFixed(2)} ms) costs much more than at 250 (${small.toFixed(2)} ms)`);
+    const small = chunked[250].mean;
+    const large = chunked[4000].mean;
+    assert.ok(large <= small * 3 + 0.5, `an update at 4,000 lines (${large.toFixed(3)} ms) costs much more than at 250 (${small.toFixed(3)} ms)`);
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });

@@ -390,6 +390,7 @@ window.addEventListener('focus', refreshOnReturn);
 // Any request answered "locked" / "not signed in" ends this page's session.
 api.onApiError((e) => { if (isLockError(e)) lockdown(e.code); });
 onLockdown(() => {
+  api.abortAll();
   stopIdleWatch();
   busCtl?.abort();
   clearTimeout(reconnectTimer);

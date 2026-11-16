@@ -231,10 +231,14 @@ export async function send(page, text, { wait = true } = {}) {
 }
 
 /** Wait until the current chat is not generating (send button is not a stop button) and the DOM settled. */
-export async function waitIdle(page, timeout = 20000) {
+export async function waitIdle(page, timeout = 30000) {
+  // Not generating, and the last turn shows its final render (rendering follows the stream frame by frame,
+  // which a busy machine delays).
   await page.waitForFunction(() => {
     const b = document.querySelector('.send-btn');
-    return b && !b.classList.contains('stop') && !document.querySelector('.turn-status .spinner');
+    const turns = document.querySelectorAll('.turn');
+    const last = turns[turns.length - 1];
+    return b && !b.classList.contains('stop') && !document.querySelector('.turn-status .spinner') && (!last || last.dataset.state !== 'live');
   }, null, { timeout });
   await page.waitForTimeout(150);
 }

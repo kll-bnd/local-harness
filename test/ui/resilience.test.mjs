@@ -33,7 +33,16 @@ test('errors: Ollama stopping mid-session gives a human message, and the typed t
     await page.locator('.composer-input').fill('are you still there?');
     await page.locator('.composer-input').press('Enter');
     const t = page.locator('.toast-error');
-    await t.waitFor();
+    await t.waitFor().catch(async (e) => {
+      // Say what the page showed instead (the CI log prints only the failure).
+      const seen = await page.evaluate(() => ({
+        toasts: [...document.querySelectorAll('.toast')].map((x) => `${x.className}: ${x.textContent}`),
+        last: document.querySelectorAll('.turn')[document.querySelectorAll('.turn').length - 1]?.textContent.slice(0, 400),
+        composer: document.querySelector('.composer-input')?.value,
+        sending: !!document.querySelector('.send-btn.stop'),
+      })).catch(() => null);
+      throw new Error(`${e.message}\npage: ${JSON.stringify(seen)}`);
+    });
     assert.match(await t.textContent(), /isn.t running|isn.t reachable|not running/i);
     // Nothing typed is lost: either it is back in the composer (failed before the stream started) or it is
     // in the transcript with an inline error and Retry (failed mid-stream).

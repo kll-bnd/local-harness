@@ -298,6 +298,10 @@ export class TurnView {
     this.sigs = s;
     this.renderUser(turn.user);
     this.renderAssistant(turn, isLast);
+    // What is on screen for this turn: still arriving, or final (tests and assistive tech can wait for it).
+    const streaming = !!live || turn.chain.some((m) => m.status === 'streaming');
+    this.el.dataset.state = streaming ? 'live' : 'done';
+    this.el.setAttribute('aria-busy', String(streaming));
   }
 
   renderUser(u) {

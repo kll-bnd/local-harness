@@ -71,6 +71,10 @@ test('memory: add, edit, pin, delete with undo', async () => {
     // edit inline
     await page.locator('.mem-row .mem-content').first().click();
     await page.locator('.mem-row.editing textarea').fill('I prefer metric units and 24-hour time.');
+    // A refresh of the page while typing (here: a settings change from elsewhere) keeps what was typed.
+    await stack.api('PATCH', '/api/settings', { memory: { extractDelayMs: 250 } });
+    await page.waitForTimeout(400);
+    assert.equal(await page.locator('.mem-row.editing textarea').inputValue(), 'I prefer metric units and 24-hour time.');
     await page.locator('.mem-row.editing textarea').press('Enter');
     await page.waitForFunction(() => /24-hour time/.test(document.querySelector('.mem-row .mem-content')?.textContent || ''));
     // pin

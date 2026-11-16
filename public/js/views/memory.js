@@ -132,27 +132,38 @@ export class MemoryView {
       m.useCount ? h('span', `used ${plural(m.useCount, 'time')}${m.lastUsedAt ? `, last ${fmtRelative(m.lastUsedAt)}` : ''}`) : h('span', 'not used yet'),
       src);
     if (editing) {
-      const ta = h('textarea.textarea', { value: m.content, rows: Math.max(2, Math.ceil(m.content.length / 80)), attrs: { 'aria-label': 'Memory' } });
-      const cat = h('select.select.input-small', { attrs: { 'aria-label': 'Category' } }, CATS.map((c) => h('option', { value: c, selected: c === m.category }, CAT_LABEL[c])));
+      // What the user typed survives a re-render (a list refresh can land while they type).
+      const prev = this.editDraft?.id === m.id ? this.editDraft : null;
+      const ta = h('textarea.textarea', { value: prev ? prev.content : m.content, rows: Math.max(2, Math.ceil(m.content.length / 80)), attrs: { 'aria-label': 'Memory' } });
+      const cat = h('select.select.input-small', { attrs: { 'aria-label': 'Category' } }, CATS.map((c) => h('option', { value: c, selected: c === (prev ? prev.category : m.category) }, CAT_LABEL[c])));
+      const keep = () => { this.editDraft = { id: m.id, content: ta.value, category: cat.value, focused: document.activeElement === ta, start: ta.selectionStart, end: ta.selectionEnd }; };
+      ta.addEventListener('input', keep);
+      ta.addEventListener('select', keep);
+      ta.addEventListener('keyup', keep);
+      cat.addEventListener('change', keep);
+      const stop = () => { this.editing = null; this.editDraft = null; };
       const save = async () => {
         const body = { content: ta.value.trim(), category: cat.value };
-        try { await api.memories.update(m.id, body); this.editing = null; this.load(); } catch (e) {
+        try { await api.memories.update(m.id, body); stop(); this.load(); } catch (e) {
           if (e.code === 'secret_detected' && await confirmDialog({ title: 'This looks like a password or API key', message: `${e.message}\n\nMemories are added to prompts in future chats and included in backups. Save it anyway?`, confirmLabel: 'Save anyway', danger: true })) {
-            try { await api.memories.update(m.id, { ...body, ...secretOverride(e) }); this.editing = null; this.load(); } catch (e2) { showError(e2, 'save the memory'); }
+            try { await api.memories.update(m.id, { ...body, ...secretOverride(e) }); stop(); this.load(); } catch (e2) { showError(e2, 'save the memory'); }
           } else if (e.code !== 'secret_detected') showError(e, 'save the memory');
         }
       };
-      ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); } if (e.key === 'Escape') { this.editing = null; this.render(); } });
-      focusWhenReady(ta);
-      return h('div.mem-row.editing', { dataset: { memoryId: m.id } }, h('div.grow.stack', ta, h('div.row', cat, h('span.spacer'), h('button.btn.btn-small', { type: 'button', on: { click: () => { this.editing = null; this.render(); } } }, 'Cancel'), h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: save } }, 'Save'))));
+      ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); } if (e.key === 'Escape') { stop(); this.render(); } });
+      if (prev?.focused) {
+        // Replacing the row must not move the caret or drop the focus.
+        queueMicrotask(() => { if (!ta.isConnected) return; ta.focus(); try { ta.setSelectionRange(prev.start, prev.end); } catch { /* ignore */ } });
+      } else focusWhenReady(ta);
+      return h('div.mem-row.editing', { dataset: { memoryId: m.id } }, h('div.grow.stack', ta, h('div.row', cat, h('span.spacer'), h('button.btn.btn-small', { type: 'button', on: { click: () => { stop(); this.render(); } } }, 'Cancel'), h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: save } }, 'Save'))));
     }
     return h(`div.mem-row${review ? '.review' : ''}`, { dataset: { memoryId: m.id } },
       h('button.icon-btn.small.pin-btn', { type: 'button', 'aria-pressed': String(!!m.pinned), title: m.pinned ? 'Unpin' : 'Pin — include in every chat', 'aria-label': m.pinned ? 'Unpin memory' : 'Pin memory', on: { click: () => this.update(m, { pinned: !m.pinned }) } }, icon(m.pinned ? 'pinFilled' : 'pin', { size: 14 })),
       h('div.grow',
-        h('div.mem-content', { tabIndex: 0, title: 'Click to edit', on: { click: () => { this.editing = m.id; this.render(); }, keydown: (e) => { if (e.key === 'Enter') { this.editing = m.id; this.render(); } } } }, m.content),
+        h('div.mem-content', { tabIndex: 0, title: 'Click to edit', on: { click: () => { this.editing = m.id; this.editDraft = null; this.render(); }, keydown: (e) => { if (e.key === 'Enter') { this.editing = m.id; this.editDraft = null; this.render(); } } } }, m.content),
         h('div.row-wrap', h(`span.badge.cat-${m.category}`, CAT_LABEL[m.category] || m.category), review ? h('span.badge.warn', 'unverified') : null, meta)),
       review ? h('button.btn.btn-small', { type: 'button', on: { click: () => this.update(m, reviewedPatch(m)) } }, icon('check', { size: 13 }), 'Keep') : null,
-      h('button.icon-btn.small', { type: 'button', title: 'Edit', 'aria-label': 'Edit memory', on: { click: () => { this.editing = m.id; this.render(); } } }, icon('pencil', { size: 14 })),
+      h('button.icon-btn.small', { type: 'button', title: 'Edit', 'aria-label': 'Edit memory', on: { click: () => { this.editing = m.id; this.editDraft = null; this.render(); } } }, icon('pencil', { size: 14 })),
       h('button.icon-btn.small', { type: 'button', title: 'Delete', 'aria-label': 'Delete memory', on: { click: () => this.remove(m) } }, icon('trash', { size: 14 })));
   }
 
