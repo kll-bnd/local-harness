@@ -1016,7 +1016,8 @@ No session needed (it contains no user data). Also embedded in `GET /api/system`
   "Security settings were changed outside Harness and were ignored" — with the fields and a dismiss button. Field
   names: `launch.json: encryption`, `launch.json: offlineLock`, `launch.json: offlineLockSuspendedUntil`, `vault.json:
   encrypted`, `vault.json: migration`, `vault.json: security record (an older copy)`, `vault.json: security record
-  (not sealed with this key)`, `vault.json: security record (removed)`, `vault.json: security record (damaged;
+  (not sealed with this key)`, `vault.json: security record (removed)`, `vault.json: security record (missing in vault.json, vault.json.bak
+  and vault-seq.json, although the folder holds encrypted data)`, `vault.json: security record (damaged;
   restored from vault.json.bak)`, `vault.json: a key wrap (damaged; restored from vault.json.bak)`, `vault.json: security record (says the data is not encrypted)`, and `vault-seq.json:
   <what is wrong> — an older vault.json cannot be told from the current one, …` when the counter file is not a
   readable file (then the most protective settings apply at every unlock until it is one again; logged once).
@@ -1073,7 +1074,9 @@ progress, `throttle`) and all of `launch.json` are hints that may only ever make
   current key never lowers protection), with its previous key from the record, its copy in `vault.json.bak`, or the
   previous-key wraps (below). The record is written at that unlock; every case but a genuine 0.2.0 key store
   (no record anywhere and nothing — `vault-seq.json`, `vault.json.bak`, a migration id — showing one existed) is
-  reported in `tamper`. Encrypted files under a record that says "not encrypted" are read the same way.
+  reported in `tamper`, and so is a key store with no record anywhere on a folder that already holds encrypted data
+  (the owner's recorded choices, if any, were reset to the protective defaults; a 0.2.0 key store with encrypted data
+  looks the same and gets that notice once, at its first unlock — its reading is unchanged). Encrypted files under a record that says "not encrypted" are read the same way.
 * **Key material is never lost.** While a re-key runs, the previous data key exists in the record (sealed under the
   new key) **and** in `wraps.previous` — wrapped under the password and under the new recovery key, removed in the
   same save that ends the conversion — so one damaged copy cannot cost the data still under it (a Keychain unlock

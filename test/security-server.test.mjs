@@ -633,6 +633,8 @@ describe('UI state and backups', () => {
 // Review 02, findings F1/F2: files that are not authenticated (launch.json, the plain fields of vault.json) may only
 // make Harness MORE protective. What lowers protection comes from the password in this process or from the security
 // record sealed under the data key (docs/API.md §10.2).
+const MISSING_RECORD = 'vault.json: security record (missing in vault.json, vault.json.bak and vault-seq.json, although the folder holds encrypted data)';
+
 describe('plain files cannot lower protection (review 01, 05, 06)', () => {
   const readJ = (dir, f) => JSON.parse(fss.readFileSync(path.join(dir, f), 'utf8'));
   const writeVault = (dir, v) => { for (const f of ['vault.json', 'vault.json.bak']) fss.writeFileSync(path.join(dir, f), JSON.stringify(v, null, 2)); };
@@ -887,7 +889,9 @@ describe('plain files cannot lower protection (review 01, 05, 06)', () => {
         s = await stack({ dataDir, fake, mode: 'launch' });
         assert.equal((await s.unlock()).status, 200);
         const st = await sec(s);
-        assert.deepEqual([st.migration, st.mode, st.tamper], [null, 'password', null]);
+        assert.deepEqual([st.migration, st.mode], [null, 'password']);
+        // a 0.2.0 key store with encrypted data looks like one whose record was wiped everywhere: told once
+        assert.deepEqual(st.tamper?.fields || null, legacy ? [MISSING_RECORD] : null);
         assert.ok((await s.call('GET', '/api/chats')).data.chats.some((x) => x.title === 'ENC-RESUME-MARKER'));
         await s.close({ keep: true });
         assert.deepEqual(grepDir(dataDir, 'ENC-RESUME-MARKER'), [], `encrypted again (${legacy ? '0.2.0 key store' : 'record'})`);
@@ -913,7 +917,7 @@ describe('plain files cannot lower protection (review 01, 05, 06)', () => {
       assert.equal((await sec(s)).state, 'locked');
       assert.equal((await s.unlock()).status, 200);
       const st = await sec(s);
-      assert.deepEqual([st.mode, st.offlineLock.enabled, st.migration, st.tamper], ['password', true, null, null]);
+      assert.deepEqual([st.mode, st.offlineLock.enabled, st.migration, st.tamper.fields], ['password', true, null, [MISSING_RECORD]]);
       assert.ok(readJ(dataDir, 'vault.json').state, 'recorded at the first unlock');
       assert.deepEqual([readJ(dataDir, 'launch.json').encryption, readJ(dataDir, 'launch.json').offlineLock], ['password', true]);
       assert.equal((await s.call('POST', '/api/security/lock', {})).status, 200);
@@ -1156,6 +1160,30 @@ describe('key material is never lost; without an intact record only the most pro
       await s.close({ keep: true });
       assert.deepEqual(grepDir(dataDir, 'STRIPPED-RECORD-NEW'), []);
       assert.ok(readJ(dataDir, 'vault.json').state, 'the record is written again');
+    } finally { await s.close(); }
+  });
+
+  test('the record wiped from every copy (and its counter) on a folder with encrypted data is reported; a fresh setup shows nothing (review 4)', async () => {
+    let s = await stack();
+    await s.setup();
+    const dataDir = s.dataDir;
+    try {
+      assert.equal((await sec(s)).tamper, null, 'a fresh setup: no notice');
+      await s.call('POST', '/api/memories', { content: 'WIPED-RECORD' });
+      assert.equal((await s.call('PUT', '/api/network', { enabled: false, password: PW })).status, 200);
+      await s.close({ keep: true });
+      s = await stack({ dataDir, mode: 'launch' });
+      await s.unlock();
+      assert.equal((await sec(s)).tamper, null, 'an ordinary restart: no notice');
+      await s.close({ keep: true });
+      for (const f of ['vault.json', 'vault.json.bak']) { const v = readJ(dataDir, f); delete v.state; writeJ(dataDir, f, v); }
+      fss.rmSync(path.join(dataDir, 'vault-seq.json'));
+      s = await stack({ dataDir, mode: 'launch' });
+      assert.equal((await s.unlock()).status, 200);
+      const st = await sec(s);
+      assert.equal(st.offlineLock.enabled, true, 'the owner\'s recorded choice is reset to the protective default…');
+      assert.ok(st.tamper?.fields.includes(MISSING_RECORD), `…and the owner is told: ${JSON.stringify(st.tamper)}`);
+      assert.ok(await hasMemory(s, 'WIPED-RECORD'));
     } finally { await s.close(); }
   });
 

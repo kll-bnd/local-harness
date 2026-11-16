@@ -525,6 +525,10 @@ export class Core extends EventEmitter {
       if (why[r.status]) fields.add(why[r.status]);
       rec = await this._protectiveReading(r, via);
     }
+    // No record anywhere and nothing that shows one existed, on a folder that already holds encrypted data: whatever
+    // the owner had recorded is now the protective default — say so. (A key store written before records existed
+    // looks the same, so it gets this notice once, at its first unlock; its reading is unchanged.)
+    if (r.status === 'missing' && (await hasEncryptedData(this.dataDir))) fields.add('vault.json: security record (missing in vault.json, vault.json.bak and vault-seq.json, although the folder holds encrypted data)');
     if (via === 'keychain' && rec.mode !== 'keychain') {
       // the key store has a keychain wrap, but the authenticated record does not say keychain: the password decides
       if (launch.encryption === 'keychain' || this.modeOverride === 'keychain') fields.add('launch.json: encryption');
