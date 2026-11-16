@@ -34,8 +34,6 @@ module.exports = function drive(ctx) {
     const origin = new URL(appUrl).origin;
 
     out.info.appUrl = appUrl;
-    out.info.attachedUrl = ctx.attachedUrl;
-    out.info.attachedVia = ctx.attachedVia;
     out.info.inProcessServer = !!ctx.server;
     out.info.version = app.getVersion();
     out.info.electron = process.versions.electron;
@@ -203,7 +201,7 @@ module.exports = function drive(ctx) {
       check('screen_lock_locks_backend', locked === true && after.status === 423, { locked, status: after.status });
       check('app_nap_released_when_locked', !ctx.activity?.active);
     } else {
-      out.info.lockOnSleep = 'not tested (no 0.2 security in this backend, or attached to another process)';
+      out.info.lockOnSleep = 'not tested (no 0.2 security in this backend)';
     }
   }
 

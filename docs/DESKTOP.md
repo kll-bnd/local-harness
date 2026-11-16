@@ -20,7 +20,7 @@ electron/
   lib/window-state.cjs  window size/position persistence
   lib/activity.cjs    App Nap guard
   lib/instance.cjs    "is Harness already running for this data dir?" (<data>/harness.lock + GET /api/health only)
-  lib/backend.cjs     start the in-process backend, or attach to the instance that owns the data dir
+  lib/backend.cjs     start the in-process backend, or refuse when another process holds the data dir
   lib/logfile.cjs     console → <data>/logs/harness.log
   test/               unit tests (npm test) and the end-to-end smoke test (npm run test:e2e)
 build/                icon.svg (source), icon.icns, icon.png (generated: npm run icons)
@@ -61,16 +61,31 @@ and Chromium's own storage (localStorage, caches) goes to its `Electron/` sub-fo
 duplicates `defaultDataDir()` because Electron needs the path synchronously before `ready`; a unit test
 keeps the two identical on macOS, Linux and Windows.
 
-Never two writers: the app takes Electron's single-instance lock for the data dir (a second launch just
-focuses the window). Before starting its own backend it looks for a Harness that serves **the same data
-dir** (e.g. started with `npm start` or `Harness.command`) through the backend's lock file
-`<data>/harness.lock` (it names the port, so an instance on a fallback port is found too) and `GET /api/health`
-on that port — both need no session and contain no user data; nothing else is probed (a Harness on a nearby
-port may serve another folder). If it finds one, the window uses that server and leaves it running on quit. If another
-launcher wins the race between that check and `startServer()`, the backend's own lock rejects with
-`err.code === 'HARNESS_ALREADY_RUNNING'` and `err.url`; the app then attaches to `err.url` in exactly the
-same way (waiting up to 10 s if the other instance has not published its URL yet). `Harness.command`
-does the same checks in reverse.
+Never two writers. A second launch of the app itself just focuses its window (Electron's single-instance
+lock). **The window only ever shows the backend this app started**, so when another process already holds the
+data folder the app does not load it, sends it nothing, and quits:
+
+1. It reads the backend's lock file `<data>/harness.lock`. A lock with `"transport": "bridge"` and a live pid is
+   **the native app's backend** (no address).
+2. Otherwise it asks the port the lock names `GET /api/health` (no session, no user data; nothing else is
+   probed, since a Harness on a nearby port may serve another folder). An answer as Harness is **a listener-mode
+   Harness** (`npm start`, `Harness.command`, the CLI).
+3. If neither, it calls `startServer()`. When another launcher won the race, the backend's own lock rejects with
+   `err.code === 'HARNESS_ALREADY_RUNNING'` (`err.pid`, `err.url`, `err.transport`) and the app treats it the same way.
+
+In each case it shows one native dialog, **Harness is already open**, with a single **Quit** button, and exits
+with code 0 (the texts are in `lib/backend.cjs`, `alreadyOpenMessage()`):
+
+| holder | dialog text |
+|---|---|
+| listener-mode Harness | Another Harness is using your data folder (process 4242, at http://127.0.0.1:8765). Use that one — or quit it and open this app again. |
+| the native app's backend | Harness is open in the Harness app (process 4242), which is using your data folder. Use that one — or quit it (⌘Q) and open this app again. |
+
+(`process <pid>` reads "another process" when the lock has no pid; ", at <url>" is left out while the other
+Harness has not published its address yet.) Nothing proves that whatever wrote the lock and answers `/api/health`
+is the genuine Harness (any program running as the user can do both), so the app neither shows it (where the
+owner would type the password) nor sends it the `api-token`, a launch code or a cookie.
+`Harness.command` (`scripts/launch.mjs`) is different: it opens the system browser at a running instance.
 
 ## Contract with the web UI
 
@@ -157,14 +172,13 @@ View with ⌥⌘J (⌥⌘I is the Inspector). File and Help also have "Show Data
   expiry**, so Chromium keeps it in memory only. In password mode that call throws while Harness is locked:
   the page then shows Harness's own lock or setup screen, and the unlock there sets the cookie. The app also
   strips `Max-Age`/`Expires` from the backend's `Set-Cookie: harness_session=…` (`webRequest.onHeadersReceived`),
-  so no session cookie lands in Chromium's on-disk cookie store. Attached to a backend in another process,
-  the app opens a one-time launch URL from `<data>/api-token` (keychain/off modes only) or lets the page's lock
-  screen do it.
+  so no session cookie lands in Chromium's on-disk cookie store. The app never reads `<data>/api-token` and
+  never talks to a backend in another process (see *One data directory*).
 * **Locking.** The 15th menu action, `lock` (⌃⌘L; Ctrl+Shift+L elsewhere), is sent to the page like the
   others; the UI calls `POST /api/security/lock`. When the Mac **sleeps** (`powerMonitor` `suspend`) or the
   **screen locks** (`lock-screen`, macOS/Windows), the app locks the in-process backend itself with
   `startServer().security.lock('app')` (no HTTP round trip; nothing happens when it is already locked, in state
-  `error` or in off mode) and tells the page (`lock`), which covers an attached backend too. The App Nap blocker is
+  `error` or in off mode) and tells the page (`lock`). The App Nap blocker is
   released once the backend is idle.
 * **The internet blocker** is the backend's (docs/API.md §10.6). The Electron app does not sandbox itself or
   its in-process backend (that would need a restart to allow downloads); the backend runs the Ollama it starts
@@ -179,12 +193,11 @@ View with ⌥⌘J (⌥⌘I is the Inspector). File and Help also have "Show Data
   when its `dataDir` names this folder. Nothing there authenticates the instance: any program running as the user
   can write `harness.lock` and answer `/api/health`. The command-line tools therefore send the password to a
   Harness they did not start only after it proves it holds the data key (`POST /api/security/prove`, checked
-  against a key unwrapped locally from `vault.json`), and never to a locked one. The Electron shell's
-  start-or-attach path still loads whatever the lock names into its window (in password mode the owner would type
-  the password into that page; in keychain/off mode the app sends the `api-token` to it). **Open item:** the shell cannot prove an instance in
-  password mode before the owner types the password; the safe change is to refuse to attach (a dialog naming the
-  other process: use it, or quit it) instead of loading it, and never to send the `api-token` to a discovered
-  instance. `Harness.command` (`scripts/launch.mjs`) opens the browser at a discovered instance the same way.
+  against a key unwrapped locally from `vault.json`), and never to a locked one. The Electron shell cannot prove
+  an instance in password mode before the owner types the password, so it never loads or contacts one beyond that
+  health check: it shows *Harness is already open* and quits (see *One data directory*). `Harness.command`
+  (`scripts/launch.mjs`) still opens the system browser at whatever URL the lock names (and in keychain/off mode
+  sends it the `api-token` for a launch code).
 
 ## Lifecycle and Mac niceties
 
@@ -254,7 +267,8 @@ Config: the `build` key in `package.json`. Highlights:
 ## Verification status
 
 **0.2: verified on Linux only** (Electron 44 under Xvfb, against the finished 0.2 backend). Unit tests for the 15-action menu
-contract, Lock Harness ⌃⌘L, instance detection by lock file + health, start-or-attach; `npm run test:e2e` adds
+contract, Lock Harness ⌃⌘L, instance detection by lock file + health, start-or-refuse (each holder, the race,
+the dialog texts, and a stand-in named by the lock receiving only `GET /api/health`); `npm run test:e2e` adds
 checks that run once the backend serves `/api/security`: setup with a throw-away password and a recovery key
 in the documented shape, the window's own session (`/api/auth/status` from the page), the session cookie
 being memory-only, data routes refused without a session, the `lock` menu action reaching the page, and an
@@ -269,7 +283,8 @@ run on a Mac:** all of the above, real sleep/screen-lock events, and the sandbox
 * `npm run test:e2e` passes **from source and against the packaged app binary**
   (`HARNESS_E2E_APP=…/Harness.app/Contents/MacOS/Harness`): window loads the server URL; preload contract
   with `desktop` and `desktop-mac`; menus Harness/File/Edit/View/Chat/Window/Help; ⌘⇧Space registered;
-  the `desktop-fullscreen` class; attaching to an already-running server; clean quit; the error paths.
+  the `desktop-fullscreen` class; clean quit; the error paths. (0.1 attached to an already-running server
+  here; that path is gone — see the 0.2 list above.)
 * The backend and desktop unit tests (`npm test`) pass on macOS for 0.2, and the server boots with no
   `node_modules`. An earlier 0.2 run there showed the suite reaching the real login Keychain; it now uses a
   stand-in and is refused the real one, and a separate opt-in check exercises a throw-away Keychain item.
@@ -278,10 +293,13 @@ run on a Mac:** all of the above, real sleep/screen-lock events, and the sandbox
 **Verified on Linux** (development box, Electron 44 under Xvfb), in addition: everything in `npm test`
 (data-dir parity with the backend, `desktop.json`, URL/navigation/window-open decisions, `showInFolder`
 containment incl. symlinks, badge sanitising, permission allow-list, menu template, context menu,
-window-state clamping, App Nap guard, instance detection and the start-or-attach race, the preload
+window-state clamping, App Nap guard, instance detection and the start-or-refuse race, the preload
 contract in a VM, packaging guards) and the full `npm run test:e2e` (also: IPC argument validation, remote
 requests cancelled, permissions denied, `ui.theme` → `nativeTheme`, the App Nap blocker held exactly during a
-fake-model generation, attaching via the backend's `HARNESS_ALREADY_RUNNING` lock error), from source and
+fake-model generation; another holder of the data folder — a recording stand-in named by the lock, a real
+server found only through the backend's `HARNESS_ALREADY_RUNNING`, a native-app lock — giving the dialog text,
+no window, exit code 0, the other server left running, and the stand-in receiving only `GET /api/health` with no
+`api-token`, launch code or cookie), from source and
 against the packaged Linux build; `bash -n` + `shellcheck` on `setup-macos.sh` and `Harness.command`, and
 the setup script's flow with stubbed macOS tools and a fake Ollama.
 

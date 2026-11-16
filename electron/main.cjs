@@ -18,8 +18,8 @@ const security = require('./lib/security.cjs');
 const menus = require('./lib/menu.cjs');
 const windowState = require('./lib/window-state.cjs');
 const { createActivityGuard, backendBusy, ACTIVITY_EVENTS } = require('./lib/activity.cjs');
-const { findRunningHarness, portRange } = require('./lib/instance.cjs');
-const { startOrAttach } = require('./lib/backend.cjs');
+const { findRunningHarness, findAppHarness } = require('./lib/instance.cjs');
+const { startOrRefuse, alreadyOpenMessage } = require('./lib/backend.cjs');
 const { teeConsoleToFile } = require('./lib/logfile.cjs');
 
 const isMac = process.platform === 'darwin';
@@ -67,8 +67,6 @@ const { config: desktop, warnings: configWarnings } = loadDesktopConfig(paths.de
 for (const w of configWarnings) console.warn(`[desktop] ${w}`);
 
 let server = null; // { url, port, close, app } when the backend runs in this process
-let attachedUrl = null; // URL of an already-running Harness for the same data dir (npm start / Harness.command)
-let attachedVia = null; // 'probe' | 'lock'
 let appUrl = null;
 let appOrigin = null;
 let win = null;
@@ -131,11 +129,9 @@ function applyTheme(settings) {
 
 // ------------------------------------------------------------------------------- sessions and locking
 /**
- * Give our own window an API session (docs/API.md §10.5) without a prompt when that is possible:
- *   in-process backend → startServer().auth.createSession() (throws while locked in password mode: the page then
- *   shows Harness's lock screen and the unlock there sets the cookie);
- *   a backend in another process (attached) → a one-time launch URL from the per-install api-token
- *   (keychain/off modes only; in password mode the page's lock screen does it).
+ * Give our own window an API session (docs/API.md §10.5) without a prompt when that is possible: the in-process
+ * backend's startServer().auth.createSession() (it throws while locked in password mode: the page then shows
+ * Harness's lock screen and the unlock there sets the cookie). The app never talks to a backend it did not start.
  * The cookie is set WITHOUT an expiry so Chromium keeps it in memory only, never in its on-disk cookie store.
  * @returns {Promise<string>} the URL to load
  */
@@ -146,24 +142,11 @@ async function windowSessionUrl() {
     try {
       await session.defaultSession.cookies.set({ url: appUrl, name: c.name, value: c.value, httpOnly: true, sameSite: 'strict', path: '/' });
     } catch (e) { console.warn(`[desktop] could not give the window a session: ${e.message}`); }
-    return appUrl;
-  }
-  if (attachedUrl) {
-    let token = null;
-    try { token = fs.readFileSync(path.join(dataDir, 'api-token'), 'utf8').trim(); } catch { return appUrl; }
-    try {
-      const res = await fetch(`${appUrl}/api/auth/launch-code`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(5000) });
-      const j = await res.json().catch(() => null);
-      if (res.ok && typeof j?.url === 'string' && security.isAppUrl(j.url, appOrigin)) return j.url;
-    } catch { /* fall back to the lock screen */ }
   }
   return appUrl;
 }
 
-/**
- * Lock Harness now (system sleep, screen lock). In-process: startServer().security.lock('app') (docs/API.md §10.5).
- * The page is told as well, so a backend in another process (attached) is locked through the page's own session.
- */
+/** Lock Harness now (system sleep, screen lock): startServer().security.lock('app') (docs/API.md §10.5); the page is told too. */
 async function lockHarness(reason) {
   notifyPage('lock');
   const sec = server?.security;
@@ -371,27 +354,34 @@ function registerGlobalShortcut() {
 }
 
 // ------------------------------------------------------------------------------------------- start-up
+/**
+ * Start the backend in this process, or — when another process holds the data folder — return who holds it.
+ * The window only ever shows the backend this app started: another holder is never loaded and never sent a
+ * credential (it could be any program that wrote harness.lock); the app explains and quits (alreadyOpen()).
+ * @returns {Promise<{ url: string } | { other: object }>}
+ */
 async function startBackend() {
-  // Never run two servers on one data dir: if one is already running (npm start / Harness.command), use it — it
-  // keeps running when Harness quits. The probe covers the normal case; the backend's own data-dir lock
-  // (HARNESS_ALREADY_RUNNING) covers a launcher that started between the probe and startServer().
-  const r = await startOrAttach({
+  const r = await startOrRefuse({
     dataDir,
     port: desktop.port,
-    ports: portRange(desktop.port || 4747),
     findRunning: findRunningHarness,
+    findApp: findAppHarness,
     startServer: async (opts) => (await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href)).startServer(opts),
-    // Test hook: skip the probe so the e2e test exercises the lock path.
+    // Test hook: skip the probe so the e2e test exercises the backend's own HARNESS_ALREADY_RUNNING path.
     probeFirst: !(E2E_SCRIPT && process.env.HARNESS_E2E_SKIP_PROBE === '1'),
   });
-  if (r.attached) {
-    attachedUrl = r.url;
-    attachedVia = r.via;
-    console.log(`[desktop] using the Harness server already running at ${r.url} (pid ${r.pid ?? '?'}, found via ${r.via})`);
-  } else {
-    server = r.server;
+  if (r.other) return { other: r.other };
+  server = r.server;
+  return { url: server.url };
+}
+
+/** Another process holds the data folder: one native dialog, then quit. */
+async function alreadyOpen(other) {
+  const { title, message } = alreadyOpenMessage(other);
+  console.log(`[desktop] ${title}: ${message}`);
+  if (!headless) {
+    await dialog.showMessageBox({ type: 'info', title, message: title, detail: message, buttons: ['Quit'], defaultId: 0, cancelId: 0 });
   }
-  return r.url;
 }
 
 async function reportStartupError(err) {
@@ -425,8 +415,9 @@ async function onReady() {
   }
   Menu.setApplicationMenu(Menu.buildFromTemplate(menus.buildAppMenuTemplate({ isMac, appName: 'Harness', send: sendToPage, showDataFolder, showLogFile })));
 
+  let started;
   try {
-    appUrl = await startBackend();
+    started = await startBackend();
   } catch (err) {
     await reportStartupError(err);
     shutdownDone = true;
@@ -434,34 +425,40 @@ async function onReady() {
     app.exit(1);
     return;
   }
+  if (started.other) {
+    await alreadyOpen(started.other);
+    shutdownDone = true;
+    logger?.close();
+    app.exit(0);
+    return;
+  }
+  appUrl = started.url;
   appOrigin = new URL(appUrl).origin;
   lockDownSession(session.defaultSession);
   registerIpc();
 
-  if (server) {
-    // 0.2: the backend's `app` (and its event bus) exists only while Harness is unlocked and is recreated on every
-    // unlock, so re-attach on each state change: startServer().security.on('state' | 'locked' | 'unlocked')
-    // (docs/API.md §10.5). With a 0.1 backend there are no such events and `app` is always there.
-    activity = createActivityGuard({ isBusy: () => backendBusy(server.app)(), blocker: powerSaveBlocker });
-    let bus = null;
-    const onEvent = (ev) => {
-      if (ACTIVITY_EVENTS.has(ev.type)) activity.update();
-      if (ev.type === 'settings.updated') applyTheme(ev.data?.settings);
-    };
-    const attachBus = () => {
-      const b = server.app?.bus;
-      if (!b || b === bus) return;
-      bus?.off?.('event', onEvent);
-      bus = b;
-      b.on('event', onEvent);
-      try { applyTheme(server.app.settings?.get?.()); } catch { /* settings not readable yet */ }
-    };
-    attachBus();
-    const events = server.security?.on ? server.security : null;
-    events?.on('unlocked', () => { attachBus(); activity.update(); });
-    events?.on('state', (st) => { if (st?.state === 'unlocked') attachBus(); activity.update(); });
-    events?.on('locked', () => { bus = null; activity.update(); });
-  }
+  // 0.2: the backend's `app` (and its event bus) exists only while Harness is unlocked and is recreated on every
+  // unlock, so re-attach on each state change: startServer().security.on('state' | 'locked' | 'unlocked')
+  // (docs/API.md §10.5). With a 0.1 backend there are no such events and `app` is always there.
+  activity = createActivityGuard({ isBusy: () => backendBusy(server.app)(), blocker: powerSaveBlocker });
+  let bus = null;
+  const onEvent = (ev) => {
+    if (ACTIVITY_EVENTS.has(ev.type)) activity.update();
+    if (ev.type === 'settings.updated') applyTheme(ev.data?.settings);
+  };
+  const attachBus = () => {
+    const b = server.app?.bus;
+    if (!b || b === bus) return;
+    bus?.off?.('event', onEvent);
+    bus = b;
+    b.on('event', onEvent);
+    try { applyTheme(server.app.settings?.get?.()); } catch { /* settings not readable yet */ }
+  };
+  attachBus();
+  const events = server.security?.on ? server.security : null;
+  events?.on('unlocked', () => { attachBus(); activity.update(); });
+  events?.on('state', (st) => { if (st?.state === 'unlocked') attachBus(); activity.update(); });
+  events?.on('locked', () => { bus = null; activity.update(); });
   nativeTheme.on('updated', () => { if (win && !win.isDestroyed()) win.setBackgroundColor(backgroundColor()); });
   // Lock when the Mac sleeps or its screen locks (Electron's powerMonitor; 'lock-screen' exists on macOS and Windows).
   powerMonitor.on('suspend', () => { lockHarness('system sleep'); });
@@ -472,7 +469,7 @@ async function onReady() {
 
   if (E2E_SCRIPT) {
     require(path.resolve(E2E_SCRIPT))({
-      app, hooks, dataDir, paths, desktop, appUrl, attachedUrl, attachedVia, lockHarness, windowSessionUrl, powerMonitor,
+      app, hooks, dataDir, paths, desktop, appUrl, lockHarness, windowSessionUrl, powerMonitor,
       get server() { return server; }, get window() { return win; }, get activity() { return activity; },
       get registeredShortcut() { return registeredShortcut; }, Menu,
     });

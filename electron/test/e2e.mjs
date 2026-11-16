@@ -8,6 +8,7 @@
 //   HARNESS_E2E_DIR=/some/tmp npm run test:e2e      # where to create the throw-away data dirs
 //   HARNESS_E2E_APP=dist/linux-unpacked/harness npm run test:e2e   # test a packaged build instead of `electron .`
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -113,42 +114,72 @@ const mkData = (name) => fs.mkdtempSync(path.join(base, `e2e-${name}-`));
   console.log(`info  ${S}: ${JSON.stringify(r.result?.info || {})}`);
 }
 
-// ------------------------------------------------------------- B. a CLI server already owns the data dir
-{
-  const S = 'attach';
-  const dataDir = mkData('attach');
-  const port = await freePort();
-  const cli = spawn(process.execPath, [path.join(root, 'server', 'index.mjs'), '--port', String(port), '--data-dir', dataDir], {
-    env: { ...process.env, HARNESS_NO_OLLAMA_AUTOSTART: '1', HARNESS_LOG_LEVEL: 'warn' }, stdio: 'ignore',
+// ------------------------------------- B. another process holds the data folder: dialog, nothing loaded, no credential
+// The window only ever shows the backend this app started. Whatever the lock names — here a stand-in that answers
+// /api/health like Harness and records every request — gets no more than that unauthenticated discovery.
+const standIn = async () => {
+  const got = [];
+  const srv = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      got.push({ method: req.method, url: req.url, raw, headers: { ...req.headers } });
+      res.setHeader('content-type', 'application/json');
+      if (req.url === '/api/health') return res.end(JSON.stringify({ ok: true, name: 'harness', version: '0.2.0', state: 'unlocked' }));
+      res.statusCode = 404;
+      return res.end('{}');
+    });
   });
-  for (let i = 0; i < 100 && !(await health(port)); i++) await sleep(100);
-  const r = await launch({ dataDir, port });
-  report(S, 'driver produced a result', !!r.result && !r.result.error, r.result?.error);
-  report(S, 'reuses the running server instead of starting a second one', r.result?.info?.attachedUrl === `http://127.0.0.1:${port}` && r.result?.info?.inProcessServer === false, r.result?.info);
-  for (const name of ['window_loads_server_url', 'preload_api_present', 'menu_action_reaches_page', 'external_navigation_blocked']) report(S, name, r.result?.checks?.[name]?.ok, r.result?.checks?.[name]);
-  report(S, 'exit code 0', r.code === 0, { code: r.code, signal: r.signal });
-  report(S, 'the CLI server keeps running after the app quits', await health(port));
-  cli.kill('SIGTERM');
-  await new Promise((res) => cli.once('exit', res));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return { got, port: srv.address().port, close: () => new Promise((r) => { srv.closeAllConnections?.(); srv.close(() => r()); }) };
+};
+const writeLock = (dataDir, info) => fs.writeFileSync(path.join(dataDir, 'harness.lock'), JSON.stringify({ startedAt: new Date().toISOString(), hostname: os.hostname(), dataDir: fs.realpathSync.native(dataDir), ...info }));
+const refused = (S, r, dataDir, text) => {
+  const out = r.stdout + r.stderr;
+  report(S, 'the dialog text names the other holder', out.includes(text), out.split('\n').filter((l) => /already open/.test(l)).join(' | ') || out.slice(-400));
+  report(S, 'no window was loaded (the e2e driver never ran) and no backend was started here', !r.result && !/listening on http/.test(out), { result: !!r.result });
+  report(S, 'clean quit (exit code 0)', r.code === 0, { code: r.code, signal: r.signal });
+};
+
+{
+  const S = 'other-listener';
+  const dataDir = mkData('other-listener');
+  const fake = await standIn();
+  writeLock(dataDir, { pid: process.pid, port: fake.port, url: `http://127.0.0.1:${fake.port}` });
+  fs.writeFileSync(path.join(dataDir, 'api-token'), 'a'.repeat(43) + '\n', { mode: 0o600 }); // must never be sent
+  const r = await launch({ dataDir, port: await freePort() });
+  refused(S, r, dataDir, `Another Harness is using your data folder (process ${process.pid}, at http://127.0.0.1:${fake.port}). Use that one — or quit it and open this app again.`);
+  const other = fake.got.filter((g) => !(g.method === 'GET' && g.url === '/api/health'));
+  const creds = fake.got.filter((g) => g.headers.authorization || g.headers.cookie || g.raw || /launch|auth|unlock/.test(g.url));
+  report(S, 'the stand-in received only GET /api/health: no credential, no launch code, no api-token', other.length === 0 && creds.length === 0, fake.got.map((g) => `${g.method} ${g.url}`));
+  await fake.close();
 }
 
-// ------------------------------------------- B2. same, but the probe is skipped: the backend's data-dir lock decides
+// ---------------------------------------------- B2. the probe is skipped: the backend's own HARNESS_ALREADY_RUNNING decides
 {
-  const S = 'attach-via-lock';
-  const dataDir = mkData('attach-lock');
+  const S = 'other-listener-race';
+  const dataDir = mkData('other-race');
   const port = await freePort();
   const cli = spawn(process.execPath, [path.join(root, 'server', 'index.mjs'), '--port', String(port), '--data-dir', dataDir], {
     env: { ...process.env, HARNESS_NO_OLLAMA_AUTOSTART: '1', HARNESS_LOG_LEVEL: 'warn' }, stdio: 'ignore',
   });
   for (let i = 0; i < 100 && !(await health(port)); i++) await sleep(100);
   const r = await launch({ dataDir, port: await freePort(), env: { HARNESS_E2E_SKIP_PROBE: '1' } });
-  report(S, 'driver produced a result', !!r.result && !r.result.error, r.result?.error);
-  report(S, 'HARNESS_ALREADY_RUNNING from startServer → attaches to err.url', r.result?.info?.attachedUrl === `http://127.0.0.1:${port}` && r.result?.info?.attachedVia === 'lock' && r.result?.info?.inProcessServer === false, r.result?.info);
-  report(S, 'window_loads_server_url', r.result?.checks?.window_loads_server_url?.ok, r.result?.checks?.window_loads_server_url);
-  report(S, 'exit code 0', r.code === 0, { code: r.code, signal: r.signal });
-  report(S, 'the CLI server keeps running after the app quits', await health(port));
+  refused(S, r, dataDir, `Another Harness is using your data folder (process ${cli.pid}, at http://127.0.0.1:${port}). Use that one — or quit it and open this app again.`);
+  report(S, 'the other Harness keeps running', await health(port));
   cli.kill('SIGTERM');
   await new Promise((res) => cli.once('exit', res));
+}
+
+// ------------------------------------------------------- B3. the native app's backend holds the folder (no address)
+{
+  const S = 'other-native-app';
+  const dataDir = mkData('other-app');
+  const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' });
+  writeLock(dataDir, { pid: holder.pid, transport: 'bridge' });
+  const r = await launch({ dataDir, port: await freePort() });
+  refused(S, r, dataDir, `Harness is open in the Harness app (process ${holder.pid}), which is using your data folder. Use that one — or quit it (⌘Q) and open this app again.`);
+  holder.kill('SIGTERM');
 }
 
 // ------------------------------------------------------------------------------ C. server cannot start
