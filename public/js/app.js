@@ -18,7 +18,8 @@ import { openShortcuts } from './views/shortcuts.js';
 const desktop = window.harnessDesktop || null;
 const root = document.getElementById('app');
 const shell = new Shell(root);
-window.__harnessShell = shell; // handy for debugging in DevTools
+// Debug/test hook only when explicitly enabled (localStorage 'harness.debug' = '1'); never exposed by default.
+try { if (localStorage.getItem('harness.debug') === '1') window.__harnessShell = shell; } catch { /* storage blocked */ }
 
 // ------------------------------------------------------------------------------------------------ actions
 const currentChat = () => shell.chatView.model;

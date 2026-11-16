@@ -2,7 +2,7 @@
 // progress/cancel, pull by name, the recommended list for this machine, and embedding models.
 import { h, mount, add, copyText } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
-import { fmtBytes, fmtTokens, modelLabel, modelShort, fmtUntil, fmtWhen, plural } from '../lib/format.js';
+import { fmtBytes, fmtTokens, modelLabel, modelShort, fmtUntil, fmtWhen, plural, residentOf } from '../lib/format.js';
 import { store, loadModels, loadSystem, loadRecommended, patchSettings, sameRef, dropModelInfo } from '../state.js';
 import * as api from '../api.js';
 import { pullModel, pullFor, activePulls, cancelPull } from './pulls.js';
@@ -45,11 +45,11 @@ export class ModelsView {
     const canPull = providers.some((p) => p.capabilities?.pull && p.status === 'running');
 
     const loadedSec = h('section.panel-section',
-      h('div.section-head', h('h2.h2', 'In memory now'), sys?.machine ? h('span.muted.small.num', `${fmtBytes(loaded.reduce((n, m) => n + (m.vramBytes || m.sizeBytes || 0), 0))} of ${fmtBytes(sys.machine.memoryBudget.budgetBytes)} model budget`) : null),
+      h('div.section-head', h('h2.h2', 'In memory now'), sys?.machine ? h('span.muted.small.num', `${fmtBytes(loaded.reduce((n, m) => n + (residentOf(m) || 0), 0))} of ${fmtBytes(sys.machine.memoryBudget.budgetBytes)} model budget`) : null),
       sys?.modelState?.unloadedForImage ? h('div.callout.warn', icon('info'), h('div', h('b', 'The chat model was unloaded to generate an image. '), 'It reloads automatically with your next message.')) : null,
       loaded.length ? h('div.list', loaded.map((m) => h('div.list-row',
         h('span.dot.ok'),
-        h('div.grow', h('div', h('b', modelLabel(m.model)), h('span.faint', ` · ${m.providerId}`)), h('div.small.muted.num', [fmtBytes(m.vramBytes || m.sizeBytes), m.contextLength ? `${fmtTokens(m.contextLength)} context` : null, m.expiresAt ? `loaded ${fmtUntil(m.expiresAt)}` : null].filter(Boolean).join(' · '))),
+        h('div.grow', h('div', h('b', modelLabel(m.model)), h('span.faint', ` · ${m.providerId}`)), h('div.small.muted.num', [`${fmtBytes(residentOf(m))} in memory${m.residentBasis === 'measured' ? ' (measured)' : ''}`, m.contextLength ? `${fmtTokens(m.contextLength)} context` : null, m.expiresAt ? `loaded ${fmtUntil(m.expiresAt)}` : null].filter(Boolean).join(' · '))),
         h('button.btn.btn-small', { type: 'button', disabled: this.busy.has(`unload:${m.model}`), on: { click: () => this.unload(m) } }, icon('eject', { size: 13 }), 'Unload'))))
         : h('p.muted', 'No model is loaded. The chat model loads with your next message (the first reply takes a little longer).'));
 

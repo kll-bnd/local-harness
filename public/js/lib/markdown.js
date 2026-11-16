@@ -92,7 +92,11 @@ function toFragment(html) {
   return tpl.content;
 }
 
-const MAX_HIGHLIGHT_CHARS = 120_000;
+const MAX_HIGHLIGHT_CHARS = 300_000;
+const DEFER_HIGHLIGHT_CHARS = 20_000; // bigger blocks show plain first and are highlighted when the page is idle
+
+// requestIdleCallback is missing in Safari/WebKit: fall back to a short timeout.
+const whenIdle = (fn) => (typeof requestIdleCallback === 'function' ? requestIdleCallback(fn, { timeout: 1500 }) : setTimeout(fn, 60));
 
 function highlightCode(codeEl) {
   const m = /language-([\w+#.-]+)/.exec(codeEl.className || '');
@@ -125,7 +129,8 @@ export function codeBlockShell(pre, lang, { streaming = false } = {}) {
 
 function enhance(frag, { highlight = true } = {}) {
   for (const code of frag.querySelectorAll('pre > code')) {
-    const lang = highlight ? highlightCode(code) : (/language-([\w+#.-]+)/.exec(code.className || '')?.[1] || '');
+    const lang = /language-([\w+#.-]+)/.exec(code.className || '')?.[1]?.toLowerCase() || '';
+    if (highlight && code.textContent.length <= DEFER_HIGHLIGHT_CHARS) highlightCode(code);
     codeBlockShell(code.parentElement, lang);
   }
   for (const img of frag.querySelectorAll('img[data-blocked-src]')) {
@@ -151,6 +156,14 @@ function enhance(frag, { highlight = true } = {}) {
 const cache = new Map();
 const CACHE_MAX = 400;
 
+/** Big code blocks are highlighted after first paint, when the page is idle, if still on screen by then. */
+function deferHighlights(frag) {
+  for (const code of frag.querySelectorAll('.code-block code:not(.hljs)')) {
+    if (code.textContent.length > DEFER_HIGHLIGHT_CHARS) whenIdle(() => { if (code.isConnected && !code.classList.contains('hljs')) highlightCode(code); });
+  }
+  return frag;
+}
+
 /** Render complete markdown to a DocumentFragment. */
 export function renderMarkdown(text, { cacheKey = null } = {}) {
   text = String(text ?? '');
@@ -159,7 +172,7 @@ export function renderMarkdown(text, { cacheKey = null } = {}) {
     if (hit && hit.text === text) {
       cache.delete(cacheKey);
       cache.set(cacheKey, hit);
-      return hit.tpl.content.cloneNode(true);
+      return deferHighlights(hit.tpl.content.cloneNode(true));
     }
   }
   let html;
@@ -171,7 +184,7 @@ export function renderMarkdown(text, { cacheKey = null } = {}) {
     cache.set(cacheKey, { text, tpl });
     if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
   }
-  return frag;
+  return deferHighlights(frag);
 }
 
 export function escapeHtml(s) {

@@ -491,8 +491,10 @@ async function run(model, kind, starter) {
     try {
       result = await starter((ev) => handleEvent(model, ev), controller.signal);
     } catch (e) {
-      // Our previous turn may still be finalizing on the server for a few ms: retry once.
-      if (e.code !== 'chat_busy' || !model.lastFinishedAt || Date.now() - model.lastFinishedAt > 3000) throw e;
+      // Safety net: the server answers 409 chat_busy as JSON *before* starting anything, so retrying once
+      // right after our own previous turn cannot send the message twice. (The server now releases the chat
+      // before `done`, so this should not trigger any more.)
+      if (e.code !== 'chat_busy' || e.status !== 409 || !model.lastFinishedAt || Date.now() - model.lastFinishedAt > 3000) throw e;
       await new Promise((r) => setTimeout(r, 400));
       result = await starter((ev) => handleEvent(model, ev), controller.signal);
     }

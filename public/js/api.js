@@ -167,7 +167,7 @@ export const chats = {
   create: (body = {}) => post('/api/chats', body),
   get: (id) => get(`/api/chats/${enc(id)}`),
   update: (id, body) => patch(`/api/chats/${enc(id)}`, body),
-  remove: (id) => del(`/api/chats/${enc(id)}`),
+  remove: (id, { deleteMemories } = {}) => del(`/api/chats/${enc(id)}${qs({ deleteMemories: deleteMemories ? 'true' : undefined })}`),
   removeUrl: (id) => `/api/chats/${enc(id)}`,
   title: (id) => post(`/api/chats/${enc(id)}/title`),
   fork: (id, messageId) => post(`/api/chats/${enc(id)}/fork`, messageId ? { messageId } : {}),

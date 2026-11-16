@@ -14,6 +14,7 @@
     "test": "node --test --test-concurrency=4 \"test/*.test.mjs\" \"electron/test/*.test.mjs\"",
     "dev:fake": "node scripts/dev-fake.mjs",
     "doctor": "node scripts/doctor.mjs",
+    "get-model": "node scripts/get-model.mjs",
     "app": "electron .",
     "dist": "electron-builder --mac --arm64",
     "dist:app": "electron-builder --mac dir --arm64",

@@ -156,6 +156,9 @@ export function modelShort(id, max = 30) {
   return tag ? `${n} · ${tag}` : n;
 }
 
+/** Memory a loaded model really occupies (docs §5.1: Ollama's ps size excludes the weights). */
+export function residentOf(m) { return m?.residentBytes ?? m?.vramBytes ?? m?.sizeBytes ?? null; }
+
 export function truncate(s, n) {
   s = String(s ?? '');
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;

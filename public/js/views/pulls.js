@@ -43,6 +43,7 @@ export async function pullModel({ model, providerId, quiet = false }) {
   try {
     const r = await api.models.pull({ model, providerId }, (ev) => {
       if (ev.type === 'start') {
+        if (ev.warning?.message) toast({ kind: 'warn', message: 'This download is not recommended', detail: ev.warning.message, id: `pullwarn-${model}`, timeout: 12000 });
         dropPull(key);
         key = ev.pullId;
         local.get(model).key = key;

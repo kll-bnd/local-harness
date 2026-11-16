@@ -37,6 +37,7 @@ function fieldsFor(section) {
       { path: 'defaultPresetId', label: 'Default preset', type: 'preset' },
       { path: 'titles.auto', label: 'Name chats automatically', help: 'After the first reply the chat model suggests a short title.', type: 'switch' },
       { path: 'titles.model', label: 'Model for titles', adv: true, ...modelOpt('Same as the chat') },
+      { path: 'security.allowedOrigins', label: 'Other web pages allowed to use Harness', type: 'tags', empty: [], adv: true, placeholder: 'e.g. http://localhost:5173', help: 'Only for development tools on another local port. The Harness window itself is always allowed.' },
     ];
     case 'model': return [
       { path: 'reasoning.think', label: 'Thinking by default', help: 'For models that can reason before answering: slower first token, often better answers. Each chat can switch it from the composer.', type: 'segmented', options: THINK },
@@ -134,6 +135,8 @@ function fieldsFor(section) {
       { label: 'When Harness starts Ollama', type: 'heading', help: 'Used only when Harness launches `ollama serve` itself.' },
       { path: 'ollama.autoStart', label: 'Start Ollama with Harness', type: 'switch' },
       { path: 'ollama.stopOnExit', label: 'Stop it when Harness quits', type: 'switch' },
+      { path: 'ollama.noCloud', label: 'Turn off Ollama cloud features', type: 'switch', adv: true, help: 'Keeps everything on this computer (OLLAMA_NO_CLOUD).' },
+      { path: 'ollama.promptCacheMiB', label: 'Prompt cache limit', type: 'number', min: 0, max: 65536, step: 64, auto: true, nullable: true, unit: 'MiB', adv: true, help: 'Caps the RAM Ollama keeps for reusing long prompts. Auto: 512 MiB on 8 GB machines.' },
       { path: 'ollama.flashAttention', label: 'Flash attention', type: 'switch', adv: true },
       { path: 'ollama.kvCacheType', label: 'KV cache type', type: 'select', options: [['f16', 'f16'], ['q8_0', 'q8_0 (half the memory)'], ['q4_0', 'q4_0']], adv: true },
       { path: 'ollama.numParallel', label: 'Parallel requests', type: 'number', min: 1, max: 16, step: 1, adv: true },
@@ -289,8 +292,8 @@ export class SettingsView {
         return ta;
       }
       case 'tags': {
-        const input = h('input.input', { id, type: 'text', value: (v || []).join(', '), placeholder: 'e.g. <|end|>, ###' });
-        input.addEventListener('change', () => { const list = input.value.split(',').map((x) => x.trim()).filter(Boolean); this.save(f, list.length ? list : null); });
+        const input = h('input.input', { id, type: 'text', value: (v || []).join(', '), placeholder: f.placeholder || 'e.g. <|end|>, ###' });
+        input.addEventListener('change', () => { const list = input.value.split(',').map((x) => x.trim()).filter(Boolean); this.save(f, list.length ? list : (f.empty ?? null)); });
         return input;
       }
       case 'json': {
@@ -383,6 +386,7 @@ export class SettingsView {
       p.id === 'ollama' && p.status !== 'running' && ollama?.installed ? h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: () => runAction('start-ollama') } }, 'Start') : null,
       p.id === 'ollama' && ollama?.managed ? h('button.btn.btn-small', { type: 'button', on: { click: async () => { try { await api.providers.stopOllama(); await loadSystem({ refresh: true }); } catch (e) { showError(e, 'stop Ollama'); } } } }, 'Stop') : null,
       p.builtin && p.id !== 'ollama' ? h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => this.updateProvider(p.id, { enabled: false }) } }, 'Disable') : null,
+      !p.builtin ? h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => this.editServer(p, 'chat') } }, 'Edit…') : null,
       !p.builtin ? h('button.icon-btn.small', { type: 'button', title: 'Remove', 'aria-label': `Remove ${p.name}`, on: { click: () => this.removeProvider(p) } }, icon('trash', { size: 14 })) : null));
     const disabled = [...['llamacpp', 'lmstudio'].filter((id) => s.providers?.builtin?.[id]?.enabled === false).map((id) => ({ id, name: id === 'llamacpp' ? 'llama.cpp / MLX (8080)' : 'LM Studio (1234)', builtin: true })), ...custom.filter((c) => c.enabled === false)];
     return h('div.form-block',
@@ -437,12 +441,38 @@ export class SettingsView {
     const rows = provs.map((p) => h('div.list-row.provider-row',
       h(`span.dot${p.status === 'running' ? '.ok' : '.err'}`),
       h('div.grow', h('div', h('b', p.name), p.currentModel ? h('span.faint', ` · ${p.currentModel}`) : null), h('div.faint.small.mono', p.baseUrl), p.error ? h('div.field-error', p.error) : null),
+      !p.builtin ? h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => this.editServer(p, 'image') } }, 'Edit…') : null,
       !p.builtin ? h('button.icon-btn.small', { type: 'button', 'aria-label': `Remove ${p.name}`, on: { click: async () => { if (await confirmDialog({ title: `Remove ${p.name}?`, confirmLabel: 'Remove', danger: true })) { try { await api.images.removeProvider(p.id); await Promise.all([loadSettings(), loadSystem({ refresh: true })]); } catch (e) { showError(e, 'remove the image backend'); } } } } }, icon('trash', { size: 14 })) : null));
     const unreachable = custom.filter((c) => !provs.some((p) => p.id === c.id));
     return h('div.form-block',
       h('div.row', h('h3.h3.grow', 'Image backends'), h('button.btn.btn-small', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Re-check'), h('button.btn.btn-small', { type: 'button', on: { click: () => this.addImageProvider() } }, icon('plus', { size: 13 }), 'Add backend…')),
       h('div.list.card-list', rows.length ? rows : h('div.callout', icon('info'), h('div', h('b', 'No image backend running. '), 'In Draw Things, open Settings → API Server, turn on the HTTP server (port 7860), then click Re-check. ComfyUI (port 8188) and A1111/Forge (--api) are detected too.'))),
       unreachable.length ? h('div.faint.small', `Configured but not reachable: ${unreachable.map((c) => c.name).join(', ')}`) : null);
+  }
+
+  /** Rename / re-point an existing custom chat or image server (and optionally replace its key). */
+  editServer(p, kind) {
+    const name = h('input.input', { value: p.name, attrs: { 'aria-label': 'Name' } });
+    const url = h('input.input', { value: p.baseUrl, attrs: { 'aria-label': 'Address' } });
+    const key = h('input.input', { type: 'password', placeholder: 'Unchanged', attrs: { 'aria-label': 'API key', autocomplete: 'off' } });
+    const result = h('div.small');
+    openDialog({
+      title: `Edit ${p.name}`,
+      body: h('div.form.compact', h('label.field-label', 'Name'), name, h('label.field-label', 'Address'), url, h('label.field-label', 'API key'), key, result),
+      actions: [{ label: 'Cancel' }, { label: 'Save & test', kind: 'primary', run: async () => {
+        const body = { name: name.value.trim() || p.name, baseUrl: url.value.trim() || p.baseUrl };
+        if (key.value) body.apiKey = key.value;
+        try {
+          const r = kind === 'image' ? await api.images.updateProvider(p.id, body) : await api.providers.update(p.id, body);
+          await Promise.all([loadSettings(), loadSystem({ refresh: true }), kind === 'chat' ? loadModels({ refresh: true }) : null]);
+          const now = (r.providers || []).find((x) => x.id === p.id);
+          if (now && now.status !== 'running') { result.replaceChildren(h('span.field-error', `Saved, but not reachable: ${now.error || 'no response'}`)); return false; }
+          toast({ kind: 'success', message: `${body.name} saved` });
+          return true;
+        } catch (e) { result.replaceChildren(h('span.field-error', e.message)); return false; }
+      } }],
+    });
+    name.focus();
   }
 
   addImageProvider() {

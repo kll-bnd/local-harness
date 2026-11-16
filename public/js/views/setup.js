@@ -143,17 +143,18 @@ export function recCard(r, machine) {
       isDefault ? h('span.badge.outline', 'default') : null,
     ];
     let action = null;
-    if (guided) action = null; // the flow below carries the actions
+    if (v.notForThisMachine) action = h('span.faint.small.nowrap', 'Needs more RAM');
+    else if (guided) action = null; // the flow below carries the actions
     else if (p && !p.done) action = pullProgress(p);
     else if (originalInstalled) action = !isDefault ? h('button.btn.btn-small', { type: 'button', on: { click: async () => { try { await patchSettings({ defaultModel: { providerId: v.providerId || 'ollama', model: v.model } }); await loadModels(); toast({ kind: 'success', message: `Default model: ${modelShort(v.model, 40)}` }); } catch (e) { showError(e, 'set the default model'); } } } }, 'Make default') : null;
     else action = h(`button.btn.btn-small${v.model === r.suggestedVariant ? '.btn-primary' : ''}`, { type: 'button', on: { click: () => pullModel({ model: v.model }) } }, icon('download', { size: 13 }), 'Download');
-    return h(`div.variant${v.model === r.suggestedVariant ? '.suggested' : ''}${guided ? '.guided' : ''}`, { dataset: { variant: v.model } },
+    return h(`div.variant${v.model === r.suggestedVariant ? '.suggested' : ''}${guided ? '.guided' : ''}${v.notForThisMachine ? '.not-here' : ''}`, { dataset: { variant: v.model } },
       h('div.grow',
         h('div.row-wrap', h('b', v.label), ...badges),
         h('div.faint.small.mono.ellipsis', { title: v.model }, v.model),
         h('div.small.muted', `${fmtBytes(v.approxSizeBytes)} download${t?.recommended ? ` · ${fmtBytes(t.approxSizeBytes)} as a text-only copy` : ''} · ${fmtTokens(v.estimate.numCtx)} context here`),
         h('div.small.variant-expl', v.estimate.explanation),
-        guided && (v.estimate.fits || v.model === r.suggestedVariant || originalInstalled || t.installed) ? textOnlyFlow(v) : null,
+        guided && !v.notForThisMachine && (v.estimate.fits || v.model === r.suggestedVariant || originalInstalled || t.installed) ? textOnlyFlow(v) : null,
         guided && !(v.estimate.fits || v.model === r.suggestedVariant || originalInstalled || t.installed) ? h('div.faint.small', 'Not usable on this Mac, even as a text-only copy.') : null),
       action);
   };

@@ -191,6 +191,9 @@ class StepView {
       else if (c) this.md.finish(c);
       else mount(this.proseEl);
       this.proseEl.hidden = !c;
+      // Text Harness wrote because the model's final answer was empty (docs §3.2): a quiet caption.
+      this.proseEl.classList.toggle('fallback', !!msg.fallback);
+      this.proseEl.title = msg.fallback ? 'The model added no text; Harness wrote this line.' : '';
     }
     // tool calls (in call order)
     const calls = msg.toolCalls || [];
@@ -418,7 +421,7 @@ export class TurnView {
     if (comp2) statBits.push(`${fmtInt(comp2)} tokens`);
     if (dur) statBits.push(fmtMs(dur));
     const tip = stats ? [
-      stats.promptTokens != null ? `Prompt: ${fmtInt(stats.promptTokens)} tokens` : null,
+      stats.promptTokens != null ? `Prompt: ${fmtInt(stats.promptTokens)} tokens${(last.usage?.cachedPromptTokens ?? live?.cachedPromptTokens) ? ` (${fmtInt(last.usage?.cachedPromptTokens ?? live?.cachedPromptTokens)} reused from cache)` : ''}` : null,
       stats.completionTokens != null ? `Reply: ${fmtInt(stats.completionTokens)} tokens` : null,
       stats.loadMs ? `Model load: ${fmtMs(stats.loadMs)}` : null,
       stats.iterations > 1 ? `${stats.iterations} model calls` : null,

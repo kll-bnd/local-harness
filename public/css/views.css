@@ -226,3 +226,4 @@ html.ready .boot-splash { display: none; }
 .model-id { max-width: 360px; }
 .models-table td.num, .models-table th { white-space: nowrap; }
 .models-table .caps { flex-wrap: wrap; max-width: 170px; }
+.variant.not-here { opacity: 0.6; }

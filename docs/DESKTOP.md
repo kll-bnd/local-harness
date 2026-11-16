@@ -15,11 +15,12 @@ electron/
   lib/menu.cjs        application, Dock and context menu templates
   lib/window-state.cjs  window size/position persistence
   lib/activity.cjs    App Nap guard
-  lib/instance.cjs    "is Harness already running for this data dir?"
+  lib/instance.cjs    "is Harness already running for this data dir?" (reads <data>/harness.lock, then probes ports)
+  lib/backend.cjs     start the in-process backend, or attach to the instance that owns the data dir
   lib/logfile.cjs     console → <data>/logs/harness.log
   test/               unit tests (npm test) and the end-to-end smoke test (npm run test:e2e)
 build/                icon.svg (source), icon.icns, icon.png (generated: npm run icons)
-scripts/              setup-macos.sh, doctor.mjs, launch.mjs (Harness.command), make-icons.mjs
+scripts/              setup-macos.sh, doctor.mjs, get-model.mjs, launch.mjs (Harness.command), make-icons.mjs
 ```
 
 Electron and electron-builder are **devDependencies**. The backend has no runtime dependencies, so
@@ -57,9 +58,14 @@ duplicates `defaultDataDir()` because Electron needs the path synchronously befo
 keeps the two identical on macOS, Linux and Windows.
 
 Never two writers: the app takes Electron's single-instance lock for the data dir (a second launch just
-focuses the window), and before starting its own backend it probes ports 4747–4757 for a Harness that
-serves **the same data dir** (e.g. started with `npm start` or `Harness.command`). If it finds one, the
-window uses that server and leaves it running on quit. `Harness.command` does the same check in reverse.
+focuses the window). Before starting its own backend it looks for a Harness that serves **the same data
+dir** (e.g. started with `npm start` or `Harness.command`): first via the backend's lock file
+`<data>/harness.lock` (it names the URL, so an instance on a fallback port is found too), then by probing
+ports 4747–4757. If it finds one, the window uses that server and leaves it running on quit. If another
+launcher wins the race between that check and `startServer()`, the backend's own lock rejects with
+`err.code === 'HARNESS_ALREADY_RUNNING'` and `err.url`; the app then attaches to `err.url` in exactly the
+same way (waiting up to 10 s if the other instance has not published its URL yet). `Harness.command`
+does the same checks in reverse.
 
 ## Contract with the web UI
 
@@ -155,6 +161,10 @@ View with ⌥⌘J (⌥⌘I is the Inspector). File and Help also have "Show Data
   Harness itself started (`settings.ollama.stopOnExit`).
 * **Startup errors**: if the data folder is unusable or the server fails to start, a dialog explains the
   error and offers "Show Log File"; the app then exits with status 1.
+* **Ollama**: the in-process backend starts Ollama itself when it is installed and not running, which is
+  what applies Harness's memory protections (flash attention, q8_0 KV cache, one loaded model, capped
+  prompt cache, `OLLAMA_NO_CLOUD=1`); `close()` on quit stops it again. An Ollama started elsewhere (the
+  menu-bar app, `brew services`) is used as is — `npm run doctor` reports which case applies.
 * **Renderer crash**: a dialog offers to reload the window (the data lives in the backend).
 * **Logs**: the backend's console output is copied to `<data>/logs/harness.log` (rotated to
   `harness.log.1` at 5 MB). Help → Show Log File.
@@ -184,6 +194,11 @@ Config: the `build` key in `package.json`. Highlights:
   yourself: System Settings → Privacy & Security → "Open Anyway", or `xattr -dr com.apple.quarantine
   /Applications/Harness.app`. Each build has a new ad-hoc identity; Harness asks for no macOS privacy
   permissions, so that does not cause prompts.
+* **Prebuilt `.dmg`**: the "macOS verification" workflow (`.github/workflows/macos.yml`) uploads the `.dmg` it
+  builds as the `Harness-mac-arm64` artifact (Actions tab → a run → Artifacts; kept 7 days). A downloaded copy
+  is quarantined, so the Gatekeeper paragraph above applies: building locally is the supported route; to use
+  the download anyway, copy the app to /Applications and run `xattr -dr com.apple.quarantine
+  /Applications/Harness.app`.
 * **Icon**: `build/icon.svg` is the source. `npm run icons` runs electron-builder's own icon tool
   (`icons@1.2.3` toolset, `app-builder-lib/out/toolsets/icons.js` → `icon-tool.js`, resvg + libvips WASM)
   to write `build/icon.icns` (entries ic04/ic05 ARGB 16/32 px; ic07–ic14 PNG 32–1024 px) and copies the
@@ -196,31 +211,32 @@ Config: the `build` key in `package.json`. Highlights:
 
 ## Verification status
 
-Developed on Linux (no Mac available). **Verified there:**
+**Verified on a real Mac in CI** (`.github/workflows/macos.yml`, GitHub's Apple Silicon runner: "Apple M1
+(Virtual)", 7 GB RAM, macOS 26):
 
-* `npm test` — unit tests for everything that does not need a display: data-dir parity with the
-  backend, `desktop.json` validation, URL/navigation/window-open decisions, `showInFolder` path
-  containment (incl. symlinks), badge sanitising, permission allow-list, menu template (every action
-  exactly once, no duplicate/clobbered accelerators, standard roles present), context menu, window-state
-  clamping, App Nap guard, running-instance detection, the preload contract (in a VM), and packaging
-  guards (no runtime deps; allow-listed files; ad-hoc identity).
-* `npm run test:e2e` — the real Electron 44 app under Xvfb: window loads the server URL; preload
-  classes and `harnessDesktop` present; no Node in the page; a native menu click reaches
-  `onMenuAction`; external/`file:` navigation and `window.open` blocked (http(s) routed to the
-  browser hook); IPC argument validation; remote requests from the page cancelled; permissions denied;
-  `ui.theme` → `nativeTheme`; App Nap blocker held exactly during a (fake-model) generation; quit closes
-  the server (port closed, clean-shutdown lines in the log, window state saved); attaching to an
-  already-running CLI server and leaving it running; an unusable data dir exits with status 1.
-  The same suite passes against the packaged Linux build (`electron-builder --linux dir`, asar).
-* `electron-builder --linux dir` — config and file allow-list (inspected `app.asar`).
-* `bash -n` and `shellcheck` on `scripts/setup-macos.sh` and `Harness.command`; the setup script's
-  flow with stubbed macOS tools.
+* `npm ci` + `npm run dist` produce `dist/mac-arm64/Harness.app` and a ~129 MB `.dmg` on macOS arm64.
+* `npm run test:e2e` passes **from source and against the packaged app binary**
+  (`HARNESS_E2E_APP=…/Harness.app/Contents/MacOS/Harness`): window loads the server URL; preload contract
+  with `desktop` and `desktop-mac`; menus Harness/File/Edit/View/Chat/Window/Help; ⌘⇧Space registered;
+  the `desktop-fullscreen` class; attaching to an already-running server; clean quit; the error paths.
+* The backend and desktop unit tests (`npm test`) pass on macOS, and the server boots with no `node_modules`.
+* The UI test suite passes in WebKit (Safari's engine), except one Chromium-only assertion.
 
-**Not verified (needs a Mac):** the arm64 `.app`/`.dmg` build itself, the ad-hoc signature
-(`codesign -dv` should show `Signature=adhoc`), Gatekeeper behaviour, `.icns` rendering in Finder/Dock,
-the `hiddenInset` title bar and traffic-light spacing, macOS full-screen transitions, hide-on-close and
-Dock reopen, Dock badge and Dock menu, the global shortcut on macOS, App Nap actually being prevented,
-the system spell checker/Look Up in the context menu, and `setup-macos.sh` on real macOS bash 3.2.
+**Verified on Linux** (development box, Electron 44 under Xvfb), in addition: everything in `npm test`
+(data-dir parity with the backend, `desktop.json`, URL/navigation/window-open decisions, `showInFolder`
+containment incl. symlinks, badge sanitising, permission allow-list, menu template, context menu,
+window-state clamping, App Nap guard, instance detection and the start-or-attach race, the preload
+contract in a VM, packaging guards) and the full `npm run test:e2e` (also: IPC argument validation, remote
+requests cancelled, permissions denied, `ui.theme` → `nativeTheme`, the App Nap blocker held exactly during a
+fake-model generation, attaching via the backend's `HARNESS_ALREADY_RUNNING` lock error), from source and
+against the packaged Linux build; `bash -n` + `shellcheck` on `setup-macos.sh` and `Harness.command`, and
+the setup script's flow with stubbed macOS tools and a fake Ollama.
+
+**Not verified:** a person looking at and using the window on a physical Mac — `hiddenInset` title-bar and
+traffic-light spacing, the icon in Finder and the Dock, hide-on-close and Dock reopen, Dock badge and menu,
+the context menu's spell checker and Look Up; whether App Nap is actually prevented (the blocker logic is
+tested, its effect on macOS is not); Gatekeeper on a physical machine (downloaded vs locally built copy);
+and `setup-macos.sh` run interactively on a real Mac.
 
 Quick checks on the Mac after `npm run dist`:
 

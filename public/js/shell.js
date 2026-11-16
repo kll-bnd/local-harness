@@ -2,7 +2,7 @@
 // chat-level actions (rename, pin, fork, export, archive, delete with undo) and the reconnect banner.
 import { h, mount, download, add } from './lib/dom.js';
 import { icon } from './lib/icons.js';
-import { fmtTokens, modelLabel, modelShort, fmtUntil } from './lib/format.js';
+import { fmtTokens, fmtBytes, modelLabel, modelShort, fmtUntil, residentOf } from './lib/format.js';
 import { store, uiPrefs, setUiPref, localPref, findModel, modelInfo, loadChats, loadArchived } from './state.js';
 import * as api from './api.js';
 import { Sidebar } from './views/sidebar.js';
@@ -10,7 +10,7 @@ import { Inspector } from './views/inspector.js';
 import { ChatView } from './views/chat/chat-view.js';
 import { navigate } from './router.js';
 import { runAction, keyLabel, getAction } from './actions.js';
-import { openMenu, toast, openDialog } from './ui/overlays.js';
+import { openMenu, toast, openDialog, confirmDialog } from './ui/overlays.js';
 import { showError } from './errors.js';
 import { peekChatModel, forgetChatModel, mergeChatSummary } from './chat/session.js';
 
@@ -183,7 +183,7 @@ export class Shell {
     else if (unloadedForImage) { dot = 'dot.warn'; stateText = 'unloaded for image'; }
     else if (loaded) { dot = 'dot.ok'; stateText = ''; }
     else stateText = 'not loaded';
-    pill.title = ollamaDown ? 'Ollama is not running — click for setup' : loaded ? `Loaded in memory${loaded.expiresAt ? ` ${fmtUntil(loaded.expiresAt)}` : ''}${loaded.contextLength ? ` with a ${fmtTokens(loaded.contextLength)} window` : ''}` : unloadedForImage ? 'Unloaded to free memory for image generation; reloads on the next message' : 'Loads on the next message (the first reply takes longer)';
+    pill.title = ollamaDown ? 'Ollama is not running — click for setup' : loaded ? `Loaded in memory (${fmtBytes(residentOf(loaded))})${loaded.expiresAt ? ` ${fmtUntil(loaded.expiresAt)}` : ''}${loaded.contextLength ? ` with a ${fmtTokens(loaded.contextLength)} window` : ''}` : unloadedForImage ? 'Unloaded to free memory for image generation; reloads on the next message' : 'Loads on the next message (the first reply takes longer)';
     if (ollamaDown) pill.addEventListener('click', (e) => { e.stopImmediatePropagation(); runAction('open-setup'); }, { capture: true });
     pill.title = `${ref.model}\n${pill.title}`;
     add(pill, h(`span.${dot}`), h('span.label', modelShort(info?.name || ref.model, 34)), stateText ? h('span.faint.hide-narrow', stateText) : null, ctxSpan);
@@ -247,7 +247,8 @@ export class Shell {
       { label: 'Export…', icon: 'share', run: () => this.exportDialog(c) },
       { label: c.archived ? 'Unarchive' : 'Archive', icon: 'archive', run: () => this.updateChat(c.id, { archived: !c.archived }, c.archived ? 'Chat restored' : 'Chat archived') },
       { separator: true },
-      { label: 'Delete', icon: 'trash', danger: true, shortcut: keyLabel('Mod+Backspace'), run: () => this.deleteChat(c.id) },
+      { label: 'Delete', icon: 'trash', danger: true, shortcut: keyLabel('Mod+Shift+Backspace'), run: () => this.deleteChat(c.id) },
+      !c.incognito ? { label: 'Delete with its memories…', icon: 'trash', danger: true, run: () => this.deleteChatAndMemories(c) } : null,
     ];
   }
 
@@ -284,6 +285,18 @@ export class Shell {
     const timer = setTimeout(commit, 6000);
     this.pendingDeletes.set(id, timer);
     toast({ kind: 'info', message: 'Chat deleted', detail: c.title || 'Untitled', timeout: 6000, id: `del-${id}`, action: { label: 'Undo', run: () => { clearTimeout(timer); this.pendingDeletes.delete(id); this.sidebar.hideForDelete(id, false); } } });
+  }
+
+  async deleteChatAndMemories(c) {
+    if (!await confirmDialog({ title: `Delete “${c.title || 'Untitled'}” and what Harness learned from it?`, message: 'The chat, its attachments and images, and the memories extracted from it are deleted. This cannot be undone.', confirmLabel: 'Delete', danger: true })) return;
+    try {
+      const r = await api.chats.remove(c.id, { deleteMemories: true });
+      forgetChatModel(c.id);
+      store.set('chats', (store.get('chats') || []).filter((x) => x.id !== c.id));
+      if (store.get('route').chatId === c.id) navigate('/chat');
+      const rm = r.removed || {};
+      toast({ kind: 'success', message: 'Chat deleted', detail: rm.memories ? `${rm.memories} memor${rm.memories === 1 ? 'y' : 'ies'} removed too.` : 'No memories came from this chat.' });
+    } catch (e) { showError(e, 'delete the chat'); }
   }
 
   flushPendingDeletes() {

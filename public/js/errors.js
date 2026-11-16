@@ -28,6 +28,16 @@ export function explainError(err, context = '') {
         action: first ? { label: first.action === 'create_text_only_copy' ? 'Make a text-only copy' : first.action === 'use_smaller_file' ? 'Use a smaller file' : 'Try again', run: () => import('./next-steps.js').then((m) => m.runNextStep(first)) } : { label: 'Models', run: () => runAction('open-models') },
       };
     }
+    case 'message_deleted':
+      return { title: 'That message was deleted', detail: 'It was removed (perhaps in another window) before the reply could start. The chat has been refreshed.' };
+    case 'registry_unreachable':
+      return { title: "Can't reach the model registry", detail: 'Downloading needs an internet connection. Everything already installed keeps working offline.' };
+    case 'workflow_invalid':
+      return { title: 'ComfyUI rejected the workflow', detail: msg, action: { label: 'Image settings', run: () => runAction('open-settings', 'images') } };
+    case 'name_taken':
+      return { title: 'That name is already taken', detail: msg };
+    case 'not_multimodal':
+      return { title: 'This model is already text-only', detail: msg };
     case 'secret_detected':
       return { title: 'That looks like a password or key', detail: msg };
     case 'memory_protected':
