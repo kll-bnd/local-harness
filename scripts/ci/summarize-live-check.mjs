@@ -17,6 +17,7 @@ for (const c of j.checks.filter((x) => x.status !== 'PASS').sort((a, b) => order
   if (c.expected) console.log(`   expected: ${clip(c.expected, 220)}`);
   if (c.actual) console.log(`   actual:   ${clip(c.actual, 420)}`);
   if (c.fix) console.log(`   fix:      ${clip(c.fix, 260)}`);
+  if (c.status === 'FAIL') for (const line of [].concat(c.info || []).slice(0, 14)) console.log(`   info:     ${clip(line, 420)}`);
 }
 const want = (process.argv[3] || '').split(',').filter(Boolean);
 for (const [name, sample] of Object.entries(j.samples || {})) if (want.some((w) => name.includes(w))) console.log(`sample ${name}: ${clip(sample, 900)}`);
