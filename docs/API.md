@@ -1152,7 +1152,7 @@ The HTTP listener answers only callers that proved they may: other programs and 
 
 ### 10.6 "Block all internet access"
 
-One setting, on by default, kept in the security record (10.2) — `launch.json` (`offlineLock`, `offlineLockSuspendedUntil`) carries a copy for the launchers, which the backend writes but never takes as permission (before the first unlock the blocker is on whatever the file says; without a key store the file is the setting) — with one clear state. Chat is never affected: while
+One setting, on by default, kept in the security record (10.2) — `launch.json` (`offlineLock`, `offlineLockSuspendedUntil`) carries a copy for the launchers, which the backend writes but never takes as permission (before the first unlock — and before the first setup — the blocker is on whatever the file says; only in off mode without a key store, a development option of the process, is the file the setting) — with one clear state. Chat is never affected: while
 blocked, installed models, memory, summaries, tools other than `fetch_url`, documents and image generation through a
 local Draw Things / ComfyUI work exactly as before, with no warnings in the chat view.
 
