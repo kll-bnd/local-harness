@@ -13,7 +13,7 @@ on:
         description: "Which jobs to run"
         type: choice
         default: all
-        options: [all, backend, desktop, native, live, e2e, ollama, nemotron]
+        options: [all, backend, desktop, native, live, e2e, hub, ollama, nemotron]
       live_groups:
         description: "live-check groups to run"
         type: string
@@ -188,6 +188,19 @@ jobs:
           curl -fsS "$O/api/tags" | jq -c '.models[] | {name, size}'
       - name: The user's scenario, end to end
         run: node scripts/ci/nemotron-e2e.mjs
+
+  hub:
+    name: Model catalogue endpoints (fact-finding)
+    if: ${{ inputs.jobs == 'hub' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Probe Hugging Face and ollama.com
+        run: node scripts/ci/hub-probe.mjs
 
   ollama:
     name: Real Ollama API behaviour
