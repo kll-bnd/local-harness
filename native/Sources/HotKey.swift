@@ -19,7 +19,7 @@ final class GlobalHotKey {
         guard let (code, mods) = GlobalHotKey.parse(accelerator) else { return "cannot parse \(accelerator)" }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let me = Unmanaged.passUnretained(self).toOpaque()
-        let st = InstallEventHandler(GetApplicationEventTarget(), { _, _, user -> OSStatus in
+        let st = InstallEventHandler(GetApplicationEventTarget(), { (_: EventHandlerCallRef?, _: EventRef?, user: UnsafeMutableRawPointer?) -> OSStatus in
             guard let user = user else { return noErr }
             let hk = Unmanaged<GlobalHotKey>.fromOpaque(user).takeUnretainedValue()
             DispatchQueue.main.async { hk.action() }

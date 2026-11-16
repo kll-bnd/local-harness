@@ -143,7 +143,7 @@ final class SelfTest: NSObject, WKScriptMessageHandler {
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let wv = message.webView, message.frameInfo.isMainFrame, message.frameInfo.securityOrigin.protocol == "harness",
               let b = message.body as? [String: Any], let op = b["op"] as? String, let id = (b["id"] as? NSNumber)?.intValue else { return }
-        let r: (Any) -> Void = { [weak self] v in self?.reply(wv, id, v) }
+        let r: ([String: Any]) -> Void = { [weak self] v in self?.reply(wv, id, v) }
         let w = app.mainWindow
         switch op {
         case "state":

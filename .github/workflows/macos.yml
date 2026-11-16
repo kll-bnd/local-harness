@@ -305,60 +305,39 @@ jobs:
       - name: Toolchain
         run: |
           touch "$FACTS"
-          { echo "toolchain| macOS $(sw_vers -productVersion) $(uname -m) $(sysctl -n machdep.cpu.brand_string)"
-            echo "toolchain| xcode-select: $(xcode-select -p)"
-            echo "toolchain| swiftc: $(swiftc --version 2>&1 | head -n 1)"
-            echo "toolchain| CLT swiftc: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools swiftc --version 2>&1 | head -n 1)"
-            echo "toolchain| CLT sdk: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools xcrun --show-sdk-path 2>&1)"
-            echo "toolchain| sandbox-exec: $(ls -l /usr/bin/sandbox-exec 2>&1)"
+          { echo "toolchain| macOS $(sw_vers -productVersion) $(uname -m) $(sysctl -n machdep.cpu.brand_string), RAM $(($(sysctl -n hw.memsize) / 1073741824)) GB"
+            echo "toolchain| Command Line Tools: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools xcrun swiftc --version 2>&1 | head -n 1)"
           } | tee -a "$FACTS"
-      - name: Probe - build with the Command Line Tools only
-        continue-on-error: true
+      - name: Build Harness.app with the Command Line Tools only
         env:
           DEVELOPER_DIR: /Library/Developer/CommandLineTools
-        run: native/probe/build-probes.sh
-      - name: Probe - build with Xcode if the Command Line Tools could not
-        run: test -x /tmp/probe/kcB || native/probe/build-probes.sh
-      - name: Probe - WKWebView custom scheme
-        continue-on-error: true
         run: |
-          node native/ci/run.mjs 200 scheme -- /tmp/probe/SchemeProbe.app/Contents/MacOS/SchemeProbe --root "$PWD/native/probe" --out /tmp/probe/scheme.json > /dev/null
-          node native/ci/summarize-probe.mjs /tmp/probe/scheme.json
-          echo "probe| downloaded files: $(ls -l /tmp/probe/dl 2>&1 | tail -n +2 | awk '{print $5, $9}' | tr '\n' ';')" | tee -a "$FACTS"
-      - name: Probe - Keychain
-        continue-on-error: true
+          if scripts/build-native.sh > /tmp/build.log 2>&1; then
+            grep '^==>' /tmp/build.log | sed 's/^/build| /' | tee -a "$FACTS"
+            echo "build| swiftc warnings: $(grep -c 'warning:' /tmp/build.log)" | tee -a "$FACTS"
+          else
+            grep -E 'error:' /tmp/build.log | sed "s#$PWD/##" | head -n 40 | sed 's/^/build-error| /' | tee -a "$FACTS"
+            tail -n 5 /tmp/build.log | sed 's/^/build-tail| /' | tee -a "$FACTS"
+            exit 1
+          fi
+      - name: Inspect the bundle
         run: |
-          { echo "keychain| default: $(security default-keychain 2>&1 | tr -d ' ')"
-            echo "keychain| list: $(security list-keychains -d user 2>&1 | tr -d ' ' | tr '\n' ' ')"
-            echo "keychain| info: $(security show-keychain-info 2>&1 | tr '\n' ' ')"
+          A=dist/native/Harness.app
+          { echo "bundle| app $(du -sh $A | cut -f1), zip $(du -sh dist/native/*.zip | cut -f1); node $(du -sh $A/Contents/MacOS/node | cut -f1), Harness binary $(du -sh $A/Contents/MacOS/Harness | cut -f1), server+public $(du -sh $A/Contents/Resources/app | cut -f1)"
+            echo "bundle| $(codesign --verify --deep --strict $A 2>&1 && echo 'codesign --verify --deep --strict: ok')"
+            echo "bundle| $(codesign -dv $A 2>&1 | grep -E '^(Identifier|Signature|CodeDirectory)' | tr '\n' ' ')"
+            echo "bundle| node: $($A/Contents/MacOS/node -v) $(codesign -dv $A/Contents/MacOS/node 2>&1 | grep -E '^(Authority|TeamIdentifier)' | head -n 2 | tr '\n' ' ')"
+            echo "bundle| $(file -b $A/Contents/MacOS/Harness)"
           } | tee -a "$FACTS"
-          K=/tmp/probe
-          node native/ci/run.mjs 20 kc -- $K/kcA attrs
-          node native/ci/run.mjs 20 kc -- $K/kcA create
-          node native/ci/run.mjs 20 kc -- $K/kcA attrs
-          node native/ci/run.mjs 20 kc -- $K/kcA read-noui
-          node native/ci/run.mjs 20 kc -- $K/kcA read
-          node native/ci/run.mjs 20 kc -- $K/kcB attrs
-          node native/ci/run.mjs 20 kc -- $K/kcB read-noui
-          node native/ci/run.mjs 20 kc -- /usr/bin/security find-generic-password -s local.harness.probe -a data-key -w
-          node native/ci/run.mjs 20 kc -- $K/kcA create-dp
-          node native/ci/run.mjs 20 kc -- $K/kcA delete
-          node native/ci/run.mjs 20 kc-dr -- $K/kcC create .dr
-          node native/ci/run.mjs 20 kc-dr -- $K/kcC read-noui .dr
-          node native/ci/run.mjs 20 kc-dr -- $K/kcD read-noui .dr
-          node native/ci/run.mjs 20 kc-dr -- $K/kcA read-noui .dr
-          node native/ci/run.mjs 20 kc-dr -- $K/kcC delete .dr
-          echo "kc-dr| designated requirement: $(codesign -d -r- $K/kcD 2>&1 | grep designated)" | tee -a "$FACTS"
-      - name: Probe - sandbox-exec and the offline-lock profile
-        continue-on-error: true
+      - name: Self-test against the mock backend (two launches, one data folder)
         run: |
-          node native/ci/run.mjs 60 net -- node native/ci/net-probe.mjs plain
-          node native/ci/run.mjs 400 sb -- node native/ci/sb-variants.mjs
-      - name: Probe - a real Ollama under the offline lock
+          node -e "const n=20*1024*1024,b=Buffer.alloc(n);for(let i=0;i<n;i++)b[i]=(Math.imul(i,31)+7)&255;require('fs').writeFileSync('/tmp/pick-20mb.bin',b)"
+          node native/test/run-selftest.mjs --app dist/native/Harness.app --label mock --script native/test/selftest-mock.js --backend native/test/mock-backend.mjs --launches 2 --files /tmp/pick-20mb.bin --timeout 240 > /dev/null
+      - name: Offline-lock profile with a real Ollama
         continue-on-error: true
         run: |
           brew install ollama > /dev/null 2>&1
-          KEEP=60 node native/ci/run.mjs 1500 ollama -- node native/ci/sandbox-ollama.mjs server/security/offline-lock.sb qwen3:0.6b > /dev/null
+          KEEP=30 node native/ci/run.mjs 1500 ollama -- node native/ci/sandbox-ollama.mjs server/security/offline-lock.sb qwen3:0.6b > /dev/null
       - name: Facts
         if: always()
         run: cat "$FACTS"

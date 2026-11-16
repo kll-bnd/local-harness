@@ -404,11 +404,14 @@ enum WindowState {
             return NSRect(x: main.minX + (main.width - w) / 2, y: main.minY + (main.height - h) / 2, width: w, height: h)
         }
         guard let d = try? Data(contentsOf: file), let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-              let w = (o["width"] as? NSNumber)?.doubleValue, let h = (o["height"] as? NSNumber)?.doubleValue, w > 0, h > 0, w < 100000, h < 100000 else {
+              let wn = o["width"] as? NSNumber, let hn = o["height"] as? NSNumber else {
             return (centred(defaultSize), false)
         }
+        let w = CGFloat(wn.doubleValue), h = CGFloat(hn.doubleValue)
+        guard w > 0, h > 0, w < 100000, h < 100000 else { return (centred(defaultSize), false) }
         let zoomed = (o["zoomed"] as? Bool) ?? false
-        guard let x = (o["x"] as? NSNumber)?.doubleValue, let y = (o["y"] as? NSNumber)?.doubleValue else { return (centred(NSSize(width: w, height: h)), zoomed) }
+        guard let xn = o["x"] as? NSNumber, let yn = o["y"] as? NSNumber else { return (centred(NSSize(width: w, height: h)), zoomed) }
+        let x = CGFloat(xn.doubleValue), y = CGFloat(yn.doubleValue)
         let rect = NSRect(x: x, y: y, width: w, height: h)
         var best: (area: CGFloat, screen: NSRect)? = nil
         for s in NSScreen.screens {
