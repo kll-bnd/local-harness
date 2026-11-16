@@ -100,6 +100,7 @@ jobs:
           done
           ollama pull qwen3:0.6b > /dev/null 2>&1
           ollama pull gemma3:270m > /dev/null 2>&1
+          ollama pull all-minilm > /dev/null 2>&1
       - name: Live check
         run: |
           node scripts/live-check.mjs --only "${{ inputs.live_groups || 'env,ollama,e2e' }}" --allow-pull --timeout-scale 4 --quiet --no-color \
