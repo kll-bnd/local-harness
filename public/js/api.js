@@ -1,5 +1,8 @@
 // The single client for the Harness backend. It mirrors docs/API.md section by section; nothing else in
-// the UI calls fetch() directly. Errors are normalised to ApiError { status, code, message, details }.
+// the UI talks to the backend. Every request — JSON, uploads, streamed replies and the global event stream —
+// goes through ONE function, `transport()`, so the native Mac app (which may have no HTTP server at all) can
+// carry the traffic over its own bridge by defining `window.harnessTransport` with the same shape.
+// Errors are normalised to ApiError { status, code, message, details }.
 
 export class ApiError extends Error {
   constructor(status, code, message, details = null) {
@@ -17,30 +20,109 @@ const qs = (o = {}) => {
   return p.length ? `?${p.map(([k, v]) => `${enc(k)}=${enc(v === true ? '1' : v)}`).join('&')}` : '';
 };
 
-async function parseError(res) {
-  let body = null;
-  try { body = await res.json(); } catch { /* not JSON */ }
-  const e = body?.error || {};
-  return new ApiError(res.status, e.code || `http_${res.status}`, e.message || res.statusText, e.details || null);
+// ------------------------------------------------------------------------------------------------ transport
+/**
+ * The transport contract (also what `window.harnessTransport` must implement):
+ *
+ *   transport(request) → Promise<response>
+ *   request  = { method: 'GET'|'POST'|'PUT'|'PATCH'|'DELETE',
+ *                path: '/api/…?query'           — always a relative path starting with /api/
+ *                headers: { [lower-case name]: string },
+ *                body: Uint8Array | Blob | null — JSON is already UTF-8 encoded; uploads are a Blob (File)
+ *                signal: AbortSignal            — on abort: cancel the request, stop the body, reject with an
+ *                                                 Error whose name is 'AbortError'
+ *                keepalive: boolean }           — hint: the page may be unloading (fetch keepalive)
+ *   response = { status: number,
+ *                headers: { [lower-case name]: string },
+ *                body: AsyncIterable<Uint8Array> — the body in order, chunk by chunk, as soon as it arrives
+ *                                                  (server-sent event streams must not be buffered) }
+ *
+ * A network-level failure (nothing reached the backend) rejects with a TypeError, like fetch.
+ */
+async function fetchTransport({ method, path, headers, body, signal, keepalive }) {
+  const res = await fetch(path, { method, headers, body: body ?? undefined, signal, keepalive: !!keepalive, credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+  const out = {};
+  res.headers.forEach((v, k) => { out[k.toLowerCase()] = v; });
+  return { status: res.status, headers: out, body: readerChunks(res.body, signal) };
 }
 
-async function request(method, path, { body, signal, headers = {}, raw = false, keepalive = false } = {}) {
-  let res;
-  const init = { method, signal, headers: { ...headers }, keepalive };
-  if (body !== undefined) {
-    if (body instanceof Blob || body instanceof ArrayBuffer) init.body = body;
-    else { init.body = JSON.stringify(body); init.headers['content-type'] = 'application/json'; }
+async function* readerChunks(stream, signal) {
+  if (!stream) return;
+  const reader = stream.getReader();
+  const onAbort = () => reader.cancel().catch(() => {});
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    reader.releaseLock?.();
+  }
+}
+
+export function transport(req) {
+  const t = typeof window !== 'undefined' && typeof window.harnessTransport === 'function' ? window.harnessTransport : fetchTransport;
+  return t(req);
+}
+
+/** Observers of every response (security gate: 401 auth_required / 423 locked → lock screen). */
+const responseHooks = new Set();
+export function onApiError(fn) { responseHooks.add(fn); return () => responseHooks.delete(fn); }
+
+const textEncoder = new TextEncoder();
+
+async function collect(body) {
+  const parts = [];
+  let n = 0;
+  for await (const c of body) { parts.push(c); n += c.length; }
+  const all = new Uint8Array(n);
+  let o = 0;
+  for (const c of parts) { all.set(c, o); o += c.length; }
+  return all;
+}
+const decodeText = (bytes) => new TextDecoder().decode(bytes);
+
+function errorFrom(status, bytes) {
+  let body = null;
+  try { body = JSON.parse(decodeText(bytes)); } catch { /* not JSON */ }
+  const e = body?.error || {};
+  const err = new ApiError(status, e.code || `http_${status}`, e.message || `HTTP ${status}`, e.details || null);
+  for (const fn of responseHooks) { try { fn(err); } catch { /* observer failed */ } }
+  return err;
+}
+
+/** One request through the transport. body: plain object (sent as JSON), Blob/File, Uint8Array or undefined. */
+async function send(method, path, { body, signal, headers = {}, keepalive = false } = {}) {
+  const h = { accept: 'application/json', ...headers };
+  let payload = null;
+  if (body !== undefined && body !== null) {
+    if (body instanceof Blob || body instanceof Uint8Array) payload = body;
+    else { payload = textEncoder.encode(JSON.stringify(body)); h['content-type'] = 'application/json'; }
   }
   try {
-    res = await fetch(path, init);
+    return await transport({ method, path, headers: h, body: payload, signal: signal || new AbortController().signal, keepalive });
   } catch (e) {
-    if (e.name === 'AbortError') throw e;
+    if (e?.name === 'AbortError') throw e;
     throw new ApiError(0, 'network', 'Harness is not reachable. Is the app still running?');
   }
-  if (!res.ok) throw await parseError(res);
-  if (raw) return res;
-  const ct = res.headers.get('content-type') || '';
-  return ct.includes('json') ? res.json() : res.text();
+}
+
+/** JSON (or text) request; non-2xx → ApiError. */
+async function request(method, path, opts = {}) {
+  const res = await send(method, path, opts);
+  let bytes;
+  try { bytes = await collect(res.body); } catch (e) {
+    if (e?.name === 'AbortError') throw e;
+    throw new ApiError(0, 'stream_interrupted', 'The connection to Harness was interrupted.');
+  }
+  if (res.status < 200 || res.status >= 300) throw errorFrom(res.status, bytes);
+  if (opts.raw) return { status: res.status, headers: res.headers, bytes };
+  const ct = res.headers['content-type'] || '';
+  const text = decodeText(bytes);
+  return ct.includes('json') ? (text ? JSON.parse(text) : null) : text;
 }
 
 const get = (p, o) => request('GET', p, o);
@@ -49,26 +131,8 @@ const patch = (p, body, o = {}) => request('PATCH', p, { ...o, body });
 const put = (p, body, o = {}) => request('PUT', p, { ...o, body });
 const del = (p, o) => request('DELETE', p, o);
 
-/**
- * POST an SSE endpoint and deliver each event to onEvent(event). Resolves with the list of terminal
- * events once the stream closes. Setup errors (JSON error before any SSE bytes) reject with ApiError;
- * aborting via `signal` resolves with { aborted: true }.
- */
-export async function stream(path, body, onEvent, { signal } = {}) {
-  let res;
-  try {
-    res = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream' }, body: JSON.stringify(body ?? {}), signal });
-  } catch (e) {
-    if (e.name === 'AbortError') return { aborted: true };
-    throw new ApiError(0, 'network', 'Harness is not reachable. Is the app still running?');
-  }
-  if (!res.ok) throw await parseError(res);
-  const ct = res.headers.get('content-type') || '';
-  if (!ct.includes('event-stream')) {
-    const data = ct.includes('json') ? await res.json() : null;
-    return { json: data };
-  }
-  const reader = res.body.getReader();
+/** Incremental server-sent-events parser over a chunk iterator. Calls onEvent({type, …data}). */
+async function readSse(body, onEvent) {
   const decoder = new TextDecoder();
   let buf = '';
   let last = null;
@@ -87,30 +151,118 @@ export async function stream(path, body, onEvent, { signal } = {}) {
     last = ev;
     onEvent(ev);
   };
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let i;
-      while ((i = buf.search(/\r?\n\r?\n/)) >= 0) {
-        const block = buf.slice(0, i);
-        buf = buf.slice(i).replace(/^\r?\n\r?\n/, '');
-        flush(block);
-      }
+  for await (const chunk of body) {
+    buf += decoder.decode(chunk, { stream: true });
+    let i;
+    while ((i = buf.search(/\r?\n\r?\n/)) >= 0) {
+      const block = buf.slice(0, i);
+      buf = buf.slice(i).replace(/^\r?\n\r?\n/, '');
+      flush(block);
     }
-    if (buf.trim()) flush(buf);
+  }
+  if (buf.trim()) flush(buf);
+  return last;
+}
+
+/**
+ * Open an SSE endpoint (POST by default) and deliver each event to onEvent(event). Setup errors (a JSON error
+ * before any SSE bytes) reject with ApiError; aborting via `signal` resolves with { aborted: true }.
+ */
+export async function stream(path, body, onEvent, { signal, method = 'POST', headers = {} } = {}) {
+  let res;
+  try {
+    res = await send(method, path, { body: method === 'GET' ? undefined : (body ?? {}), signal, headers: { accept: 'text/event-stream', ...headers } });
   } catch (e) {
-    if (e.name === 'AbortError' || signal?.aborted) return { aborted: true, last };
+    if (e?.name === 'AbortError') return { aborted: true };
+    throw e;
+  }
+  if (res.status < 200 || res.status >= 300) throw errorFrom(res.status, await collect(res.body).catch(() => new Uint8Array()));
+  const ct = res.headers['content-type'] || '';
+  if (!ct.includes('event-stream')) {
+    const text = decodeText(await collect(res.body));
+    return { json: ct.includes('json') && text ? JSON.parse(text) : null };
+  }
+  try {
+    const last = await readSse(res.body, onEvent);
+    return { last };
+  } catch (e) {
+    if (e?.name === 'AbortError' || signal?.aborted) return { aborted: true };
     throw new ApiError(0, 'stream_interrupted', 'The connection to Harness was interrupted.');
   }
-  return { last };
+}
+
+/** POST that answers with a file (backup, export): returns { blob, filename }. */
+async function postForFile(path, body, { headers = {} } = {}) {
+  const r = await request('POST', path, { body, headers: { accept: '*/*', ...headers }, raw: true });
+  const cd = r.headers['content-disposition'] || '';
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+  return { blob: new Blob([r.bytes], { type: r.headers['content-type'] || 'application/octet-stream' }), filename: m ? decodeURIComponent(m[1]) : null };
 }
 
 // ------------------------------------------------------------------------------------------------ 5.1
 export const system = {
   health: () => get('/api/health'),
   info: ({ refresh } = {}) => get(`/api/system${qs({ refresh })}`),
+};
+
+// ------------------------------------------------------------------------------------------------ 10.1–10.3
+/** Base64url of a UTF-8 string (for X-Harness-Backup-Passphrase). */
+export function base64url(text) {
+  let bin = '';
+  for (const b of textEncoder.encode(text)) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export const security = {
+  status: () => get('/api/security'),
+  setup: (password) => post('/api/security/setup', { password }),
+  /** { password } | { recoveryKey } | {} (keychain mode) */
+  unlock: (body = {}) => post('/api/security/unlock', body),
+  lock: () => post('/api/security/lock', {}),
+  /** password may be omitted inside a passwordReset window. */
+  changePassword: ({ password, newPassword }) => post('/api/security/password', password ? { password, newPassword } : { newPassword }),
+  newRecoveryKey: (password) => post('/api/security/recovery-key', { password }),
+  setMode: ({ password, mode }) => post('/api/security/mode', { password, mode }),
+  /** → { confirmation, expiresAt }: a single-use X-Harness-Confirm value (2 minutes). */
+  confirm: (password) => post('/api/security/confirm', { password }),
+};
+
+export const auth = {
+  /** Exchange a one-use #launch=<code> for a session cookie. */
+  session: (code) => post('/api/auth/session', { code }),
+  status: () => get('/api/auth/status'),
+  logout: () => post('/api/auth/logout', {}),
+};
+
+// ------------------------------------------------------------------------------------------------ 10.4
+export const uiState = {
+  get: () => get('/api/ui-state'),
+  put: (state) => put('/api/ui-state', { state }),
+  /** { set: { key: value }, remove: [key] } — top-level keys only. */
+  patch: ({ set, remove } = {}, { keepalive = false } = {}) => patch('/api/ui-state', { ...(set ? { set } : {}), ...(remove?.length ? { remove } : {}) }, { keepalive }),
+};
+
+export const backup = {
+  /** Full backup download; passphrase null → plain harness.backup, otherwise the encrypted envelope. → { blob, filename } */
+  create: ({ password, passphrase = null }) => postForFile('/api/export', { password, passphrase }),
+};
+
+// ------------------------------------------------------------------------------------------------ 10.6
+export const network = {
+  get: () => get('/api/network'),
+  /** minutes 1–120; needs the password. → { offlineLock, restartRequired } */
+  allow: ({ minutes = 15, password }) => post('/api/network/allow', { minutes, password }),
+  block: () => post('/api/network/block', {}),
+  /** Turning the blocker off needs the password; turning it on does not. */
+  setEnabled: (enabled, { password } = {}) => put('/api/network', enabled ? { enabled: true } : { enabled: false, password }),
+  test: () => post('/api/network/test', {}),
+};
+
+// ------------------------------------------------------------------------------------------------ 10.8
+export const catalog = {
+  list: ({ source = 'local', sort, kind, fits, minParams, maxParams, publisher, q, cursor, limit } = {}, opts = {}) =>
+    get(`/api/catalog${qs({ source, sort, kind, fits: fits ? 'true' : undefined, minParams, maxParams, publisher, q, cursor, limit })}`, opts),
+  model: ({ source, id }, opts = {}) => get(`/api/catalog/model${qs({ source, id })}`, opts),
 };
 
 // ------------------------------------------------------------------------------------------------ 5.2
@@ -147,7 +299,7 @@ export const models = {
   context: (r, mode) => get(`/api/models/context${qs({ ...ref(r), mode })}`),
   recommended: () => get('/api/models/recommended'),
   /** SSE: start → progress… → done | error */
-  pull: (body, onEvent, opts) => stream('/api/models/pull', body, onEvent, opts),
+  pull: (body, onEvent, opts) => stream('/api/models/pull', body, onEvent, opts), // body: { model, providerId?, textOnlyCopy? }
   remove: (r) => del(`/api/models${qs(ref(r))}`),
   load: (r) => post('/api/models/load', ref(r)),
   unload: (r) => post('/api/models/unload', ref(r)),
@@ -187,13 +339,20 @@ export const chats = {
   compact: (id, body = {}) => post(`/api/chats/${enc(id)}/compact`, body),
 
   exportUrl: (id, format = 'markdown', { embedImages } = {}) => `/api/chats/${enc(id)}/export${qs({ format, embedImages })}`,
-  import: (payload) => post('/api/chats/import', payload),
+  import: (payload, { passphrase } = {}) => post('/api/chats/import', payload, { headers: passphrase ? { 'x-harness-backup-passphrase': base64url(passphrase) } : {} }),
 };
 
 export const search = (q, { limit } = {}, opts = {}) => get(`/api/search${qs({ q, limit })}`, opts);
-export const backupUrl = () => '/api/export';
-/** Restore a harness.backup (merged, new ids). parts: { chats, attachments, images, memories, presets } booleans; settings: 'skip'|'safe'|'full'. */
-export const restore = (backup, { settings = 'skip', ...parts } = {}) => post(`/api/restore${qs({ settings, ...Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, v ? '1' : '0'])) })}`, backup);
+/**
+ * Restore a harness.backup (merged, new ids). parts: { chats, attachments, images, memories, presets } booleans;
+ * settings: 'skip'|'safe'|'full'. confirmation: X-Harness-Confirm from security.confirm(); passphrase for an
+ * encrypted backup.
+ */
+export const restore = (backupData, { settings = 'skip', confirmation, passphrase, ...parts } = {}) => post(
+  `/api/restore${qs({ settings, ...Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, v ? '1' : '0'])) })}`,
+  backupData,
+  { headers: { ...(confirmation ? { 'x-harness-confirm': confirmation } : {}), ...(passphrase ? { 'x-harness-backup-passphrase': base64url(passphrase) } : {}) } },
+);
 
 // ------------------------------------------------------------------------------------------------ 5.9
 export const memories = {
@@ -236,7 +395,7 @@ export const images = {
   fileUrl: (id, { download: dl } = {}) => `/api/images/${enc(id)}/file${qs({ download: dl })}`,
 };
 
-/** Fire-and-forget request that survives page unload (used to flush pending deletes). */
-export function beacon(method, path) {
-  try { fetch(path, { method, keepalive: true }); } catch { /* ignore */ }
+/** Fire-and-forget request that should survive page unload (flushes pending deletes / UI state). */
+export function beacon(method, path, body) {
+  send(method, path, { body, keepalive: true }).then((r) => collect(r.body)).catch(() => {});
 }

@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 // `npm run doctor` — check this machine for everything Harness needs and say how to fix what is missing.
-// Zero dependencies. Read-only: it never installs, starts Ollama or changes settings. When Harness is not
-// running it asks a throw-away copy of the backend (temporary data folder, deleted again, Ollama auto-start off).
+// Zero dependencies. Read-only: it never installs, starts Ollama or changes settings, and it never needs your
+// data: by default it does not ask for your Harness password. Facts that involve no user data (models, Ollama,
+// the internet blocker's self-test) come from a throw-away copy of the backend (temporary data folder, deleted
+// again, Ollama auto-start off, carrying your blocker setting from launch.json). The security state, protection
+// mode and blocker state of a running Harness come from its session-free GET /api/security.
 //
 //   npm run doctor                             human-readable report
+//   npm run doctor -- --unlock                 also look inside the running Harness (asks for your password,
+//                                              not shown; --password-stdin reads it from stdin): loaded models'
+//                                              real memory use, Ollama protections, self-test in that process
+//   npm run doctor -- --state                  print only the security state (setup script)
 //   npm run doctor -- --json                   machine-readable report
 //   npm run doctor -- --live                   also run the live conformance check (scripts/live-check.mjs)
 //                                              against the real backends and summarise it
@@ -21,7 +28,8 @@ process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1'; // the temporary backend below mu
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const { resolveDataDir } = require('../electron/lib/paths.cjs');
-const { findRunningHarness, portRange } = require('../electron/lib/instance.cjs');
+const { findRunningHarness } = require('../electron/lib/instance.cjs');
+const { HarnessClient, passwordSource, readLaunchJson, describeOfflineLock } = await import('./lib/harness-client.mjs');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 
 const args = new Set(process.argv.slice(2));
@@ -30,6 +38,9 @@ const asJson = args.has('--json');
 const live = args.has('--live');
 const onlyModel = args.has('--recommended-model');
 const onlyTextOnly = args.has('--recommended-text-only');
+const onlyState = args.has('--state');
+const unlock = args.has('--unlock');
+const pwStdin = args.has('--password-stdin');
 
 const GB = 1024 ** 3;
 const fmtGB = (b) => `${(b / GB).toFixed(1)} GB`;
@@ -37,9 +48,9 @@ const results = [];
 const add = (status, title, detail = '', fix = '') => results.push({ status, title, detail, fix });
 const isMac = process.platform === 'darwin';
 
-async function getJson(url, timeoutMs = 2500) {
+async function getJson(url, timeoutMs = 2500, { method = 'GET', headers = {}, body } = {}) {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(url, { method, headers: body !== undefined ? { 'content-type': 'application/json', ...headers } : headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) return { ok: false, status: res.status };
     return { ok: true, data: await res.json().catch(() => null) };
   } catch (e) {
@@ -52,20 +63,38 @@ function run(cmd, argv) {
 }
 
 /**
- * Talk to the Harness that owns the data dir if it is running (its measurements are the real ones), else to a
- * throw-away backend. Returns { url, running, close }.
+ * A backend to ask data-free questions: a throw-away one (temporary folder, no password, Ollama auto-start off)
+ * that carries this install's blocker setting, so its self-test answers for the same configuration.
  */
-async function harnessApi(dataDir, running) {
-  if (running) return { url: running.url, running: true, close: async () => {} };
+async function tempApi(launch) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-doctor-'));
   try {
     const { startServer } = await import('../server/index.mjs');
-    const srv = await startServer({ port: 0, dataDir: tmp, openBrowser: false, autodetect: false, logLevel: 'silent' });
-    return { url: srv.url, running: false, close: async () => { await srv.close().catch(() => {}); fs.rmSync(tmp, { recursive: true, force: true }); } };
+    const srv = await startServer({ port: 0, dataDir: tmp, openBrowser: false, autodetect: false, logLevel: 'silent', security: { mode: 'off', apiAuth: false }, offlineLock: launch.offlineLock !== false });
+    return { url: srv.url, headers: {}, temp: true, close: async () => { await srv.close().catch(() => {}); fs.rmSync(tmp, { recursive: true, force: true }); } };
   } catch {
     fs.rmSync(tmp, { recursive: true, force: true });
     return null;
   }
+}
+
+/** The running Harness with a session (only with --unlock: asks for the password). */
+async function runningApi(running) {
+  const client = new HarnessClient({ base: running.url, dataDir, password: passwordSource({ fromStdin: pwStdin }) });
+  try {
+    await client.ensureSession({ reason: 'let doctor look inside the running Harness' });
+    return { url: running.url, headers: client.authHeaders(), temp: false, close: () => client.close() };
+  } catch (e) {
+    await client.close().catch(() => {});
+    return { error: e };
+  }
+}
+
+/** The security state without a session: what the files on disk say. */
+function inferStateFromDisk() {
+  const launch = readLaunchJson(dataDir);
+  if (launch.encryption === 'off') return 'ready';
+  return fs.existsSync(path.join(dataDir, 'vault.json')) ? 'locked' : 'needs_setup';
 }
 
 /** The recommended chat model, its download, and (on ≤ 8 GB) the text-only copy to make from it. */
@@ -90,10 +119,17 @@ function pickRecommended(rec) {
 }
 
 const dataDir = resolveDataDir();
+const launch = readLaunchJson(dataDir);
+
+if (onlyState) {
+  // One word for scripts: needs_setup | locked | migrating | unlocked (running) or not_running:<what the disk says>.
+  const running = await findRunningHarness({ dataDir, timeoutMs: 1500 }).catch(() => null);
+  console.log(running ? (running.state || 'unlocked') : `not_running:${inferStateFromDisk()}`);
+  process.exit(0);
+}
 
 if (onlyModel || onlyTextOnly) {
-  const running = await findRunningHarness({ dataDir, ports: portRange(Number(process.env.HARNESS_PORT) || 4747), timeoutMs: 800 }).catch(() => null);
-  const api = await harnessApi(dataDir, running);
+  const api = await tempApi(launch);
   const rec = api ? pickRecommended((await getJson(`${api.url}/api/models/recommended`, 15000)).data) : null;
   await api?.close();
   if (!rec?.model) { console.error('Could not determine a recommended model.'); process.exit(1); }
@@ -135,12 +171,61 @@ try {
 } catch { /* reported below */ }
 add(writable ? 'ok' : 'fail', `Data folder: ${dataDir}`, writable ? '' : 'Not writable.', `Check permissions: ls -ld "${dataDir}"`);
 
-const running = writable ? await findRunningHarness({ dataDir, ports: portRange(Number(process.env.HARNESS_PORT) || 4747), timeoutMs: 800 }) : null;
-if (running) add('info', `Harness ${running.version} is running at ${running.url}`, `pid ${running.pid}`);
-const api = await harnessApi(dataDir, running);
-const sys = api ? (await getJson(`${api.url}/api/system`, 15000)).data : null;
-const recRaw = api ? (await getJson(`${api.url}/api/models/recommended`, 15000)).data : null;
-await api?.close();
+// ----------------------------------------------------------------------------- security and the blocker
+const running = writable ? await findRunningHarness({ dataDir, timeoutMs: 1500 }) : null;
+const runningSec = running ? (await getJson(`${running.url}/api/security`, 5000)).data : null;
+const modeNames = { password: 'password (you type it to open Harness)', keychain: 'Keychain (opens without asking — weaker)', off: 'OFF — your data is stored unencrypted' };
+if (running) {
+  const st = runningSec?.state || running.state || 'unknown';
+  const stText = { needs_setup: 'waiting for you to choose a password', locked: 'locked (your data is closed)', migrating: `encrypting/decrypting your data${runningSec?.migration ? ` (${runningSec.migration.done}/${runningSec.migration.total})` : ''}`, unlocked: 'unlocked' }[st] || st;
+  add('info', `Harness ${running.version} is running at ${running.url} — ${stText}`, `pid ${running.pid ?? '?'}${runningSec?.transport ? `, ${runningSec.transport}` : ''}`);
+  if (runningSec?.unlock?.retryAfterMs > 0) add('warn', `Too many wrong passwords: the next attempt is accepted in ${Math.ceil(runningSec.unlock.retryAfterMs / 1000)} s`);
+} else {
+  const st = inferStateFromDisk();
+  add('info', `Harness is not running${st === 'needs_setup' ? ' — no password chosen yet (Harness asks for one when you open it)' : ''}`);
+}
+const mode = runningSec?.mode || launch.encryption;
+add(mode === 'off' ? 'warn' : mode === 'keychain' ? 'info' : 'ok', `Data protection: ${modeNames[mode] || mode}`,
+  mode === 'password' ? 'Only your typed password (or the recovery key) opens the data; while Harness is locked other programs cannot read it.' : mode === 'keychain' ? 'Any program running as you can ask the Keychain for the key.' : 'Anyone who can read your files can read your chats.',
+  mode === 'off' ? 'Settings → Security → protection: password' : '');
+if (runningSec?.plainDataFound) add('warn', 'Unencrypted data from Harness 0.1 is waiting to be encrypted', 'Open Harness and choose a password; it encrypts the existing chats first.');
+try {
+  const m = fs.statSync(dataDir).mode & 0o777;
+  if (m & 0o077) add('warn', `The data folder is readable by other accounts (mode ${m.toString(8)})`, 'Harness 0.2 sets it to 700 when it starts.', `chmod 700 "${dataDir}"`);
+} catch { /* reported above */ }
+
+const offline = runningSec?.offlineLock || null;
+let session = null;
+if (unlock && running) {
+  session = await runningApi(running);
+  if (session.error) { add('warn', `Could not look inside the running Harness: ${session.error.message}`); session = null; }
+} else if (unlock) add('info', '--unlock: Harness is not running, so there is nothing to unlock');
+const tmpApi = await tempApi(launch);
+const api = session || tmpApi;
+const call = (p, o = {}) => (api ? getJson(`${api.url}${p}`, o.timeoutMs || 15000, { ...o, headers: { ...(api.headers || {}), ...(o.headers || {}) } }) : Promise.resolve({ ok: false }));
+
+// The blocker: its setting, how it is enforced, and the backend's own self-test — in one line.
+const selfTest = await call('/api/network/test', { method: 'POST', body: {}, timeoutMs: 30000 });
+const where = session ? 'inside the running Harness' : 'in a temporary backend with your setting';
+if (!offline && !selfTest.ok) {
+  add('info', `Internet blocker: ${launch.offlineLock === false ? 'off' : 'on'} (launch.json); this backend has no self-test`);
+} else {
+  const o = offline || selfTest.data?.offlineLock || { enabled: launch.offlineLock !== false, blocked: launch.offlineLock !== false, osEnforced: false, osScope: 'none', externalOllama: false };
+  const results = selfTest.data?.results || [];
+  const reachable = results.filter((r) => r.result === 'reachable');
+  const verdict = !o.enabled ? 'OFF — Harness and the Ollama it starts can reach the internet'
+    : !o.blocked ? `ALLOWED${o.allowedUntil ? ` until ${new Date(o.allowedUntil).toLocaleTimeString()}` : ''} (for a download) — it blocks again by itself`
+      : reachable.length ? `ON, but the self-test reached ${reachable.map((r) => r.target).join(', ')} — something CAN leave this Mac`
+        : `nothing Harness sends can leave this Mac${o.externalOllama ? ' — but the Ollama in use was not started by Harness and is not confined' : ''}`;
+  add(!o.enabled || reachable.length || o.externalOllama ? 'warn' : 'ok', `Internet blocker: ${verdict}`,
+    [`${describeOfflineLock(o)}${offline ? '' : ' (setting from launch.json; Harness is not running)'}`,
+      selfTest.ok ? `self-test ${where}: ${results.map((r) => `${r.layer} ${r.target} → ${r.result}`).join('; ') || 'no probes'}` : 'self-test: not available',
+      o.enabled && offline && !o.osEnforced ? 'Only Harness\'s own code blocks; no macOS sandbox is in force.' : ''].filter(Boolean).join('\n      '),
+    o.externalOllama ? 'Quit the other Ollama (menu bar → Quit Ollama; brew services stop ollama) so Harness starts its own inside the sandbox.' : '');
+}
+
+const sys = (await call('/api/system')).data;
+const recRaw = (await call('/api/models/recommended')).data;
 if (sys?.machine?.totalMemBytes && sys.machine.totalMemBytes !== totalMem) {
   // HARNESS_TOTALMEM_BYTES (simulated RAM): follow what the backend plans with.
   totalMem = sys.machine.totalMemBytes;
@@ -159,8 +244,12 @@ if (!ollama.installed && !ollamaUp) {
   if (!ollamaUp) add('info', 'Ollama is not running', 'Fine: Harness starts it itself, with its memory protections, when it launches.');
 }
 
-// Memory protections only apply to an Ollama that Harness started.
-const prot = ollama.protections;
+// Memory protections only apply to an Ollama that Harness started. Without a session to the running Harness
+// the temporary backend cannot know who started Ollama: the running Harness's externalOllama flag answers it.
+let prot = ollama.protections;
+if (running && !session) {
+  prot = offline ? { inEffect: ollamaUp && !offline.externalOllama, external: !!offline.externalOllama, message: offline.externalOllama ? 'The Ollama in use was not started by Harness, so its memory protections and the macOS sandbox do not apply.' : ollamaUp ? 'Ollama was started by the running Harness, with its memory protections.' : 'The running Harness starts Ollama itself when needed.' } : null;
+}
 const menuBarApp = isMac && run('pgrep', ['-x', 'Ollama']) !== null;
 const brewService = isMac && run('launchctl', ['list', 'homebrew.mxcl.ollama']) !== null;
 if (prot) {
@@ -180,7 +269,8 @@ if (ollamaUp && ollamaProvider?.baseUrl) {
   tags = t.ok ? (t.data?.models || []).map((m) => ({ name: m.name, size: m.size })) : [];
   add(tags.length ? 'ok' : 'warn', `Installed models: ${tags.length ? tags.map((m) => `${m.name} (${fmtGB(m.size || 0)})`).join(', ') : 'none'}`);
 }
-for (const m of sys?.loadedModels || []) {
+if (running && !session && ollamaUp) add('info', 'Loaded models\' real memory use: run `npm run doctor -- --unlock` to see it (needs your password)');
+for (const m of session ? sys?.loadedModels || [] : []) {
   const bytes = m.residentBytes ?? null;
   const basis = m.residentBasis === 'measured' ? 'measured' : m.residentBasis ? `estimated (${m.residentBasis})` : 'unknown';
   add('info', `Loaded now: ${m.model} — ${bytes ? fmtGB(bytes) : '?'} in memory (${basis}), context ${m.contextLength ?? '?'}`);
@@ -205,6 +295,9 @@ if (!rec?.model) {
     [rec.explanation, rec.sizeBytes ? `download ~${fmtGB(rec.sizeBytes)}` : ''].filter(Boolean).join(' — '),
     installed ? '' : 'npm run get-model   (or use the app\'s Models screen)');
 }
+
+await tmpApi?.close();
+await session?.close?.();
 
 // Image generation & other local servers (all optional)
 const probes = [

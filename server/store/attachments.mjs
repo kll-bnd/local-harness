@@ -2,7 +2,7 @@
 // document chunks in a shared hybrid index (index/documents.json) for per-chat document RAG.
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { readJson, writeJsonAtomic, writeFileAtomic, ensureDir, removeFile } from '../lib/fsx.mjs';
+import { readJson, writeJsonAtomic, writeFileAtomic, ensureDir, removeFile, readFileData, readTextData, createDataReadStream, dataFileSize } from '../lib/fsx.mjs';
 import { newId, sha1, assertSafeId, isSafeId } from '../lib/ids.mjs';
 import { Worker } from 'node:worker_threads';
 import { nowIso } from '../lib/util.mjs';
@@ -148,16 +148,23 @@ export class AttachmentStore {
     if (a && a.chatId !== chatId) { a.chatId = chatId; await this.saveIndex(); }
   }
 
+  /** Stream the original bytes (decrypted chunk by chunk): { stream, size }. */
+  async openOriginal(id) {
+    this.get(id);
+    const file = path.join(this.folder(id), 'original');
+    return { size: await dataFileSize(file), stream: createDataReadStream(file) };
+  }
+
   async readOriginal(id) {
     this.get(id);
-    return fs.readFile(path.join(this.folder(id), 'original'));
+    return readFileData(path.join(this.folder(id), 'original'));
   }
 
   async readText(id) {
     if (this._textCache.has(id)) return this._textCache.get(id);
     const a = this.get(id);
     if (a.kind !== 'text') return null;
-    const t = await fs.readFile(path.join(this.folder(id), 'text.txt'), 'utf8').catch(() => null);
+    const t = await readTextData(path.join(this.folder(id), 'text.txt')).catch(() => null);
     if (t !== null) this._cacheText(id, t);
     return t;
   }

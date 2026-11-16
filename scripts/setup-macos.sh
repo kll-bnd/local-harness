@@ -143,28 +143,86 @@ if [ -n "$OLLAMA" ]; then
 fi
 
 # ------------------------------------------------------------------------------------------------
-step "5. A chat model sized for this Mac"
+step "5. Your Harness password"
+LAUNCHER_PID=""
+stop_launcher() {
+  if [ -n "$LAUNCHER_PID" ]; then
+    kill -TERM "$LAUNCHER_PID" 2>/dev/null || true
+    wait "$LAUNCHER_PID" 2>/dev/null || true
+    LAUNCHER_PID=""
+  fi
+}
+trap stop_launcher EXIT
+STATE="$(node scripts/doctor.mjs --state 2>/dev/null || echo unknown)"
+case "$STATE" in
+  needs_setup|not_running:needs_setup)
+    say "  Harness keeps your chats encrypted. You open it with a password that only you know; Harness"
+    say "  never stores it. This script does not choose or type it for you: Harness asks for it in its own"
+    say "  window, and then shows a ${B}recovery key${N} once. Write the key down or keep it in a password manager —"
+    say "  not in a chat, a note synced in plain text, or a screenshot. Without the password AND the recovery"
+    say "  key nobody can open the data, not even you."
+    if [ ! -t 0 ]; then
+      note "Skipped (not interactive): open Harness (Harness.command or npm start -- --open) to choose the password."
+    elif ask "Open Harness in your browser now to choose your password?" y; then
+      if [ "$STATE" = "needs_setup" ]; then
+        node scripts/launch.mjs >/dev/null 2>&1 || true
+      else
+        node scripts/launch.mjs >"${TMPDIR:-/tmp}/harness-setup-launch.log" 2>&1 &
+        LAUNCHER_PID=$!
+      fi
+      say "  A browser window opens with Harness. Choose your password there and save the recovery key."
+      while :; do
+        read -r -p "  Press Return here when you have done that (or type s to skip): " ans || ans="s"
+        case "$ans" in [Ss]*) break ;; esac
+        STATE="$(node scripts/doctor.mjs --state 2>/dev/null || echo unknown)"
+        case "$STATE" in
+          needs_setup|not_running:needs_setup) warn "Harness still has no password. Finish the setup in the browser window." ;;
+          *) ok "Your Harness password is set."; break ;;
+        esac
+      done
+    fi
+    ;;
+  migrating)
+    ok "Harness is encrypting your existing data (from Harness 0.1); it continues while it runs." ;;
+  unknown)
+    warn "Could not ask Harness about its state (see: npm run doctor)." ;;
+  *)
+    ok "A Harness password is set (state: $STATE)." ;;
+esac
+
+# ------------------------------------------------------------------------------------------------
+step "6. A chat model sized for this Mac"
 if [ -z "$OLLAMA" ]; then
   warn "Skipped: needs Ollama."
 else
   say "  Harness asks its own backend which file fits this Mac's memory, downloads it through Harness"
-  say "  (which starts Ollama itself, with its protections, and stops it again afterwards) and — on an 8 GB"
-  say "  Mac — makes a text-only copy that needs ~1 GB less memory. You can also do this later in the app"
-  say "  (Models screen) or with:  npm run get-model"
-  GET_MODEL_ARGS=""
-  [ "$ASSUME_YES" = 1 ] && GET_MODEL_ARGS="--yes"
-  if [ "$ASSUME_YES" = 1 ] || [ -t 0 ]; then
-    # shellcheck disable=SC2086
-    if ! node scripts/get-model.mjs $GET_MODEL_ARGS; then
-      warn "The model step did not finish — run it again later with: npm run get-model"
-    fi
-  else
-    note "Skipped (not interactive). Run: npm run get-model"
-  fi
+  say "  (which starts Ollama itself, with its protections) and — on an 8 GB Mac — makes a text-only copy"
+  say "  that needs ~1 GB less memory. You can also do this later in the app (Models screen) or with:"
+  say "  npm run get-model"
+  say "  Harness blocks internet access by default. The download asks for your Harness password to allow it"
+  say "  for this download only, blocks it again right after, and shows the blocker's state at the end."
+  STATE="$(node scripts/doctor.mjs --state 2>/dev/null || echo unknown)"
+  case "$STATE" in
+    needs_setup|not_running:needs_setup)
+      note "Skipped: choose your Harness password first (step 5), then run: npm run get-model" ;;
+    *)
+      GET_MODEL_ARGS=""
+      [ "$ASSUME_YES" = 1 ] && GET_MODEL_ARGS="--yes"
+      if [ -t 0 ]; then
+        # shellcheck disable=SC2086
+        if ! node scripts/get-model.mjs $GET_MODEL_ARGS; then
+          warn "The model step did not finish — run it again later with: npm run get-model"
+        fi
+      else
+        note "Skipped (not interactive: it needs your Harness password). Run: npm run get-model"
+      fi
+      ;;
+  esac
 fi
+stop_launcher
 
 # ------------------------------------------------------------------------------------------------
-step "6. Image generation with Draw Things (optional)"
+step "7. Image generation with Draw Things (optional)"
 if curl -fsS -m 2 http://127.0.0.1:7860/sdapi/v1/options >/dev/null 2>&1; then
   ok "An image server is answering on port 7860 (Draw Things or AUTOMATIC1111) — Harness will find it."
 else
@@ -179,7 +237,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------------------------
-step "7. Desktop app (optional — the browser version needs none of this)"
+step "8. Desktop app (optional — the browser version needs none of this)"
 if [ -f node_modules/electron/path.txt ]; then
   ok "Desktop app tooling already installed (node_modules)"
 elif ask "Install the desktop app tooling with npm (Electron + electron-builder, a few hundred MB)?" y; then
@@ -211,5 +269,8 @@ say "Start Harness in one of these ways:"
 [ -d /Applications/Harness.app ] && say "  • open Harness from Applications (or Spotlight)"
 say "  • double-click Harness.command in this folder (opens in your browser)"
 say "  • or in Terminal:  cd \"$REPO\" && npm start -- --open"
+say ""
+say "Harness asks for your password when it opens and locks itself after 15 idle minutes, when the Mac"
+say "sleeps (Mac app) or when you choose Lock Harness (⌃⌘L). Internet access stays blocked unless you allow it."
 say ""
 say "Check everything at any time with:  npm run doctor"

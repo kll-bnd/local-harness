@@ -122,7 +122,7 @@ export function registerImageRoutes(r, app) {
   r.get('/api/images/:id/file', async ({ params, res, query }) => {
     const rec = app.gallery.get(params.id);
     const buf = await app.gallery.read(rec.id);
-    const headers = { 'content-type': rec.mime, 'content-length': buf.length, 'cache-control': 'private, max-age=31536000, immutable', 'x-content-type-options': 'nosniff' };
+    const headers = { 'content-type': rec.mime, 'content-length': buf.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' };
     if (qBool(query.get('download'))) headers['content-disposition'] = `attachment; filename="${rec.id}.${rec.file.split('.').pop()}"`;
     res.writeHead(200, headers);
     res.end(buf);

@@ -82,20 +82,22 @@ export function registerMemoryRoutes(r, app) {
 
   r.get('/api/attachments/:id/content', async ({ params, res }) => {
     const a = app.attachments.get(params.id);
-    const buf = await app.attachments.readOriginal(a.id);
+    const { size, stream } = await app.attachments.openOriginal(a.id);
     // Only raster images are shown inline; everything else (HTML, SVG, PDF, text, …) is a sandboxed download,
     // so an uploaded file can never run as active content on the app's own origin.
     const inlineImage = a.kind === 'image' && ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(a.mime);
     const fname = encodeURIComponent(a.name).replace(/'/g, '%27');
     res.writeHead(200, {
       'content-type': inlineImage ? a.mime : 'application/octet-stream',
-      'content-length': buf.length,
-      'cache-control': 'private, max-age=3600',
+      'content-length': size,
+      'cache-control': 'no-store',
       'content-disposition': `${inlineImage ? 'inline' : 'attachment'}; filename*=UTF-8''${fname}`,
       'x-content-type-options': 'nosniff',
       'content-security-policy': inlineImage ? "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox" : "default-src 'none'; sandbox",
     });
-    res.end(buf);
+    stream.on('error', () => res.destroy());
+    res.on('close', () => stream.destroy());
+    stream.pipe(res);
   });
 
   r.get('/api/attachments/:id/text', async ({ params, query }) => {

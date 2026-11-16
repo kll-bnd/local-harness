@@ -5,24 +5,37 @@
 // It uses the Harness that is already running for your data folder, or starts one just for this (and stops it
 // again). Ollama is therefore always started BY HARNESS, with its memory protections — never directly.
 //
-//   npm run get-model                       ask before each step
-//   npm run get-model -- --yes              accept the defaults (download, text-only copy; keep the original)
+// Harness 0.2 keeps your data locked behind your Harness password and blocks internet access by default, so:
+//   * it asks for your Harness password (on the terminal, not shown; or from stdin with --password-stdin);
+//   * the download needs internet: it asks before allowing it for a limited window (your password confirms),
+//     blocks it again as soon as the download is done, and prints the blocker's state at the end;
+//   * on a fresh install (no password chosen yet) it stops and tells you to open Harness first.
+//
+//   npm run get-model                        ask before each step
+//   npm run get-model -- --yes               accept the defaults (allow internet for the download, text-only copy)
 //   npm run get-model -- --yes --delete-original
-//   npm run get-model -- --model <tag>      a different file, e.g. the largest realistic one on 8 GB
+//   npm run get-model -- --model <tag>       a different file, e.g. the largest realistic one on 8 GB
+//   npm run get-model -- --minutes 30        length of the internet window (default 15; a running download
+//                                            keeps it open until it ends)
+//   … --password-stdin < file                read the Harness password from stdin (automation; implies no questions
+//                                            on stdin, so combine with --yes)
 import readline from 'node:readline/promises';
 import { createRequire } from 'node:module';
+import { HarnessClient, passwordSource, reachHarness, describeOfflineLock } from './lib/harness-client.mjs';
 
 const require = createRequire(import.meta.url);
 const { resolveDataDir } = require('../electron/lib/paths.cjs');
-const { findRunningHarness, portRange } = require('../electron/lib/instance.cjs');
 
 const argv = process.argv.slice(2);
 const yes = argv.includes('--yes') || argv.includes('-y');
+const pwStdin = argv.includes('--password-stdin');
 const deleteOriginal = argv.includes('--delete-original');
-const modelArg = (() => { const i = argv.indexOf('--model'); return i >= 0 ? argv[i + 1] : null; })();
+const opt = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; };
+const modelArg = opt('--model');
+const minutes = Math.min(120, Math.max(1, Number(opt('--minutes')) || 15));
 const GB = 1024 ** 3;
 const fmtGB = (b) => `${(b / GB).toFixed(1)} GB`;
-const interactive = process.stdin.isTTY && !yes;
+const interactive = process.stdin.isTTY && !yes && !pwStdin;
 
 async function ask(q, def = true) {
   if (yes) { console.log(`${q} → ${def ? 'yes' : 'no'} (--yes)`); return def; }
@@ -36,31 +49,53 @@ async function ask(q, def = true) {
 // ------------------------------------------------------------------------------------- reach Harness
 const dataDir = resolveDataDir();
 const port = Number(process.env.HARNESS_PORT) || 4747;
-let base;
-let srv = null;
-const running = await findRunningHarness({ dataDir, ports: portRange(port), timeoutMs: 800 });
-if (running) {
-  base = running.url;
-  console.log(`Using the Harness that is running at ${base}.`);
-} else {
-  const { startServer } = await import('../server/index.mjs');
+let h;
+try {
+  h = await reachHarness({ dataDir, port, log: (m) => console.log(m) });
+} catch (e) {
+  console.error(`Harness could not start: ${e.message}\nRun: npm run doctor`);
+  process.exit(1);
+}
+if (h.running) console.log(`Using the Harness that is running at ${h.base}.`);
+const client = new HarnessClient({ base: h.base, dataDir, password: passwordSource({ fromStdin: pwStdin }) });
+let allowedByUs = false;
+let closing = false;
+
+async function done(code) {
+  if (closing) return;
+  closing = true;
   try {
-    srv = await startServer({ port, dataDir, openBrowser: false, logLevel: 'warn' });
-    base = srv.url;
-    console.log(`Started Harness for this step at ${base} (stopped again at the end).`);
-    await srv.app.startup; // lets Harness start Ollama itself, with its protections
-  } catch (e) {
-    if (e?.code === 'HARNESS_ALREADY_RUNNING' && e.url) { base = e.url; console.log(`Using the Harness that is running at ${base}.`); } else throw e;
+    if (allowedByUs) {
+      const r = await client.request('POST', '/api/network/block', {}).catch(() => null);
+      if (!r?.ok) console.error('! Could not block internet access again — it blocks itself when the window ends. Check with: npm run doctor');
+    }
+    await printBlockerState();
+  } finally {
+    await client.close().catch(() => {});
+    await h.close();
+    process.exit(code);
   }
 }
-const done = async (code) => { if (srv) await srv.close().catch(() => {}); process.exit(code); };
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => done(130));
 
-async function api(method, p, body) {
-  const res = await fetch(base + p, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
-  const data = await res.json().catch(() => null);
-  return { status: res.status, ok: res.ok, data };
+async function printBlockerState() {
+  if (!client.authenticated && client.via !== 'legacy') return;
+  const sec = await client.security().catch(() => null);
+  if (sec?.offlineLock) console.log(`\nInternet access in Harness now: ${describeOfflineLock(sec.offlineLock)}`);
 }
+
+const api = (method, p, body) => client.request(method, p, body).then((r) => ({ status: r.status, ok: r.ok, data: r.data }));
+
+try {
+  await client.ensureSession({ reason: 'download a model' });
+} catch (e) {
+  console.error(`\n${e.message}`);
+  await client.close().catch(() => {});
+  await h.close();
+  process.exit(e.code === 'needs_setup' ? 3 : 2);
+}
+// Harness started here and just unlocked: give it a moment to start Ollama itself (with its protections).
+if (h.srv?.app?.startup) await h.srv.app.startup.catch(() => {});
 
 // ------------------------------------------------------------------------------------------- Ollama
 let sys = (await api('GET', '/api/system')).data;
@@ -113,11 +148,15 @@ if (copyInstalled) {
 }
 if (fileInstalled) {
   console.log(`\n✓ ${tag} is already downloaded.`);
-} else if (await ask(`\nDownload ${tag} now?`, true)) {
-  const ok = await pull(tag);
-  if (!ok) await done(1);
 } else {
-  await done(0);
+  if (!(await ask(`\nDownload ${tag} now?`, true))) await done(0);
+  if (!(await allowInternet())) await done(0);
+  const ok = await pull(tag);
+  if (allowedByUs) {
+    const r = await api('POST', '/api/network/block', {});
+    if (r.ok) { allowedByUs = false; console.log('✓ Internet access is blocked again.'); }
+  }
+  if (!ok) await done(1);
 }
 
 // ------------------------------------------------------------------------------------- text-only copy
@@ -137,12 +176,41 @@ if (textOnly) {
 console.log('\nDone. Pick the model in Harness (it is chosen automatically when it is the best installed fit).');
 await done(0);
 
+// ------------------------------------------------------------------------------------ internet window
+/** Make sure the download may reach the internet: ask, then allow for `minutes` with the password. */
+async function allowInternet() {
+  const net = await api('GET', '/api/network');
+  const o = net.data?.offlineLock;
+  if (!net.ok || !o) return true; // a Harness without the blocker
+  if (!o.blocked) { console.log(`Internet access in Harness: ${describeOfflineLock(o)}`); return true; }
+  console.log(`\nInternet access is blocked in Harness (the default: chat never needs it). The download needs it, so
+Harness can allow it for ${minutes} minutes — it blocks again by itself when that time is up (a download still
+running keeps it open until it ends), and this tool blocks it again as soon as the download is done.`);
+  if (!(await ask(`Allow internet access for this download (needs your Harness password)?`, true))) {
+    console.log('Not downloading. You can also download from the app\'s Models screen ("Allow internet for 15 minutes").');
+    return false;
+  }
+  const r = await client.withPassword((pw) => client.request('POST', '/api/network/allow', { minutes, password: pw }), 'Harness password (to allow internet for the download): ');
+  if (!r.ok) {
+    console.error(`Harness did not allow internet access: ${r.data?.error?.message || r.status}`);
+    return false;
+  }
+  allowedByUs = true;
+  if (r.data?.restartRequired) {
+    console.error('Harness needs a restart to allow internet access (its whole backend runs in the macOS sandbox). Allow it from the app instead.');
+    return false;
+  }
+  console.log(`✓ Internet access allowed: ${describeOfflineLock(r.data?.offlineLock)}`);
+  return true;
+}
+
 // ---------------------------------------------------------------------------------------------- pull
 async function pull(model) {
-  const res = await fetch(`${base}/api/models/pull`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, providerId: 'ollama' }) });
+  const res = await fetch(`${h.base}/api/models/pull`, { method: 'POST', headers: { 'content-type': 'application/json', ...client.authHeaders() }, body: JSON.stringify({ model, providerId: 'ollama' }) });
   if (!res.ok || !(res.headers.get('content-type') || '').includes('text/event-stream')) {
     const j = await res.json().catch(() => null);
-    console.error(`Download failed: ${j?.error?.message || res.status}`);
+    const code = j?.error?.code;
+    console.error(`Download failed: ${j?.error?.message || res.status}${code === 'offline_lock' ? '\n(Internet access is blocked in Harness. Allow it in the app or run this again and answer yes.)' : ''}`);
     return false;
   }
   const dec = new TextDecoder();
@@ -173,4 +241,3 @@ async function pull(model) {
   if (result) console.log(`✓ Downloaded ${model}`);
   return result === true;
 }
-

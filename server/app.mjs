@@ -28,12 +28,8 @@ import { Gallery } from './image/gallery.mjs';
 import { RamLease } from './image/ram-lease.mjs';
 import { log } from './lib/log.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-export const ROOT_DIR = path.resolve(here, '..');
-
-export const VERSION = (() => {
-  try { return JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'package.json'), 'utf8')).version; } catch { return '0.0.0'; }
-})();
+export { ROOT_DIR, VERSION } from './version.mjs';
+import { ROOT_DIR, VERSION } from './version.mjs';
 
 export function defaultDataDir() {
   if (process.env.HARNESS_DATA_DIR) return path.resolve(process.env.HARNESS_DATA_DIR);
@@ -61,7 +57,7 @@ export function detectSystem(overrides = {}) {
  * @param {object} [o.system] overrides for platform/arch/totalMem (tests)
  * @param {boolean} [o.autodetect] probe default ports for llama.cpp/LM Studio/Draw Things/ComfyUI
  */
-export async function createApp({ dataDir, system: sysOverrides = {}, autodetect = true, publicDir } = {}) {
+export async function createApp({ dataDir, system: sysOverrides = {}, autodetect = true, publicDir, ollamaProcess = null, network = null, core = null } = {}) {
   dataDir = path.resolve(dataDir || defaultDataDir());
   await ensureDir(dataDir);
   await ensureDir(path.join(dataDir, 'index'));
@@ -74,7 +70,11 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
     system: detectSystem(sysOverrides),
     bus,
     foreground: 0,
-    url: null,
+    url: core?.url || null,
+    port: core?.port ?? null,
+    core,
+    network,
+    transport: core?.transport || 'listener',
   };
   app.settings = await new SettingsStore(dataDir, bus).load();
   app.presets = await new PresetStore(dataDir, bus).load();
@@ -82,7 +82,8 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.measurements = await new MeasurementStore(dataDir, bus).load();
   // What the machine really experiences (runner RSS, swap/compressor growth) — macOS only; tests inject a fake.
   app.memoryProbe = sysOverrides && 'memoryProbe' in sysOverrides ? sysOverrides.memoryProbe : createMemoryProbe({ platform: app.system.platform });
-  app.ollamaProcess = new OllamaProcess({ getSettings: () => app.settings.get(), getProvider: () => app.registry.ollama() || { baseUrl: 'http://127.0.0.1:11434', status: async () => ({ ok: false }) }, bus, totalMem: app.system.totalMem });
+  // Shared with the core when given (it outlives lock/unlock); otherwise this app owns it.
+  app.ollamaProcess = ollamaProcess || new OllamaProcess({ getSettings: () => app.settings.get(), getProvider: () => app.registry.ollama() || { baseUrl: 'http://127.0.0.1:11434', status: async () => ({ ok: false }) }, bus, totalMem: app.system.totalMem });
   app.registry = new ProviderRegistry({ settings: app.settings, bus, system: app.system, autodetect, ollamaProcess: app.ollamaProcess });
   app.registry.measurements = app.measurements;
   app.embedder = new Embedder({ registry: app.registry, settings: app.settings, system: app.system });
@@ -102,12 +103,28 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.background = new BackgroundQueue(app);
   app.ram = new RamLease(app);
 
-  app.close = async () => {
+  /**
+   * Close the stores. `lock: true` (Harness is locking): abort what runs (partial replies kept), unload the models
+   * Harness loaded into Ollama, end event streams — but leave a managed Ollama running. Otherwise (shutdown) a
+   * managed Ollama is stopped when settings say so.
+   */
+  app.close = async ({ lock = false, stopOllama = !lock } = {}) => {
+    app.closing = true;
     app.background.stop();
     for (const g of app.engine.active.values()) g.controller.abort();
+    for (const j of app.images.jobs?.values?.() || []) if (!['done', 'error', 'aborted'].includes(j.status)) j._controller?.abort();
+    // give aborted turns a moment to store their partial replies
+    const t0 = Date.now();
+    while ((app.engine.active.size || app.images.active) && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 25));
+    if (lock) {
+      const ollama = app.registry.ollama();
+      const loaded = [...app.engine.loadedCtx.keys()].filter((k) => k.startsWith(`${ollama?.id}/`)).map((k) => k.slice(ollama.id.length + 1));
+      await Promise.allSettled(loaded.map((m) => Promise.race([ollama.unload(m), new Promise((r) => setTimeout(r, 5000))])));
+    }
+    app.bus.publish('server.closing', { reason: lock ? 'locked' : 'shutdown' });
     await app.chats.flush();
     await Promise.allSettled([app.calibrator.save(), app.measurements.save(), app.memories.index.save(), app.recall.index.save(), app.attachments.docIndex.save()]);
-    if (app.settings.get().ollama?.stopOnExit !== false) await app.ollamaProcess.stop().catch(() => {});
+    if (stopOllama && !ollamaProcess && app.settings.get().ollama?.stopOnExit !== false) await app.ollamaProcess.stop().catch(() => {});
     await flushWrites();
   };
 

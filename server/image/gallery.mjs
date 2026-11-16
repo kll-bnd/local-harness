@@ -1,7 +1,7 @@
 // Generated-image gallery: files under images/, metadata in images/index.json.
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { readJson, writeJsonAtomic, writeFileAtomic, ensureDir, removeFile } from '../lib/fsx.mjs';
+import { readJson, writeJsonAtomic, writeFileAtomic, ensureDir, removeFile, readFileData } from '../lib/fsx.mjs';
 import { newId, isSafeId } from '../lib/ids.mjs';
 import { nowIso } from '../lib/util.mjs';
 import { notFound } from '../lib/errors.mjs';
@@ -52,7 +52,7 @@ export class Gallery {
 
   tryGet(id) { return this.items.get(id) || null; }
 
-  async read(id) { return fs.readFile(this.filePath(this.get(id))); }
+  async read(id) { return readFileData(this.filePath(this.get(id))); }
 
   list({ chatId, source, limit = 100, offset = 0, q } = {}) {
     let arr = [...this.items.values()];

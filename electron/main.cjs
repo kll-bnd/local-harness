@@ -6,7 +6,7 @@
 // closes the backend cleanly on quit. All decision logic lives in ./lib/*.cjs (unit-tested without a
 // display in electron/test/); this file is wiring only.
 const {
-  app, BrowserWindow, Menu, shell, dialog, ipcMain, session, nativeTheme, powerSaveBlocker, globalShortcut, screen, clipboard,
+  app, BrowserWindow, Menu, shell, dialog, ipcMain, session, nativeTheme, powerSaveBlocker, powerMonitor, globalShortcut, screen, clipboard,
 } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -94,6 +94,13 @@ function openExternal(url) {
   return true;
 }
 
+/** Deliver a menu action to the page without bringing the window forward (e.g. lock on sleep). */
+function notifyPage(action) {
+  if (!MENU_ACTIONS.includes(action) || !win || win.isDestroyed()) return;
+  const wc = win.webContents;
+  if (!wc.isLoading()) wc.send('harness:menu-action', action);
+}
+
 function sendToPage(action) {
   if (!MENU_ACTIONS.includes(action)) return;
   const w = showWindow();
@@ -122,6 +129,57 @@ function applyTheme(settings) {
   nativeTheme.themeSource = t === 'light' || t === 'dark' ? t : 'system';
 }
 
+// ------------------------------------------------------------------------------- sessions and locking
+/**
+ * Give our own window an API session (docs/API.md §10.5) without a prompt when that is possible:
+ *   in-process backend → startServer().auth.createSession() (throws while locked in password mode: the page then
+ *   shows Harness's lock screen and the unlock there sets the cookie);
+ *   a backend in another process (attached) → a one-time launch URL from the per-install api-token
+ *   (keychain/off modes only; in password mode the page's lock screen does it).
+ * The cookie is set WITHOUT an expiry so Chromium keeps it in memory only, never in its on-disk cookie store.
+ * @returns {Promise<string>} the URL to load
+ */
+async function windowSessionUrl() {
+  if (server?.auth?.createSession) {
+    let c = null;
+    try { c = server.auth.createSession(); } catch { return appUrl; }
+    try {
+      await session.defaultSession.cookies.set({ url: appUrl, name: c.name, value: c.value, httpOnly: true, sameSite: 'strict', path: '/' });
+    } catch (e) { console.warn(`[desktop] could not give the window a session: ${e.message}`); }
+    return appUrl;
+  }
+  if (attachedUrl) {
+    let token = null;
+    try { token = fs.readFileSync(path.join(dataDir, 'api-token'), 'utf8').trim(); } catch { return appUrl; }
+    try {
+      const res = await fetch(`${appUrl}/api/auth/launch-code`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(5000) });
+      const j = await res.json().catch(() => null);
+      if (res.ok && typeof j?.url === 'string' && security.isAppUrl(j.url, appOrigin)) return j.url;
+    } catch { /* fall back to the lock screen */ }
+  }
+  return appUrl;
+}
+
+/**
+ * Lock Harness now (system sleep, screen lock). In-process: a short-lived session from startServer().auth calls
+ * POST /api/security/lock (locking drops every session, this one included). The page is told as well, so a
+ * backend in another process (attached) is locked through the page's own session.
+ */
+async function lockHarness(reason) {
+  notifyPage('lock');
+  if (!server?.auth?.createSession) return false;
+  let c = null;
+  try { c = server.auth.createSession(); } catch { return false; } // already locked (password mode)
+  try {
+    const res = await fetch(`${appUrl}/api/security/lock`, { method: 'POST', headers: { cookie: `${c.name}=${c.value}`, 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(15000) });
+    console.log(`[desktop] locked Harness (${reason}): HTTP ${res.status}`);
+    return res.ok;
+  } catch (e) {
+    console.warn(`[desktop] could not lock Harness (${reason}): ${e.message}`);
+    return false;
+  }
+}
+
 function scheduleSaveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveStateNow, 500);
@@ -134,7 +192,7 @@ function saveStateNow() {
 }
 
 // ----------------------------------------------------------------------------------------------- window
-function createWindow() {
+function createWindow(startUrl = appUrl) {
   const st = windowState.fitToDisplays(windowState.readState(paths.windowState), screen.getAllDisplays(), screen.getPrimaryDisplay());
   const devIcon = path.join(ROOT, 'build', 'icon.png');
   const init = { appVersion: app.getVersion(), actions: MENU_ACTIONS, fullscreen: false };
@@ -226,7 +284,7 @@ function createWindow() {
   });
   w.on('closed', () => { if (win === w) win = null; });
 
-  w.loadURL(appUrl);
+  w.loadURL(startUrl);
   return w;
 }
 
@@ -258,6 +316,15 @@ function lockDownSession(ses) {
   // The page may only talk to the local server: no remote images, fonts, scripts or trackers.
   // (Links the user clicks open in the system browser instead.)
   const warned = new Set();
+  // Keep Harness's session cookie in memory only: drop Max-Age/Expires from its Set-Cookie so Chromium does not
+  // write it to its on-disk cookie store (a session is useless once Harness locks, but it need not sit on disk).
+  ses.webRequest.onHeadersReceived({ urls: ['http://127.0.0.1/*', 'http://127.0.0.1:*/*'] }, (details, callback) => {
+    const h = details.responseHeaders || {};
+    const key = Object.keys(h).find((k) => k.toLowerCase() === 'set-cookie');
+    if (!key || !security.isAppUrl(details.url, appOrigin)) return callback({});
+    h[key] = h[key].map((c) => (/^\s*harness_session=/.test(c) ? c.replace(/;\s*(max-age|expires)=[^;]*/gi, '') : c));
+    return callback({ responseHeaders: h });
+  });
   ses.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
     let ok = true;
     try {
@@ -372,21 +439,26 @@ async function onReady() {
   registerIpc();
 
   if (server) {
-    applyTheme(server.app.settings.get());
+    // While locked (0.2 password mode) the settings are still encrypted: the theme follows after unlocking.
+    try { applyTheme(server.app.settings?.get?.()); } catch { /* locked */ }
     activity = createActivityGuard({ isBusy: backendBusy(server.app), blocker: powerSaveBlocker });
-    server.app.bus.on('event', (ev) => {
-      if (ACTIVITY_EVENTS.has(ev.type)) activity.update();
-      else if (ev.type === 'settings.updated') applyTheme(ev.data?.settings);
+    server.app.bus?.on('event', (ev) => {
+      if (ACTIVITY_EVENTS.has(ev.type) || ev.type === 'security.status' || ev.type === 'locked') activity.update();
+      if (ev.type === 'settings.updated') applyTheme(ev.data?.settings);
+      else if (ev.type === 'security.status' && ev.data?.state === 'unlocked') { try { applyTheme(server.app.settings?.get?.()); } catch { /* */ } }
     });
   }
   nativeTheme.on('updated', () => { if (win && !win.isDestroyed()) win.setBackgroundColor(backgroundColor()); });
+  // Lock when the Mac sleeps or its screen locks (Electron's powerMonitor; 'lock-screen' exists on macOS and Windows).
+  powerMonitor.on('suspend', () => { lockHarness('system sleep'); });
+  powerMonitor.on('lock-screen', () => { lockHarness('screen locked'); });
 
-  createWindow();
+  createWindow(await windowSessionUrl());
   registerGlobalShortcut();
 
   if (E2E_SCRIPT) {
     require(path.resolve(E2E_SCRIPT))({
-      app, hooks, dataDir, paths, desktop, appUrl, attachedUrl, attachedVia,
+      app, hooks, dataDir, paths, desktop, appUrl, attachedUrl, attachedVia, lockHarness, windowSessionUrl, powerMonitor,
       get server() { return server; }, get window() { return win; }, get activity() { return activity; },
       get registeredShortcut() { return registeredShortcut; }, Menu,
     });

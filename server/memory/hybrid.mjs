@@ -7,7 +7,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { BM25Index, tokenize } from './bm25.mjs';
 import { dot, decodeVector } from './vectors.mjs';
-import { readJson, writeFileAtomic } from '../lib/fsx.mjs';
+import { readJson, writeFileAtomic, readFileData, appendData } from '../lib/fsx.mjs';
 import { log } from '../lib/log.mjs';
 
 /** Map that reports set/delete so changes can be persisted incrementally. */
@@ -94,7 +94,7 @@ export class HybridIndex {
       return this;
     }
     if (this.persistItems) {
-      const txt = await fs.readFile(this.itemsFile, 'utf8').catch(() => '');
+      const txt = await readFileData(this.itemsFile).then((b) => b.toString('utf8'), (e) => { if (e.status === 423) throw e; return ''; });
       let lines = 0;
       for (const line of txt.split('\n')) {
         if (!line) continue;
@@ -112,7 +112,7 @@ export class HybridIndex {
         if (++n % 500 === 0) await new Promise((res) => setImmediate(res));
       }
     }
-    const bin = await fs.readFile(this.vectorsFile).catch(() => null);
+    const bin = await readFileData(this.vectorsFile).catch((e) => { if (e.status === 423) throw e; return null; });
     if (bin) {
       for (const r of decodeVecRecords(bin)) {
         this._logRecords++;
@@ -260,14 +260,14 @@ export class HybridIndex {
       const ids = [...this._dirtyItems];
       this._dirtyItems.clear();
       const lines = ids.map((id) => { const it = this.items.get(id); return JSON.stringify(it ? { op: 'put', id, text: it.text, meta: it.meta } : { op: 'del', id }); });
-      await fs.appendFile(this.itemsFile, lines.join('\n') + '\n');
+      await appendData(this.itemsFile, lines.join('\n') + '\n');
       this._logRecords += ids.length;
     }
     if (this._dirtyVecs.size) {
       const ids = [...this._dirtyVecs];
       this._dirtyVecs.clear();
       const recs = ids.map((id) => { const v = this.vectors.get(id); return v ? encodeVecRecord(1, id, v.model, v.vec) : encodeVecRecord(2, id); });
-      await fs.appendFile(this.vectorsFile, Buffer.concat(recs));
+      await appendData(this.vectorsFile, Buffer.concat(recs));
       this._logRecords += ids.length;
     }
   }
