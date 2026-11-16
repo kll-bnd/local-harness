@@ -659,13 +659,19 @@ test('start-up files weakened while Harness was closed: one calm notice, restore
     assert.doesNotMatch(notice, /launch\.json/);
     await page.waitForTimeout(6000); // not a toast: it does not go away by itself
     assert.equal(await page.locator('.tamper-notice').count(), 1);
+    await app.shot('40-tamper-notice');
+    // Settings → Privacy & security has the same callout at its top (and then the floating notice steps aside).
     await page.goto(`${stack.url}/#/settings/privacy`);
     await page.waitForSelector('.privacy .privacy-tamper');
     assert.match(await page.locator('.privacy .privacy-tamper').textContent(), /open without your password and switch off the internet blocker/);
-    await app.shot('40-tamper');
-    await page.locator('.privacy .privacy-tamper button', { hasText: 'OK, got it' }).click();
     await page.waitForSelector('.tamper-notice', { state: 'detached' });
+    await app.shot('41-tamper-privacy');
+    await page.locator('.privacy .privacy-tamper button', { hasText: 'OK, got it' }).click();
     await page.waitForSelector('.privacy .privacy-tamper', { state: 'detached' });
+    await page.goto(`${stack.url}/#/memory`);
+    await page.waitForTimeout(300);
+    assert.equal(await page.locator('.tamper-notice').count(), 0);
+    await page.goto(`${stack.url}/#/settings/privacy`);
     // Gone for good: after a reload, and after locking and unlocking again.
     await page.reload();
     await page.waitForSelector('.privacy');

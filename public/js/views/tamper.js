@@ -56,15 +56,20 @@ export function tamperCallout(t, { className = '' } = {}) {
       h('div.row', h('button.btn.btn-small.tamper-ok', { type: 'button', on: { click: () => dismissTamper() } }, 'OK, got it'))));
 }
 
-/** The persistent notice in the app; shows itself whenever security.tamper is set. */
+/**
+ * The persistent notice in the app; shows itself whenever security.tamper is set — except on Settings → Privacy &
+ * security, which shows the same callout at its top.
+ */
 export function startTamperNotice() {
   let el = null;
   const render = () => {
     const t = store.get('security')?.tamper;
-    if (!t) { el?.remove(); el = null; return; }
+    const r = store.get('route');
+    if (!t || (r?.view === 'settings' && r.section === 'privacy')) { el?.remove(); el = null; return; }
     if (!el) { el = h('div.tamper-notice'); document.body.append(el); }
     mount(el, tamperCallout(t));
   };
   store.on('security', render);
+  store.on('route', render);
   render();
 }
