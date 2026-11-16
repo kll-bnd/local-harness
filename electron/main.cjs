@@ -18,7 +18,7 @@ const security = require('./lib/security.cjs');
 const menus = require('./lib/menu.cjs');
 const windowState = require('./lib/window-state.cjs');
 const { createActivityGuard, backendBusy, ACTIVITY_EVENTS } = require('./lib/activity.cjs');
-const { findRunningHarness, findAppHarness } = require('./lib/instance.cjs');
+const { findRunningHarness, findAppHarness, lockElsewhere } = require('./lib/instance.cjs');
 const { startOrRefuse, alreadyOpenMessage } = require('./lib/backend.cjs');
 const { teeConsoleToFile } = require('./lib/logfile.cjs');
 
@@ -366,6 +366,7 @@ async function startBackend() {
     port: desktop.port,
     findRunning: findRunningHarness,
     findApp: findAppHarness,
+    findElsewhere: lockElsewhere,
     startServer: async (opts) => (await import(pathToFileURL(path.join(ROOT, 'server', 'index.mjs')).href)).startServer(opts),
     // Test hook: skip the probe so the e2e test exercises the backend's own HARNESS_ALREADY_RUNNING path.
     probeFirst: !(E2E_SCRIPT && process.env.HARNESS_E2E_SKIP_PROBE === '1'),

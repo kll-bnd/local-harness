@@ -182,6 +182,18 @@ const refused = (S, r, dataDir, text) => {
   holder.kill('SIGTERM');
 }
 
+// ------------------------------------------- B4. the lock was written on another computer: nothing it names is contacted
+{
+  const S = 'other-computer';
+  const dataDir = mkData('other-computer');
+  const fake = await standIn();
+  writeLock(dataDir, { pid: process.pid, port: fake.port, url: `http://127.0.0.1:${fake.port}`, hostname: `${os.hostname()}-elsewhere` });
+  const r = await launch({ dataDir, port: await freePort() });
+  refused(S, r, dataDir, `Harness on another computer (${os.hostname()}-elsewhere) is using this data folder. Quit Harness there, then open this app again.`);
+  report(S, 'the address in the lock was not contacted at all', fake.got.length === 0, fake.got.map((g) => `${g.method} ${g.url}`));
+  await fake.close();
+}
+
 // ------------------------------------------------------------------------------ C. server cannot start
 {
   const S = 'startup-error';

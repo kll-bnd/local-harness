@@ -9,8 +9,14 @@
 // folder). NOTE: nothing here authenticates the instance — any program running as this user can write the lock
 // and answer /api/health. Use it to avoid two writers and to find where to go; never send a secret to what it
 // names without proof (scripts/lib/harness-client.mjs: POST /api/security/prove before a password is sent).
+//
+// The lock's `url` (and the `url` of the backend's HARNESS_ALREADY_RUNNING error, which comes from it) is NEVER
+// used: a discovered instance is only ever reached at http://127.0.0.1:<port>, with the lock's port checked to be
+// an integer 1–65535 (loopbackUrl). A lock written on another computer (`hostname`, a data folder on a shared
+// volume) is never contacted at all (lockElsewhere).
 const http = require('node:http');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 function getJson(port, p, timeoutMs) {
@@ -37,6 +43,27 @@ function readLock(dataDir) {
   try { return JSON.parse(fs.readFileSync(path.join(dataDir, 'harness.lock'), 'utf8')); } catch { return null; }
 }
 
+/** The only address a discovered Harness is reached at: http://127.0.0.1:<port>, or null for anything but a port 1–65535. */
+function loopbackUrl(port) {
+  const p = typeof port === 'number' ? port : (typeof port === 'string' && /^[0-9]{1,5}$/.test(port) ? Number(port) : NaN);
+  return Number.isInteger(p) && p >= 1 && p <= 65535 ? `http://127.0.0.1:${p}` : null;
+}
+
+/** A host name from a lock, safe to print: printable characters only, at most 64. */
+const printableHost = (h) => String(h).replace(/[^\x21-\x7e]/g, '?').slice(0, 64);
+
+/**
+ * The lock was written on ANOTHER computer (its `hostname` is not this one's): the data folder is on a volume that
+ * computer uses too. Nothing it names is contacted; the backend will not start on the folder either.
+ * @returns {{ hostname: string, pid: number|null } | null}
+ */
+function lockElsewhere({ dataDir } = {}) {
+  const info = readLock(dataDir);
+  const h = info?.hostname;
+  if (typeof h !== 'string' || h === '' || h === os.hostname()) return null;
+  return { hostname: printableHost(h), pid: Number.isInteger(info.pid) ? info.pid : null };
+}
+
 /**
  * @param {object} o
  * @param {string} o.dataDir
@@ -46,12 +73,12 @@ function readLock(dataDir) {
  */
 async function findRunningHarness({ dataDir, timeoutMs = 1500 } = {}) {
   const info = readLock(dataDir);
-  const port = Number(info?.port);
-  if (!Number.isInteger(port) || port <= 0 || port >= 65536) return null;
-  if (!lockIsFor(info, dataDir)) return null;
+  const url = loopbackUrl(info?.port);
+  if (!url || !lockIsFor(info, dataDir) || lockElsewhere({ dataDir })) return null;
+  const port = Number(new URL(url).port);
   const h = await getJson(port, '/api/health', timeoutMs);
   if (!(h && h.ok && h.name === 'harness')) return null;
-  return { url: `http://127.0.0.1:${port}`, port, version: h.version, pid: Number.isInteger(info.pid) ? info.pid : null, state: h.state ?? null };
+  return { url, port, version: h.version, pid: Number.isInteger(info.pid) ? info.pid : null, state: h.state ?? null };
 }
 
 function pidAlive(pid) {
@@ -67,11 +94,11 @@ function pidAlive(pid) {
  */
 function findAppHarness({ dataDir } = {}) {
   const info = readLock(dataDir);
-  if (!info || info.transport !== 'bridge' || !pidAlive(info.pid)) return null;
-  if (!lockIsFor(info, dataDir)) return null;
+  if (!info || info.transport !== 'bridge' || !lockIsFor(info, dataDir) || lockElsewhere({ dataDir })) return null;
+  if (!pidAlive(info.pid)) return null;
   return { pid: info.pid, transport: 'bridge', startedAt: typeof info.startedAt === 'string' ? info.startedAt : null };
 }
 
 const portRange = (preferred) => Array.from({ length: 11 }, (_, i) => preferred + i).filter((p) => p > 0 && p < 65536);
 
-module.exports = { findRunningHarness, findAppHarness, portRange, readLock };
+module.exports = { findRunningHarness, findAppHarness, lockElsewhere, loopbackUrl, portRange, readLock };
