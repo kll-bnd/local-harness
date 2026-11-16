@@ -255,7 +255,7 @@ async function connectEvents() {
     const r = await api.events((ev, name) => dispatch(name || ev.type, ev), { signal: ctl.signal });
     if (r?.aborted || ctl.signal.aborted) return;
   } catch (e) {
-    if (isLockError(e)) { lockdown('locked'); return; }
+    if (isLockError(e)) { lockdown(e.code); return; }
   }
   if (busCtl !== ctl || isLockingDown()) return;
   clearTimeout(offlineTimer);

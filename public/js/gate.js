@@ -46,6 +46,7 @@ export async function runGate() {
       await cantReach(e);
       continue;
     }
+    if (sec.state === 'error') { await errorScreen(sec); continue; }
     if (sec.state === 'needs_setup') { await setupFlow(sec); continue; }
     if (sec.state === 'migrating') { await migrationScreen(sec); continue; }
     if (sec.state === 'locked' || !sec.session?.authenticated) {
@@ -69,6 +70,34 @@ function cantReach(e) {
   });
 }
 
+// ------------------------------------------------------------------------------------------------ key store damaged
+/**
+ * State `error`: the key store (vault.json) is damaged or missing while encrypted files exist. Nothing was deleted
+ * and nothing can be opened; never offer a new setup here (it would orphan every encrypted file).
+ */
+function errorScreen(sec) {
+  return new Promise((resolve) => {
+    const code = sec.error?.code;
+    const missing = code === 'vault_missing';
+    screen(
+      brand(),
+      h('h1.gate-title', missing ? 'Harness can’t find its key file' : 'Harness’s key file is damaged'),
+      h('p.gate-text', missing
+        ? 'Your chats are encrypted, but the file that holds their key (vault.json) is not in the Harness data folder. Nothing has been deleted.'
+        : 'Your chats are encrypted, but the file that holds their key (vault.json) can’t be read, and neither can its automatic backup copy. Nothing has been deleted.'),
+      h('div.gate-callout', icon('info', { size: 14 }), h('div',
+        h('b', 'What to do'),
+        h('ol.gate-steps',
+          h('li', 'Quit Harness.'),
+          h('li', 'Put vault.json back into the Harness data folder from a backup of that folder (for example Time Machine). Its copy vault.json.bak works too.'),
+          h('li', 'Open Harness again and unlock it with your password or recovery key.')))),
+      h('p.gate-note', 'Without that file the data cannot be opened — not even with your password or recovery key. Harness will not set up anything new over it.'),
+      sec.error?.message ? h('p.gate-note.faint', sec.error.message) : null,
+      h('div.gate-actions', h('button.btn.btn-large', { type: 'button', on: { click: () => resolve() } }, 'Check again')),
+    );
+  });
+}
+
 // ------------------------------------------------------------------------------------------------ lock screen
 function lockFlow(sec) {
   const mode = sec.mode;
@@ -80,13 +109,17 @@ function lockFlow(sec) {
     const waitLine = h('div.gate-wait', { role: 'status' });
     const pw = passwordField({ label: 'Password', autocomplete: 'current-password', placeholder: 'Password' });
     const keyInput = h('textarea.input.rk-input', { id: 'rk-input', rows: 2, placeholder: 'HRK1-XXXX-XXXX-…', attrs: { 'aria-label': 'Recovery key', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false' } });
-    const keychainFirst = mode === 'keychain' && sec.state === 'locked';
+    const keychainFirst = mode === 'keychain' && sec.state === 'locked' && !!sec.session?.authenticated;
     const submitBtn = h(`button.btn${keychainFirst ? '' : '.btn-primary'}.btn-large.gate-submit`, { type: 'submit' }, keychainFirst ? 'Unlock with password' : 'Unlock');
     const fieldBox = h('div.gate-field');
     const switchLink = h('button.btn-link.gate-switch', { type: 'button', on: { click: () => { useKey = !useKey; render(); } } });
     const keyNote = h('p.gate-note', { hidden: true }, 'Your recovery key is the one Harness showed you once when you chose your password (it starts with HRK1). After unlocking with it you can choose a new password.');
-    const keychainBtn = mode === 'keychain' && sec.state === 'locked'
+    // Keychain mode: one click — for a window that already had a session (a new one comes from the launcher).
+    const keychainBtn = keychainFirst
       ? h('button.btn.btn-primary.btn-large', { type: 'button', on: { click: () => attempt({}) } }, icon('key', { size: 15 }), 'Open Harness')
+      : null;
+    const keychainNote = mode === 'keychain' && sec.unlock?.keychainError
+      ? h('p.gate-note', `The Keychain did not open Harness: ${sec.unlock.keychainError.message || sec.unlock.keychainError.code}. Your password works too.`)
       : null;
 
     const render = () => {
@@ -118,6 +151,10 @@ function lockFlow(sec) {
         submitBtn.disabled = false;
         if (e?.code === 'wrong_password') err.textContent = "That's not the password.";
         else if (e?.code === 'wrong_recovery_key') err.textContent = "That recovery key doesn't open this Harness.";
+        else if (e?.code === 'keychain_unavailable') err.textContent = `The Keychain didn't answer${e.details?.reason === 'denied' ? ' (access was denied)' : e.details?.reason === 'timeout' ? ' in time' : e.details?.reason === 'not_found' ? ' (no Harness key there)' : ''}. Use your password.`;
+        else if (e?.code === 'wrong_key') err.textContent = "The key in the Keychain doesn't open this Harness. Use your password.";
+        else if (e?.code === 'auth_required') err.textContent = 'Open Harness from its launcher, or use your password.';
+        else if (e?.code === 'vault_corrupt' || e?.code === 'vault_missing') { resolve(); return; }
         else if (e?.code === 'unlock_throttled') err.textContent = '';
         else if (e?.code === 'network') err.textContent = "Can't reach Harness right now.";
         else err.textContent = e?.message || 'That did not work.';
@@ -147,6 +184,7 @@ function lockFlow(sec) {
         ? h('p.gate-text', 'This window has not been signed in. Open Harness from the app or its launcher — or type your Harness password.')
         : h('p.gate-text', mode === 'keychain' ? 'Your data is encrypted. This Mac keeps the key in your Keychain.' : 'Your chats are encrypted on this Mac. Enter your password to open them.'),
       keychainBtn ? h('div.gate-actions', keychainBtn) : null,
+      keychainNote,
       keychainBtn ? h('div.gate-or', 'or') : null,
       unlockable || notLocked ? form : null,
       h('div.gate-foot', switchLink),

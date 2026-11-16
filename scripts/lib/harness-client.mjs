@@ -102,6 +102,15 @@ async function call(base, method, p, { body, headers = {}, token, cookie, timeou
 }
 
 const errCode = (r) => r?.data?.error?.code || null;
+
+/** State `error` (§10.1): the key store is unusable. Never suggest setting up again — that cannot help. */
+export function vaultError(sec) {
+  const code = sec?.error?.code || 'vault_error';
+  const what = code === 'vault_missing'
+    ? 'Harness found encrypted data but no key store (vault.json) next to it.'
+    : 'Harness\'s key store (vault.json, and its copy vault.json.bak) is damaged.';
+  return new HarnessError(code, `${what} Your data is still encrypted and nothing was changed. Restore vault.json from a backup of the Harness data folder (Time Machine, or a copy you made), then open Harness again. Do not choose a new password: that cannot open the existing data.${sec?.error?.message ? `\n(Harness says: ${sec.error.message})` : ''}`, { security: sec });
+}
 const errMsg = (r) => r?.data?.error?.message || `HTTP ${r?.status}`;
 const fmtWait = (ms) => (ms >= 60000 ? `${Math.ceil(ms / 60000)} min` : `${Math.ceil(ms / 1000)} s`);
 
@@ -182,14 +191,12 @@ export class HarnessClient {
     try { return fs.readFileSync(path.join(this.dataDir, 'api-token'), 'utf8').trim() || null; } catch { return null; }
   }
 
+  /** The bearer token Harness returns when asked for one (`"session": "token"`, §10.3); nothing else is used. */
   #takeSession(r) {
     const t = r.data?.sessionToken;
-    if (t) { this.#token = t; return true; }
-    // Fallback: the session cookie (same session, §10.5) if the body carries no token.
-    const set = r.res.headers.getSetCookie?.() || [];
-    const c = set.map((s) => s.split(';')[0]).find((s) => s.startsWith('harness_session='));
-    if (c) { this.#cookie = c; return true; }
-    return false;
+    if (!t) return false;
+    this.#token = t;
+    return true;
   }
 
   /**
@@ -200,6 +207,7 @@ export class HarnessClient {
   async ensureSession({ reason = 'continue' } = {}) {
     let sec = await this.security();
     if (!sec) { this.#via = 'legacy'; return { state: 'unlocked', mode: 'none', legacy: true }; }
+    if (sec.state === 'error') throw vaultError(sec);
     sec = await this.#waitWhileMigrating(sec);
     if (sec.state === 'needs_setup') {
       throw new HarnessError('needs_setup', sec.plainDataFound
@@ -211,13 +219,16 @@ export class HarnessClient {
       const token = this.#apiToken();
       if (token) {
         this.#token = token; this.#via = 'api-token';
-        if (sec.state === 'locked' && sec.mode === 'keychain') {
-          const r = await call(this.base, 'POST', '/api/security/unlock', { body: {}, token, timeoutMs: 60000 });
-          if (!r.ok) throw new HarnessError(errCode(r) || 'unlock_failed', `Could not open Harness with the Keychain: ${errMsg(r)}`);
-        }
-        return this.security();
+        if (sec.state !== 'locked' || sec.mode !== 'keychain') return this.security();
+        // Keychain items can need a macOS prompt; Harness gives up after 60 s and the password still works.
+        const r = await call(this.base, 'POST', '/api/security/unlock', { body: {}, token, timeoutMs: 75000 });
+        if (r.ok) return this.security();
+        if (/^vault_/.test(errCode(r) || '')) throw vaultError({ error: r.data.error });
+        this.log(`The Keychain did not open Harness (${errMsg(r)}); your password still does.`);
+        this.#token = null;
+        this.#via = null;
       }
-      // No token file (e.g. another user's install): fall through to the password.
+      // No token file, or the Keychain refused: fall through to the password.
     }
     for (let attempt = 1; ; attempt++) {
       const retry = sec.unlock?.retryAfterMs || 0;
@@ -227,13 +238,15 @@ export class HarnessClient {
         await sleep(retry);
       }
       const pw = this.#password ?? await this.#askPassword(`Harness password (to ${reason}): `);
-      const r = await call(this.base, 'POST', '/api/security/unlock', { body: { password: pw }, timeoutMs: 120000 });
+      // Ask explicitly for a bearer token: browsers only ever get the HttpOnly cookie (§10.3).
+      const r = await call(this.base, 'POST', '/api/security/unlock', { body: { password: pw, session: 'token' }, timeoutMs: 120000 });
       if (r.ok && this.#takeSession(r)) {
         this.#password = pw; this.#via = 'password';
         return this.#waitWhileMigrating(await this.security());
       }
-      if (r.ok) throw new HarnessError('no_session', 'Harness accepted the password but returned no session (contract: sessionToken in the unlock response).');
+      if (r.ok) throw new HarnessError('no_session', 'Harness accepted the password but returned no session token.');
       const code = errCode(r);
+      if (/^vault_/.test(code || '')) throw vaultError({ error: r.data.error });
       this.#password = null;
       if (code === 'wrong_password' || code === 'unlock_throttled') {
         const wait = r.data?.error?.details?.retryAfterMs || 0;
@@ -249,6 +262,7 @@ export class HarnessClient {
   /** An authenticated request; if Harness locked meanwhile (423 / 401), unlock once more and repeat. */
   async request(method, p, body, { headers, timeoutMs } = {}) {
     let r = await call(this.base, method, p, { body, headers, token: this.#token, cookie: this.#cookie, timeoutMs });
+    if ((r.status === 409 || r.status === 503) && /^vault_/.test(errCode(r) || '')) throw vaultError({ error: r.data.error });
     if (r.status === 423 || (r.status === 401 && errCode(r) === 'auth_required')) {
       this.#token = null; this.#cookie = null;
       await this.ensureSession({ reason: 'continue' });

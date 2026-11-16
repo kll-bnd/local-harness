@@ -161,19 +161,19 @@ async function windowSessionUrl() {
 }
 
 /**
- * Lock Harness now (system sleep, screen lock). In-process: a short-lived session from startServer().auth calls
- * POST /api/security/lock (locking drops every session, this one included). The page is told as well, so a
- * backend in another process (attached) is locked through the page's own session.
+ * Lock Harness now (system sleep, screen lock). In-process: startServer().security.lock('app') (docs/API.md §10.5).
+ * The page is told as well, so a backend in another process (attached) is locked through the page's own session.
  */
 async function lockHarness(reason) {
   notifyPage('lock');
-  if (!server?.auth?.createSession) return false;
-  let c = null;
-  try { c = server.auth.createSession(); } catch { return false; } // already locked (password mode)
+  const sec = server?.security;
+  if (!sec?.lock) return false;
+  if (sec.state !== 'unlocked' && sec.state !== 'migrating') return false; // nothing to lock (locked, error, setup)
+  if (sec.mode === 'off') return false;
   try {
-    const res = await fetch(`${appUrl}/api/security/lock`, { method: 'POST', headers: { cookie: `${c.name}=${c.value}`, 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(15000) });
-    console.log(`[desktop] locked Harness (${reason}): HTTP ${res.status}`);
-    return res.ok;
+    await sec.lock('app');
+    console.log(`[desktop] locked Harness (${reason})`);
+    return true;
   } catch (e) {
     console.warn(`[desktop] could not lock Harness (${reason}): ${e.message}`);
     return false;
@@ -440,8 +440,8 @@ async function onReady() {
 
   if (server) {
     // 0.2: the backend's `app` (and its event bus) exists only while Harness is unlocked and is recreated on every
-    // unlock, so re-attach on each state change. `server.core` emits 'state' / 'locked' (not part of the documented
-    // contract yet — see docs/DESKTOP.md); with a 0.1 backend there is no core and `app` is always there.
+    // unlock, so re-attach on each state change: startServer().security.on('state' | 'locked' | 'unlocked')
+    // (docs/API.md §10.5). With a 0.1 backend there are no such events and `app` is always there.
     activity = createActivityGuard({ isBusy: () => backendBusy(server.app)(), blocker: powerSaveBlocker });
     let bus = null;
     const onEvent = (ev) => {
@@ -457,8 +457,10 @@ async function onReady() {
       try { applyTheme(server.app.settings?.get?.()); } catch { /* settings not readable yet */ }
     };
     attachBus();
-    server.core?.on?.('state', (st) => { if (st?.state === 'unlocked') attachBus(); activity.update(); });
-    server.core?.on?.('locked', () => { bus = null; activity.update(); });
+    const events = server.security?.on ? server.security : null;
+    events?.on('unlocked', () => { attachBus(); activity.update(); });
+    events?.on('state', (st) => { if (st?.state === 'unlocked') attachBus(); activity.update(); });
+    events?.on('locked', () => { bus = null; activity.update(); });
   }
   nativeTheme.on('updated', () => { if (win && !win.isDestroyed()) win.setBackgroundColor(backgroundColor()); });
   // Lock when the Mac sleeps or its screen locks (Electron's powerMonitor; 'lock-screen' exists on macOS and Windows).

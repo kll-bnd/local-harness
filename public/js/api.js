@@ -244,7 +244,10 @@ export const security = {
   /** password may be omitted inside a passwordReset window. */
   changePassword: ({ password, newPassword }) => post('/api/security/password', password ? { password, newPassword } : { newPassword }),
   newRecoveryKey: (password) => post('/api/security/recovery-key', { password }),
-  setMode: ({ password, mode }) => post('/api/security/mode', { password, mode }),
+  /** From off mode with no password ever set, turning encryption on takes { mode, newPassword } (→ recoveryKey). */
+  setMode: ({ password, mode, newPassword }) => post('/api/security/mode', newPassword ? { mode, newPassword } : { password, mode }),
+  /** A new data key; everything is re-encrypted (state migrating) and a new recovery key is returned once. */
+  rekey: (password) => post('/api/security/rekey', { password }),
   /** → { confirmation, expiresAt }: a single-use X-Harness-Confirm value (2 minutes). */
   confirm: (password) => post('/api/security/confirm', { password }),
   /** The user is here (pointer, keys…): keeps Harness from auto-locking. → { ok, idleLockAt } */

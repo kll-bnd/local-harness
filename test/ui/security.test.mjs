@@ -392,7 +392,7 @@ test('protection mode: "Don\'t ask on this Mac" needs the password; the lock scr
     await page.locator('.privacy button', { hasText: 'Check that nothing can get out' }).click();
     await page.waitForSelector('.selftest-head', { timeout: 15000 });
     assert.match(await page.locator('.selftest-head').textContent(), /Nothing got out/);
-    assert.match(await page.locator('.selftest-list').textContent(), /Harness itself: refused to connect to huggingface\.co:443/);
+    assert.match(await page.locator('.selftest-list').textContent(), /Harness itself: refuses to connect to huggingface\.co:443/);
     await page.locator('.mode-card[data-mode="keychain"]').click();
     await page.waitForSelector('dialog.confirm-pw');
     await page.locator('dialog.confirm-pw .dialog-actions .btn', { hasText: 'Cancel' }).click();
@@ -404,6 +404,53 @@ test('protection mode: "Don\'t ask on this Mac" needs the password; the lock scr
     await lockViaKeys(page);
     await page.locator('.gate button', { hasText: 'Open Harness' }).click();
     await page.waitForSelector('.privacy');
+
+    // Back to the password: Harness recommends a new data key (the Keychain could have been read).
+    await page.locator('.mode-card[data-mode="password"]').click();
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
+    await page.waitForSelector('.rekey-callout');
+    await page.locator('.rekey-callout button', { hasText: 'Re-encrypt with a new key' }).click();
+    await page.fill('dialog.confirm-pw input[type="password"]', PASSWORD);
+    await page.locator('dialog.confirm-pw .dialog-actions .btn-primary').click();
+    // The new recovery key is shown once, and the page waits for it to be stored before anything reloads.
+    await page.waitForSelector('dialog.rk-dialog .rk-key');
+    const key = (await page.locator('dialog.rk-dialog .rk-key .rk-group').allTextContents()).join('-');
+    await page.waitForTimeout(500);
+    assert.equal(await page.locator('dialog.rk-dialog').count(), 1, 'still on screen while the data is re-encrypted');
+    await page.check('dialog.rk-dialog .rk-confirm input');
+    await page.locator('dialog.rk-dialog .dialog-actions .btn-primary').click();
+    await page.waitForSelector('.privacy', { timeout: 20000 });
+    // The new key opens Harness.
+    await lockViaKeys(page);
+    await page.locator('.gate-switch').click();
+    await page.fill('.gate textarea', key);
+    await page.click('.gate-submit');
+    await page.waitForFunction(() => /Choose a new password/.test(document.querySelector('.gate')?.textContent || ''));
+    await page.locator('.gate-foot button', { hasText: 'Not now' }).click();
+    await page.waitForSelector('.privacy');
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
+test('a damaged key store gets a calm explanation and never a new setup', async () => {
+  const stack = await startStack({ secure: true });
+  await stack.setupPassword(PASSWORD);
+  await stack.api('POST', '/api/chats/import', { title: 'Keep me', messages: [{ role: 'user', content: 'hello' }] });
+  await stack.stopServer();
+  await fs.writeFile(path.join(stack.dataDir, 'vault.json'), '{"version":1,"wraps":');
+  await fs.writeFile(path.join(stack.dataDir, 'vault.json.bak'), 'not json either');
+  await stack.startServerAgain();
+  const app = await openApp(stack);
+  try {
+    const { page } = app;
+    await page.waitForSelector('.gate');
+    const text = await page.locator('.gate').textContent();
+    assert.match(text, /key file is damaged/);
+    assert.match(text, /Nothing has been deleted/);
+    assert.equal(await page.locator('.gate input[name="password2"]').count(), 0, 'no setup offered');
+    assert.equal(await page.locator('.gate input[type="password"]').count(), 0);
+    await app.shot('38-vault-error');
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });

@@ -214,6 +214,11 @@ export function describeLive(model) {
     const what = st.reason === 'model_in_use' ? 'Waiting for the model to finish another task' : 'Waiting for image generation to finish';
     return { label: `${what}… ${s} s`, phase: 'waiting', hint: s >= 5 ? `On ${mac} the chat model and image generation take turns, so they never compete for memory.` : null };
   }
+  if (st?.phase === 'loading' && st.reason === 'starting_ollama') {
+    // Harness is still starting Ollama (e.g. right after unlocking): the turn waits instead of failing.
+    const s = Math.max(since(st.at), Math.round((st.elapsedMs || 0) / 1000));
+    return { label: `Starting Ollama… ${s} s`, phase: 'loading', hint: s >= 5 ? 'Harness starts the model server when it opens; your message is sent as soon as it is up.' : null };
+  }
   if (st?.phase === 'loading') {
     const s = Math.max(since(st.at), Math.round((st.elapsedMs || 0) / 1000));
     const label = st.reason === 'reload_after_image' || st.models ? 'Reloading the chat model after the image'

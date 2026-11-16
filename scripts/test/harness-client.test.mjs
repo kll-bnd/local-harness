@@ -28,14 +28,33 @@ test('password from stdin: unlocks, uses the bearer token, logs out at the end',
   } finally { await f.close(); }
 });
 
-test('falls back to the session cookie when the unlock body carries no token', async () => {
-  const f = await startFakeSecurity({ sessionInBody: false });
+test('asks for a bearer token explicitly ("session": "token") and uses nothing else', async () => {
+  const f = await startFakeSecurity();
   try {
     const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: scripted(['correct horse']), log: quiet });
     await c.ensureSession();
-    assert.equal((await c.request('GET', '/api/data')).status, 200);
-    assert.match(c.authHeaders().cookie, /^harness_session=/);
+    assert.equal(f.unlockBodies.at(-1).session, 'token');
+    assert.equal(c.authHeaders().cookie, undefined);
+    assert.match(c.authHeaders().authorization, /^Bearer /);
+    const g = await startFakeSecurity({ honourTokenRequest: false });
+    try {
+      const d = new HarnessClient({ base: g.url, dataDir: tmp(), password: scripted(['correct horse']), log: quiet });
+      await assert.rejects(d.ensureSession(), (e) => e.code === 'no_session');
+    } finally { await g.close(); }
   } finally { await f.close(); }
+});
+
+test('state error (damaged key store): reported plainly, never a password prompt or setup', async () => {
+  for (const code of ['vault_corrupt', 'vault_missing']) {
+    const f = await startFakeSecurity({ state: 'error', error: { code, message: 'x' } });
+    try {
+      const pw = scripted(['should not be asked']);
+      const c = new HarnessClient({ base: f.url, dataDir: tmp(), password: pw, log: quiet });
+      await assert.rejects(c.ensureSession(), (e) => e.code === code && /Restore vault\.json from a backup/.test(e.message) && /Do not choose a new password/.test(e.message));
+      assert.equal(pw.prompts.length, 0);
+      assert.equal(f.unlockBodies.length, 0);
+    } finally { await f.close(); }
+  }
 });
 
 test('wrong password: asks again on a terminal, fails at once from stdin', async () => {

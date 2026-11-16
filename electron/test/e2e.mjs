@@ -162,18 +162,24 @@ const mkData = (name) => fs.mkdtempSync(path.join(base, `e2e-${name}-`));
   report(S, 'reports the server start failure', /server failed to start/.test(r.stdout + r.stderr), (r.stdout + r.stderr).slice(-600));
 }
 
-// ------------------------------------------------------------- D. the backend itself throws while starting
+// ------------------------------------------------- D. damaged key store (0.2): Harness starts in state "error"
 {
-  const S = 'server-error';
-  const dataDir = mkData('server-error');
-  fs.mkdirSync(path.join(dataDir, 'memories.json')); // 0.1: a directory where the backend expects a file → EISDIR
-  fs.writeFileSync(path.join(dataDir, 'vault.json'), JSON.stringify({ version: 99 })); // 0.2: not a key store → vault_corrupt
+  const S = 'vault-error';
+  const dataDir = mkData('vault-error');
+  // Encrypted data exists (a chats folder) but both copies of the key store are unusable.
+  fs.mkdirSync(path.join(dataDir, 'chats'));
+  fs.writeFileSync(path.join(dataDir, 'chats', 'chat_x.json'), Buffer.from('HXC1 not really'));
+  fs.writeFileSync(path.join(dataDir, 'vault.json'), JSON.stringify({ version: 99 }));
+  fs.writeFileSync(path.join(dataDir, 'vault.json.bak'), JSON.stringify({ version: 99 }));
   const port = await freePort();
-  const r = await launch({ dataDir, port, timeoutMs: 30000 });
-  report(S, 'exits with code 1', r.code === 1, { code: r.code, signal: r.signal });
+  const r = await launch({ dataDir, port, timeoutMs: 60000 });
+  const sec = r.result?.info?.security;
+  report(S, 'the app starts and shows the window (the UI explains the damaged key store)', r.result?.checks?.window_loads_server_url?.ok, r.result?.checks?.window_loads_server_url);
+  report(S, 'state "error" (vault_corrupt), never needs_setup', sec?.state === 'error', sec);
+  report(S, 'exit code 0 and no server left listening', r.code === 0 && !(await portOpen(port)), { code: r.code, signal: r.signal });
   const log = fs.existsSync(path.join(dataDir, 'logs', 'harness.log')) ? fs.readFileSync(path.join(dataDir, 'logs', 'harness.log'), 'utf8') : '';
-  report(S, 'error is written to the log file', /server failed to start[\s\S]*(EISDIR|vault)/.test(log), log.slice(-400));
-  report(S, 'no server left listening', !(await portOpen(port)));
+  report(S, 'the log names the problem', /vault_corrupt/.test(log), log.slice(-300));
+  report(S, 'the damaged key store was left untouched', fs.readFileSync(path.join(dataDir, 'vault.json'), 'utf8') === JSON.stringify({ version: 99 }));
 }
 
 console.log(failures.length ? `\n${failures.length} check(s) FAILED` : '\nall desktop E2E checks passed');

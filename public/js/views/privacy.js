@@ -11,7 +11,7 @@ import { showError } from '../errors.js';
 import { runAction, keyLabel, getAction } from '../actions.js';
 import { confirmWithPassword, passwordField, strengthMeter, recoveryKeyPanel, migrationProgress, RECOVERY_WARNING, setSecurityContext, confirmationHeader } from '../security-ui.js';
 import { networkState, scopeSentence, allowFor, blockNow, setBlocker, selfTest } from './network.js';
-import { lockdown } from '../lockdown.js';
+import { lockdown, holdLockdown } from '../lockdown.js';
 
 const MODES = [
   { id: 'password', label: 'Ask for my password', recommended: true, text: 'Harness asks for your password when it opens. Only your password or recovery key can unlock the data.' },
@@ -56,15 +56,26 @@ export function privacySection(view) {
     h('h3.h3', 'Protection'),
     modeList, migEl.el));
 
-  // ---- password + recovery key
+  // ---- password + recovery key (+ re-keying after the Keychain held the key)
   const rk = sec.recoveryKey;
+  const noPassword = mode === 'off' && !rk; // off mode that never had a password (a recovery key comes with one)
+  const encrypted = mode !== 'off';
   add(wrap, h('section.form-block',
     h('h3.h3', 'Password and recovery key'),
-    h('div.row-wrap',
-      h('button.btn', { type: 'button', on: { click: () => changePasswordDialog() } }, icon('key', { size: 14 }), 'Change password…'),
-      h('button.btn', { type: 'button', on: { click: () => newRecoveryKey(view) } }, icon('lock', { size: 14 }), rk ? 'Make a new recovery key…' : 'Make a recovery key…')),
-    h('p.field-help', rk ? `Your recovery key was made ${fmtRelative(rk.createdAt)} (${fmtFull(rk.createdAt)}). It cannot be shown again; making a new one stops the old one from working.` : 'There is no recovery key. Without one, forgetting your password means your data cannot be opened.'),
-    inResetWindow() ? h('p.field-help.warn-text', `You opened Harness with your recovery key: until ${new Date(resetUntil()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} you can choose a new password without the old one.`) : null));
+    noPassword
+      ? h('p.field-help', 'Harness has no password yet. Choose “Ask for my password” above to set one and encrypt your data.')
+      : [
+        h('div.row-wrap',
+          h('button.btn', { type: 'button', on: { click: () => changePasswordDialog() } }, icon('key', { size: 14 }), 'Change password…'),
+          encrypted ? h('button.btn', { type: 'button', on: { click: () => newRecoveryKey(view) } }, icon('lock', { size: 14 }), rk ? 'Make a new recovery key…' : 'Make a recovery key…') : null),
+        encrypted ? h('p.field-help', rk ? `Your recovery key was made ${fmtRelative(rk.createdAt)} (${fmtFull(rk.createdAt)}). It cannot be shown again; making a new one stops the old one from working.` : 'There is no recovery key. Without one, forgetting your password means your data cannot be opened.') : null,
+      ],
+    inResetWindow() ? h('p.field-help.warn-text', `You opened Harness with your recovery key: until ${new Date(resetUntil()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} you can choose a new password without the old one.`) : null,
+    store.get('rekeyRecommended') && encrypted ? h('div.callout.accent.rekey-callout', icon('info'), h('div.grow',
+      h('b', 'Consider a new data key. '),
+      'While Harness opened without asking, its key sat in your Keychain, where other programs running as you could read it. A new key re-encrypts everything (this takes a little while) and comes with a new recovery key.',
+      h('div.row', { style: { marginTop: '8px' } }, h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: () => rekey(view) } }, 'Re-encrypt with a new key…')))) : null,
+    encrypted && !store.get('rekeyRecommended') ? h('div.row', h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => rekey(view) } }, 'Re-encrypt everything with a new key…')) : null));
 
   // ---- auto-lock
   const cur = settings.security?.idleLockMinutes ?? sec.idleLockMinutes ?? 15;
@@ -76,7 +87,7 @@ export function privacySection(view) {
     h('div.form-row', { dataset: { path: 'security.idleLockMinutes' } },
       h('div.form-label', h('label.field-label', 'Lock Harness after'), h('div.field-help', 'Counted from the last thing you did in Harness. Locking stops replies that are running and unloads the models Harness started.')),
       h('div.form-control', idleSel)),
-    h('div.row', h('button.btn', { type: 'button', disabled: mode === 'off', on: { click: () => runAction('lock') } }, icon('lock', { size: 14 }), 'Lock now'), h('span.faint.small', keyLabel(getAction('lock')?.keys?.[0]))),
+    mode !== 'off' ? h('div.row', h('button.btn', { type: 'button', on: { click: () => runAction('lock') } }, icon('lock', { size: 14 }), 'Lock now'), h('span.faint.small', keyLabel(getAction('lock')?.keys?.[0]))) : null,
   ));
 
   // ---- internet
@@ -125,7 +136,8 @@ function internetBlock(view) {
     if (lastTest.error) { mount(results, h('div.field-error', lastTest.error)); return; }
     const r = lastTest.result;
     mount(results,
-      h(`div.selftest-head${r.blocked ? '.ok' : '.bad'}`, icon(r.blocked ? 'shieldCheck' : 'warning', { size: 15 }), r.blocked ? 'Nothing got out.' : 'Something could get out.'),
+      h(`div.selftest-head${r.leaked ? '.bad' : r.unsure ? '.unsure' : '.ok'}`, icon(r.leaked || r.unsure ? 'warning' : 'shieldCheck', { size: 15 }),
+        r.leaked ? 'Something could get out.' : r.open ? 'Internet access is allowed right now, as you chose.' : r.unsure ? 'Nothing got out, but part of the check could not tell.' : 'Nothing got out.'),
       h('ul.selftest-list', r.lines.map((l) => h(`li.selftest-item.${l.result}`, h('span.selftest-dot'), h('span', h('b', `${l.layer}: `), l.text, l.detail ? h('span.faint', ` ${l.detail}`) : null)))),
       h('div.faint.small', `Checked ${new Date(lastTest.at).toLocaleTimeString()}`));
   };
@@ -152,30 +164,95 @@ function internetBlock(view) {
 }
 
 // ------------------------------------------------------------------------------------------------ actions
-async function changeMode(next, view) {
-  const m = MODES.find((x) => x.id === next);
-  const r = await confirmWithPassword({
-    title: next === 'password' ? 'Ask for the password again?' : next === 'keychain' ? 'Open Harness without asking on this Mac?' : 'Turn encryption off?',
-    message: next === 'off' ? 'Harness decrypts every file. Your chats, memories and images will be readable by anyone who can read this Mac’s disk.' : m.text,
-    confirmLabel: next === 'off' ? 'Turn off encryption' : 'Change',
-    danger: next === 'off',
-    run: (password) => api.security.setMode({ password, mode: next }),
-  }).catch((e) => { showError(e, 'change protection'); return null; });
-  if (!r) return;
-  setSecurityContext({ mode: r.mode });
-  await refreshSecurity();
-  toast({ kind: 'success', message: r.state === 'migrating' ? 'Changing how your data is stored…' : 'Protection changed', id: 'mode' });
-  if (r.state === 'migrating') pollMigration(view);
-  view.renderNow?.();
+/** Show a once-only recovery key in a dialog that cannot be dismissed until the user says it is stored. */
+function showRecoveryKey(key, { title = 'Your new recovery key', createdAt } = {}) {
+  return new Promise((resolve) => {
+    let done = null;
+    const panel = recoveryKeyPanel(key, { createdAt, onStoredChange: (on) => { if (done) done.disabled = !on; } });
+    const dlg = openDialog({
+      title,
+      dismissible: false,
+      className: 'rk-dialog',
+      body: h('div.stack', panel.el, h('p.gate-warning', icon('warning', { size: 14 }), h('span', RECOVERY_WARNING)), panel.confirmEl),
+      actions: [{ label: 'Done', kind: 'primary', disabled: true, run: () => { if (!panel.stored()) return false; resolve(); return true; } }],
+    });
+    done = dlg.el.querySelector('.dialog-actions .btn');
+  });
 }
 
-async function pollMigration(view) {
-  for (let i = 0; i < 2000; i++) {
-    await new Promise((res) => setTimeout(res, 700));
-    const s = await refreshSecurity();
+/** Off mode without any password: turning encryption on needs a new password (and yields a recovery key). */
+function choosePassword() {
+  return new Promise((resolve) => {
+    const pw = passwordField({ label: 'New password', autocomplete: 'new-password' });
+    const again = passwordField({ label: 'New password again', autocomplete: 'new-password', name: 'password2' });
+    const meter = strengthMeter(pw.input);
+    const err = h('div.field-error', { role: 'alert' });
+    let got = null;
+    openDialog({
+      title: 'Choose a password', size: 'small',
+      body: h('form.stack', { on: { submit: (e) => e.preventDefault() } },
+        h('p.field-help', 'Harness encrypts your chats, memories and images with it and asks for it when it opens.'),
+        h('label.field-label', { htmlFor: pw.input.id }, 'Password'), pw.el, meter.el,
+        h('label.field-label', { htmlFor: again.input.id }, 'Type it again'), again.el, err),
+      actions: [{ label: 'Cancel' }, { label: 'Continue', kind: 'primary', run: () => {
+        const r = meter.update();
+        if (!r.ok) { err.textContent = r.detail; return false; }
+        if (pw.input.value !== again.input.value) { err.textContent = "The two passwords don't match."; return false; }
+        got = pw.input.value;
+        return true;
+      } }],
+      onClose: () => resolve(got),
+    });
+    pw.focus();
+  });
+}
+
+async function changeMode(next, view) {
+  const m = MODES.find((x) => x.id === next);
+  const sec = store.get('security') || {};
+  // A conversion may start with this request; keep the page (and a new recovery key) until the key is saved.
+  const release = holdLockdown();
+  try {
+    let r;
+    if (sec.mode === 'off' && !sec.recoveryKey && next !== 'off') {
+      const newPassword = await choosePassword();
+      if (!newPassword) return;
+      try { r = await api.security.setMode({ mode: next, newPassword }); } catch (e) { showError(e, 'turn encryption on'); return; }
+    } else {
+      r = await confirmWithPassword({
+        title: next === 'password' ? 'Ask for the password again?' : next === 'keychain' ? 'Open Harness without asking on this Mac?' : 'Turn encryption off?',
+        message: next === 'off' ? 'Harness decrypts every file. Your chats, memories and images will be readable by anyone who can read this Mac’s disk.' : m.text,
+        confirmLabel: next === 'off' ? 'Turn off encryption' : 'Change',
+        danger: next === 'off',
+        run: (password) => api.security.setMode({ password, mode: next }),
+      }).catch((e) => { showError(e, 'change protection'); return null; });
+    }
+    if (!r) return;
+    setSecurityContext({ mode: r.mode });
+    if (r.rekeyRecommended) store.set('rekeyRecommended', true);
+    if (r.recoveryKey) await showRecoveryKey(r.recoveryKey, { title: 'Your recovery key' });
+    toast({ kind: 'success', message: r.state === 'migrating' ? 'Changing how your data is stored…' : 'Protection changed', id: 'mode' });
+    await refreshSecurity();
     view.renderNow?.();
-    if (!s || s.state !== 'migrating') return;
-  }
+  } finally { release(); }
+}
+
+/** A new data key: everything is re-encrypted and a new recovery key replaces the old one (shown once). */
+async function rekey(view) {
+  const release = holdLockdown();
+  try {
+    const r = await confirmWithPassword({
+      title: 'Re-encrypt everything with a new key?',
+      message: 'Harness makes a new data key and re-encrypts all your files with it; this takes a little while and Harness is unavailable meanwhile. Your password stays the same; your recovery key is replaced by a new one, shown once.',
+      confirmLabel: 'Re-encrypt',
+      run: (password) => api.security.rekey(password),
+    }).catch((e) => { showError(e, 're-encrypt the data'); return null; });
+    if (!r) return;
+    store.set('rekeyRecommended', false);
+    if (r.recoveryKey) await showRecoveryKey(r.recoveryKey, { title: 'Your new recovery key' });
+    await refreshSecurity();
+    view.renderNow?.();
+  } finally { release(); }
 }
 
 function changePasswordDialog() {
@@ -220,17 +297,7 @@ async function newRecoveryKey(view) {
     run: (password) => api.security.newRecoveryKey(password),
   }).catch((e) => { showError(e, 'make a recovery key'); return null; });
   if (!r?.recoveryKey) return;
-  await new Promise((resolve) => {
-    let done = null;
-    const panel = recoveryKeyPanel(r.recoveryKey, { createdAt: r.createdAt, onStoredChange: (on) => { if (done) done.disabled = !on; } });
-    const dlg = openDialog({
-      title: 'Your new recovery key',
-      dismissible: false,
-      body: h('div.stack', panel.el, h('p.gate-warning', icon('warning', { size: 14 }), h('span', RECOVERY_WARNING)), panel.confirmEl),
-      actions: [{ label: 'Done', kind: 'primary', disabled: true, run: () => { if (!panel.stored()) return false; resolve(); return true; } }],
-    });
-    done = dlg.el.querySelector('.dialog-actions .btn');
-  });
+  await showRecoveryKey(r.recoveryKey, { createdAt: r.createdAt });
   await refreshSecurity();
   view.renderNow?.();
 }

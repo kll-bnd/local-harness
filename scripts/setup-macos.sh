@@ -184,7 +184,12 @@ case "$STATE" in
     ;;
   migrating)
     ok "Harness is encrypting your existing data (from Harness 0.1); it continues while it runs." ;;
-  unknown)
+  error|not_running:error)
+    bad "Harness's key store (vault.json) is damaged. Your data is still encrypted and nothing was changed."
+    note "Quit Harness and restore vault.json from a backup of the data folder, then run this again."
+    note "Do NOT choose a new password: it cannot open the existing data. Details: npm run doctor"
+    exit 1 ;;
+  unknown|not_running:unknown)
     warn "Could not ask Harness about its state (see: npm run doctor)." ;;
   *)
     ok "A Harness password is set." ;;

@@ -101,7 +101,18 @@ export function explainError(err, context = '') {
     case 'catalog_not_found':
       return { title: "That model isn't listed", detail: 'It may be private or removed.' };
     case 'catalog_unavailable':
-      return { title: "The catalogue can't be reached right now", detail: `${err.details?.source === 'ollama' ? 'ollama.com' : err.details?.source === 'huggingface' ? 'Hugging Face' : 'The site'} did not answer as expected. Installed models are not affected.` };
+      return {
+        title: /changed/i.test(msg) ? `The ${err.details?.source === 'ollama' ? 'Ollama library' : 'catalogue'} page has changed` : "The catalogue can't be reached right now",
+        detail: `${msg || `${err.details?.source === 'ollama' ? 'ollama.com' : err.details?.source === 'huggingface' ? 'Hugging Face' : 'The site'} did not answer as expected.`} Installed models are not affected.`,
+      };
+    case 'bad_cursor':
+      return { title: 'The list changed', detail: 'Starting it again from the top.' };
+    case 'not_encrypted':
+      return { title: 'Harness runs without encryption', detail: 'There is nothing to lock. Choose a password in Settings → Privacy & security.' };
+    case 'keychain_unavailable':
+      return { title: "The Keychain didn't answer", detail: msg };
+    case 'rate_limited':
+      return { title: 'Just a moment', detail: msg };
     case 'unsupported_sort':
       return { title: "This list can't be sorted that way", detail: msg };
     case 'bad_request':

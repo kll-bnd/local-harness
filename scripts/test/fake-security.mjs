@@ -3,11 +3,12 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 
-export async function startFakeSecurity({ state = 'locked', mode = 'password', password = 'correct horse', sessionInBody = true } = {}) {
+export async function startFakeSecurity({ state = 'locked', mode = 'password', password = 'correct horse', honourTokenRequest = true, error = null } = {}) {
   const f = {
     state, mode, password, failed: 0, sessions: new Set(), logouts: 0, unlockBodies: [], allowCalls: [], blockCalls: 0,
     offlineLock: { enabled: true, blocked: true, allowedUntil: null, waitingFor: null, osEnforced: true, osScope: 'ollama', externalOllama: false },
     migration: null,
+    error,
   };
   const retryAfter = () => (f.failed < 3 ? 0 : Math.min(300000, 1000 * 2 ** (f.failed - 3)));
   const json = (res, status, body, headers = {}) => { res.writeHead(status, { 'content-type': 'application/json', ...headers }); res.end(JSON.stringify(body)); };
@@ -17,7 +18,7 @@ export async function startFakeSecurity({ state = 'locked', mode = 'password', p
     const c = (req.headers.cookie || '').split(';').map((s) => s.trim()).find((s) => s.startsWith('harness_session='))?.slice(16);
     return [a, c].find((t) => t && f.sessions.has(t)) || null;
   };
-  const security = (req) => ({ state: f.state, mode: f.mode, plainDataFound: false, migration: f.migration, unlock: { failedAttempts: f.failed, retryAfterMs: f.lastFailAt ? Math.max(0, f.lastFailAt + retryAfter() - Date.now()) : 0 }, recoveryKey: null, idleLockMinutes: 15, session: { authenticated: !!sessionOf(req), via: sessionOf(req) ? 'token' : null }, transport: 'listener', offlineLock: f.offlineLock });
+  const security = (req) => ({ ...(f.state === 'error' ? { error: f.error } : {}), state: f.state, mode: f.mode, plainDataFound: false, migration: f.migration, unlock: { failedAttempts: f.failed, retryAfterMs: f.lastFailAt ? Math.max(0, f.lastFailAt + retryAfter() - Date.now()) : 0 }, recoveryKey: null, idleLockMinutes: 15, session: { authenticated: !!sessionOf(req), via: sessionOf(req) ? 'token' : null }, transport: 'listener', offlineLock: f.offlineLock });
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const c of req) raw += c;
@@ -28,6 +29,8 @@ export async function startFakeSecurity({ state = 'locked', mode = 'password', p
     if (p === 'GET /api/security') { if (f.migration) { f.migration.done++; if (f.migration.done >= f.migration.total) { f.migration = null; f.state = 'unlocked'; } } return json(res, 200, security(req)); }
     if (p === 'POST /api/security/unlock') {
       f.unlockBodies.push(body);
+      if (f.state === 'error') return err(res, 409, f.error.code);
+      if (body.session === 'token' && req.headers.origin) return err(res, 403, 'token_refused');
       if (f.state === 'needs_setup') return err(res, 423, 'needs_setup');
       const wait = f.lastFailAt ? f.lastFailAt + retryAfter() - Date.now() : 0;
       if (wait > 0) return err(res, 429, 'unlock_throttled', { retryAfterMs: wait });
@@ -37,13 +40,15 @@ export async function startFakeSecurity({ state = 'locked', mode = 'password', p
       if (f.state === 'locked') f.state = 'unlocked';
       const t = crypto.randomBytes(16).toString('hex');
       f.sessions.add(t);
-      return json(res, 200, { state: f.state, passwordReset: null, ...(sessionInBody ? { sessionToken: t } : {}) }, { 'set-cookie': `harness_session=${t}; HttpOnly; SameSite=Strict; Path=/` });
+      // Like §10.3: the token is in the body only when asked for with "session": "token".
+      return json(res, 200, { state: f.state, passwordReset: null, ...(honourTokenRequest && body.session === 'token' ? { sessionToken: t } : {}) }, { 'set-cookie': `harness_session=${t}; HttpOnly; SameSite=Strict; Path=/` });
     }
     if (p === 'POST /api/auth/logout') { const s = sessionOf(req); if (s) { f.sessions.delete(s); f.logouts++; } return json(res, 200, { ok: true }); }
+    if (f.state === 'error') return err(res, 503, f.error.code);
     if (f.state === 'needs_setup' || f.state === 'locked' || f.state === 'migrating') return err(res, 423, f.state === 'migrating' ? 'locked' : f.state);
     if (!sessionOf(req)) return err(res, 401, 'auth_required', { reason: 'missing', unlock: f.mode === 'password' });
     if (p === 'POST /api/security/lock') { f.state = 'locked'; f.sessions.clear(); return json(res, 200, { state: 'locked' }); }
-    if (p === 'GET /api/network') return json(res, 200, f.offlineLock);
+    if (p === 'GET /api/network') return json(res, 200, { offlineLock: f.offlineLock });
     if (p === 'POST /api/network/allow') {
       f.allowCalls.push({ minutes: body.minutes, hasPassword: 'password' in body });
       if (!('password' in body)) return err(res, 403, 'confirmation_required');

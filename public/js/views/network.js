@@ -182,18 +182,50 @@ export async function setBlocker(enabled) {
   return !!r;
 }
 
-/** "Check that nothing can get out" → plain-language lines per layer. */
+/**
+ * "Check that nothing can get out" → plain-language lines per layer. Every result is worded for what it is:
+ * the code layer only asks Harness's own blocker; the macOS layer really tries (a TCP connection to a public
+ * address, one UDP datagram, a name lookup) from inside the sandbox — and says so when it could not tell.
+ */
 export async function selfTest() {
-  const r = await api.network.test();
+  let r;
+  try { r = await api.network.test(); } catch (e) {
+    if (e instanceof api.ApiError && e.code === 'rate_limited') {
+      const s = Math.ceil((e.details?.retryAfterMs || 10000) / 1000);
+      throw new Error(`A check just ran. Try again in ${s} s.`);
+    }
+    throw e;
+  }
+  const what = (target) => {
+    const t = String(target || '');
+    if (/^dns /.test(t)) return { inf: `look up ${t.slice(4)}`, ger: `a lookup of ${t.slice(4)}` };
+    if (/^udp /.test(t)) return { inf: `send to ${t.slice(4)} (UDP)`, ger: `a UDP datagram to ${t.slice(4)}` };
+    const host = t.replace(/^tcp /, '');
+    return { inf: `connect to ${host}`, ger: `a connection to ${host}` };
+  };
   const lines = (r.results || []).map((x) => {
-    const layer = x.layer === 'os' ? 'macOS sandbox' : x.layer === 'code' ? 'Harness itself' : x.layer;
+    const os = x.layer === 'os';
+    const layer = os ? 'macOS sandbox' : x.layer === 'code' ? 'Harness itself' : x.layer;
+    const w = what(x.target);
     let text;
-    if (x.result === 'blocked') text = x.layer === 'os' ? `stopped a connection to ${x.target}.` : `refused to connect to ${x.target}.`;
-    else if (x.result === 'reachable') text = `a connection to ${x.target} got through.`;
-    else text = x.layer === 'os' ? 'not tested — no macOS sandbox covers this part of Harness here.' : 'not tested.';
-    return { layer, result: x.result, text, detail: x.detail || '' };
+    switch (x.result) {
+      case 'blocked': text = os ? `stopped ${w.ger}.` : `refuses to ${w.inf}.`; break;
+      case 'allowed': text = `would ${w.inf} right now.`; break;
+      case 'reachable': text = `did not stop ${w.ger} — it got through.`; break;
+      case 'inconclusive': text = `could not tell whether ${w.ger} is stopped.`; break;
+      case 'skipped': text = os ? 'not tested: no macOS sandbox covers this part of Harness here, so only Harness’s own blocker applies.' : 'not tested.'; break;
+      default: text = `${x.result || 'unknown'} (${w.ger}).`;
+    }
+    return { layer, result: x.result, text, detail: x.result === 'skipped' ? '' : x.detail || '' };
   });
-  return { blocked: !!r.blocked, lines };
+  if (typeof r.osEnforced === 'boolean') {
+    const ol = store.get('network');
+    if (ol) applyNetworkStatus({ ...ol, osEnforced: r.osEnforced });
+  }
+  const open = !r.blocked && lines.some((l) => l.result === 'allowed'); // inside an allow window: expected
+  const leaked = lines.some((l) => l.result === 'reachable') || (!!r.blocked && lines.some((l) => l.result === 'allowed'));
+  const unsure = lines.some((l) => l.result === 'inconclusive');
+  return { blocked: !!r.blocked && !leaked, open, leaked, unsure, osEnforced: r.osEnforced, lines };
 }
 
 // ------------------------------------------------------------------------------------------------ title bar

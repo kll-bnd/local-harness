@@ -69,8 +69,10 @@ function fitChip(fit) {
   const label = FIT_LABEL[f.verdict][f.estimate ? 1 : 0];
   const title = `${fit.note || ''}${f.estimate ? `${fit.note ? ' — ' : ''}an estimate; open it to see every file` : ''}` || label;
   const cls = f.verdict === 'comfortable' ? 'ok' : f.verdict === 'smaller' ? 'smaller' : 'no';
+  // Ollama: the verdict is for its largest size that fits (fit.size, e.g. "8b").
+  const extra = fit.size && f.verdict !== 'too_big' ? `up to ${fit.size}` : size && f.verdict !== 'smaller' ? size : '';
   return h(`span.fit-chip.${cls}`, { title, dataset: { verdict: f.verdict } },
-    f.verdict === 'too_big' ? null : icon('check', { size: 12 }), h('span', label), size && f.verdict !== 'smaller' ? h('span.faint', ` · ${size}`) : null);
+    f.verdict === 'too_big' ? null : icon('check', { size: 12 }), h('span', label), extra ? h('span.faint', ` · ${extra}`) : null);
 }
 
 // ------------------------------------------------------------------------------------------------ list
@@ -146,6 +148,7 @@ export class CatalogBrowser {
     } catch (e) {
       if (seq !== this.seq) return;
       if (e instanceof api.ApiError && e.code === 'offline_lock') this.blocked = e.details || {};
+      else if (e instanceof api.ApiError && e.code === 'bad_cursor' && cursor) { this.loading = false; this.reload(); return; }
       else this.error = e;
     } finally {
       if (seq === this.seq) {

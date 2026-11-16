@@ -51,7 +51,7 @@ const isMac = process.platform === 'darwin';
 async function getJson(url, timeoutMs = 2500, { method = 'GET', headers = {}, body } = {}) {
   try {
     const res = await fetch(url, { method, headers: body !== undefined ? { 'content-type': 'application/json', ...headers } : headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { ok: false, status: res.status };
+    if (!res.ok) return { ok: false, status: res.status, data: await res.json().catch(() => null) };
     return { ok: true, data: await res.json().catch(() => null) };
   } catch (e) {
     return { ok: false, error: e.cause?.code || e.name || e.message };
@@ -90,11 +90,30 @@ async function runningApi(running) {
   }
 }
 
-/** The security state without a session: what the files on disk say. */
-function inferStateFromDisk() {
-  const launch = readLaunchJson(dataDir);
-  if (launch.encryption === 'off') return 'ready';
-  return fs.existsSync(path.join(dataDir, 'vault.json')) ? 'locked' : 'needs_setup';
+/**
+ * When no Harness runs: open the real data folder with a short-lived backend (Ollama auto-start off, no
+ * password involved) just long enough to read its session-free security state and run its self-test with this
+ * install's own settings. It writes nothing but what any start writes (launch.json on a first start, the folder
+ * mode 700); in state `error` it changes nothing.
+ */
+async function probeDataDir() {
+  try {
+    const { startServer } = await import('../server/index.mjs');
+    const srv = await startServer({ port: 0, dataDir, openBrowser: false, autodetect: false, logLevel: 'silent' });
+    try {
+      const sec = (await getJson(`${srv.url}/api/security`, 10000)).data;
+      const test = await getJson(`${srv.url}/api/network/test`, 30000, { method: 'POST', body: {} });
+      return { sec, test };
+    } finally { await srv.close().catch(() => {}); }
+  } catch (e) {
+    return { sec: null, test: null, error: e };
+  }
+}
+
+async function selfTestOf(url) {
+  let r = await getJson(`${url}/api/network/test`, 30000, { method: 'POST', body: {} });
+  if (r.status === 429) { await new Promise((res) => setTimeout(res, 10500)); r = await getJson(`${url}/api/network/test`, 30000, { method: 'POST', body: {} }); }
+  return r;
 }
 
 /** The recommended chat model, its download, and (on ≤ 8 GB) the text-only copy to make from it. */
@@ -124,7 +143,9 @@ const launch = readLaunchJson(dataDir);
 if (onlyState) {
   // One word for scripts: needs_setup | locked | migrating | unlocked (running) or not_running:<what the disk says>.
   const running = await findRunningHarness({ dataDir, timeoutMs: 1500 }).catch(() => null);
-  console.log(running ? (running.state || 'unlocked') : `not_running:${inferStateFromDisk()}`);
+  if (running) { console.log(running.state || 'unlocked'); process.exit(0); }
+  const p = await probeDataDir();
+  console.log(`not_running:${p.sec?.state || (p.error ? 'unknown' : 'ready')}`);
   process.exit(0);
 }
 
@@ -173,28 +194,37 @@ add(writable ? 'ok' : 'fail', `Data folder: ${dataDir}`, writable ? '' : 'Not wr
 
 // ----------------------------------------------------------------------------- security and the blocker
 const running = writable ? await findRunningHarness({ dataDir, timeoutMs: 1500 }) : null;
+const probe = running ? null : (writable ? await probeDataDir() : null);
 const runningSec = running ? (await getJson(`${running.url}/api/security`, 5000)).data : null;
+const secNow = runningSec || probe?.sec || null;
 const modeNames = { password: 'password (you type it to open Harness)', keychain: 'Keychain (opens without asking — weaker)', off: 'OFF — your data is stored unencrypted' };
+const stText = (st, s2) => ({ needs_setup: 'no password chosen yet (Harness asks for one when you open it)', locked: 'locked (your data is closed)', migrating: `encrypting/decrypting your data${s2?.migration ? ` (${s2.migration.done}/${s2.migration.total})` : ''}`, unlocked: 'unlocked', error: 'KEY STORE DAMAGED' }[st] || st);
 if (running) {
   const st = runningSec?.state || running.state || 'unknown';
-  const stText = { needs_setup: 'waiting for you to choose a password', locked: 'locked (your data is closed)', migrating: `encrypting/decrypting your data${runningSec?.migration ? ` (${runningSec.migration.done}/${runningSec.migration.total})` : ''}`, unlocked: 'unlocked' }[st] || st;
-  add('info', `Harness ${running.version} is running at ${running.url} — ${stText}`, `pid ${running.pid ?? '?'}${runningSec?.transport ? `, ${runningSec.transport}` : ''}`);
+  add(st === 'error' ? 'fail' : 'info', `Harness ${running.version} is running at ${running.url} — ${stText(st, runningSec)}`, `pid ${running.pid ?? '?'}${runningSec?.transport ? `, ${runningSec.transport}` : ''}`);
   if (runningSec?.unlock?.retryAfterMs > 0) add('warn', `Too many wrong passwords: the next attempt is accepted in ${Math.ceil(runningSec.unlock.retryAfterMs / 1000)} s`);
+  if (runningSec?.unlock?.keychainError) add('warn', `The Keychain did not open Harness: ${runningSec.unlock.keychainError.message}`, 'Your password still opens it.');
 } else {
-  const st = inferStateFromDisk();
-  add('info', `Harness is not running${st === 'needs_setup' ? ' — no password chosen yet (Harness asks for one when you open it)' : ''}`);
+  add(probe?.sec?.state === 'error' ? 'fail' : 'info', `Harness is not running${probe?.sec ? ` — ${stText(probe.sec.state, probe.sec)}` : ''}`);
 }
-const mode = runningSec?.mode || launch.encryption;
+if (secNow?.state === 'error') {
+  // §10.1: never suggest setting up again — a new password cannot open the existing data.
+  add('fail', `The key store is unusable (${secNow.error?.code || 'error'}): ${secNow.error?.message || ''}`.trim(),
+    'Your chats are still encrypted and nothing was changed. Harness keeps a verified copy (vault.json.bak) and restores it by itself when it is intact; here it is not.',
+    `Quit Harness, restore vault.json (and vault.json.bak) from a backup of "${dataDir}" (Time Machine or your own copy), then open Harness again. Do not choose a new password.`);
+}
+const mode = secNow?.mode || launch.encryption;
 add(mode === 'off' ? 'warn' : mode === 'keychain' ? 'info' : 'ok', `Data protection: ${modeNames[mode] || mode}`,
   mode === 'password' ? 'Only your typed password (or the recovery key) opens the data; while Harness is locked other programs cannot read it.' : mode === 'keychain' ? 'Any program running as you can ask the Keychain for the key.' : 'Anyone who can read your files can read your chats.',
-  mode === 'off' ? 'Settings → Security → protection: password' : '');
-if (runningSec?.plainDataFound) add('warn', 'Unencrypted data from Harness 0.1 is waiting to be encrypted', 'Open Harness and choose a password; it encrypts the existing chats first.');
+  mode === 'off' ? 'Settings → protection: password' : '');
+if (secNow?.plainDataFound) add('warn', 'Unencrypted data from Harness 0.1 is waiting to be encrypted', 'Open Harness and choose a password; it encrypts the existing chats first.');
+if (runningSec?.idleLockAt) add('info', `Harness locks itself at ${new Date(runningSec.idleLockAt).toLocaleTimeString()} if it stays idle (idle lock ${runningSec.idleLockMinutes} min)`);
 try {
   const m = fs.statSync(dataDir).mode & 0o777;
   if (m & 0o077) add('warn', `The data folder is readable by other accounts (mode ${m.toString(8)})`, 'Harness 0.2 sets it to 700 when it starts.', `chmod 700 "${dataDir}"`);
 } catch { /* reported above */ }
 
-const offline = runningSec?.offlineLock || null;
+const offline = secNow?.offlineLock || null;
 let session = null;
 if (unlock && running) {
   session = await runningApi(running);
@@ -204,23 +234,23 @@ const tmpApi = await tempApi(launch);
 const api = session || tmpApi;
 const call = (p, o = {}) => (api ? getJson(`${api.url}${p}`, o.timeoutMs || 15000, { ...o, headers: { ...(api.headers || {}), ...(o.headers || {}) } }) : Promise.resolve({ ok: false }));
 
-// The blocker: its setting, how it is enforced, and the backend's own self-test — in one line.
-const selfTest = await call('/api/network/test', { method: 'POST', body: {}, timeoutMs: 30000 });
-const where = session ? 'inside the running Harness' : 'in a temporary backend with your setting';
+// The blocker: its setting, how it is enforced, and the backend's own self-test (no session needed) — in one line.
+const selfTest = running ? await selfTestOf(running.url) : probe?.test || { ok: false };
+const where = running ? 'in the running Harness' : 'in Harness with this folder\'s settings';
 if (!offline && !selfTest.ok) {
-  add('info', `Internet blocker: ${launch.offlineLock === false ? 'off' : 'on'} (launch.json); this backend has no self-test`);
+  add('info', `Internet blocker: ${launch.offlineLock === false ? 'off' : 'on'} (launch.json); no self-test available`);
 } else {
-  const o = offline || selfTest.data?.offlineLock || { enabled: launch.offlineLock !== false, blocked: launch.offlineLock !== false, osEnforced: false, osScope: 'none', externalOllama: false };
+  const o = { ...(offline || { enabled: launch.offlineLock !== false, blocked: launch.offlineLock !== false, osScope: 'none', externalOllama: false }), ...(typeof selfTest.data?.osEnforced === 'boolean' ? { osEnforced: selfTest.data.osEnforced } : {}) };
   const results = selfTest.data?.results || [];
-  const reachable = results.filter((r) => r.result === 'reachable');
+  const leaks = results.filter((r) => r.result === 'reachable' || r.result === 'allowed');
   const verdict = !o.enabled ? 'OFF — Harness and the Ollama it starts can reach the internet'
     : !o.blocked ? `ALLOWED${o.allowedUntil ? ` until ${new Date(o.allowedUntil).toLocaleTimeString()}` : ''} (for a download) — it blocks again by itself`
-      : reachable.length ? `ON, but the self-test reached ${reachable.map((r) => r.target).join(', ')} — something CAN leave this Mac`
+      : leaks.length ? `ON, but the self-test got through to ${leaks.map((r) => r.target).join(', ')} — something CAN leave this Mac`
         : `nothing Harness sends can leave this Mac${o.externalOllama ? ' — but the Ollama in use was not started by Harness and is not confined' : ''}`;
-  add(!o.enabled || reachable.length || o.externalOllama ? 'warn' : 'ok', `Internet blocker: ${verdict}`,
-    [`${describeOfflineLock(o)}${offline ? '' : ' (setting from launch.json; Harness is not running)'}`,
-      selfTest.ok ? `self-test ${where}: ${results.map((r) => `${r.layer} ${r.target} → ${r.result}`).join('; ') || 'no probes'}` : 'self-test: not available',
-      o.enabled && offline && !o.osEnforced ? 'Only Harness\'s own code blocks; no macOS sandbox is in force.' : ''].filter(Boolean).join('\n      '),
+  add(!o.enabled || leaks.length || o.externalOllama ? 'warn' : 'ok', `Internet blocker: ${verdict}`,
+    [describeOfflineLock(o),
+      selfTest.ok ? `self-test ${where}: ${results.map((r) => `${r.layer} ${r.target} → ${r.result}`).join('; ') || 'no probes'}` : `self-test: not available${selfTest.status ? ` (HTTP ${selfTest.status})` : ''}`,
+      o.enabled && o.blocked && !o.osEnforced ? 'Only Harness\'s own code blocks right now; no macOS sandbox is in force (it applies to the Ollama Harness starts).' : ''].filter(Boolean).join('\n      '),
     o.externalOllama ? 'Quit the other Ollama (menu bar → Quit Ollama; brew services stop ollama) so Harness starts its own inside the sandbox.' : '');
 }
 
@@ -248,12 +278,9 @@ if (!ollama.installed && !ollamaUp) {
 // the temporary backend cannot know who started Ollama: the running Harness's externalOllama flag answers it.
 let prot = ollama.protections;
 if (running && !session) {
-  const unlockedNow = (runningSec?.state || running.state) === 'unlocked';
   if (!offline) prot = null;
   else if (offline.externalOllama) prot = { inEffect: false, external: true, message: 'The Ollama in use was not started by Harness, so its memory protections and the macOS sandbox do not apply.' };
   else if (!ollamaUp) prot = { inEffect: false, external: false, message: 'The running Harness starts Ollama itself when needed.' };
-  // A locked Harness may not have looked at Ollama yet (seen on the 0.2 backend: externalOllama false while locked).
-  else if (!unlockedNow) prot = { inEffect: false, external: false, unknown: true, message: 'Whether the running Harness started this Ollama is known only while Harness is unlocked: run `npm run doctor -- --unlock`.' };
   else prot = { inEffect: true, external: false, message: 'Ollama was started by the running Harness, with its memory protections.' };
 }
 const menuBarApp = isMac && run('pgrep', ['-x', 'Ollama']) !== null;

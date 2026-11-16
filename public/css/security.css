@@ -34,6 +34,7 @@
 .gate-or { text-align: center; color: var(--fg-4); font-size: 12px; }
 .gate-callout { display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px; border-radius: var(--r-md); background: var(--accent-softer); box-shadow: inset 0 0 0 0.5px var(--accent-soft); color: var(--fg-2); font-size: 12.5px; line-height: 1.5; }
 .gate-callout .icon { color: var(--accent-text); margin-top: 2px; flex: none; }
+.gate-steps { margin: 4px 0 0; padding-left: 1.2em; display: flex; flex-direction: column; gap: 3px; }
 .gate-warning { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 10px 12px; border-radius: var(--r-md); background: var(--warn-soft); color: var(--fg); font-size: 12.5px; line-height: 1.5; }
 .gate-warning .icon { color: var(--warn); margin-top: 2px; flex: none; }
 .gate .rk-input { font-family: var(--font-mono); font-size: 13px; letter-spacing: 0.02em; resize: none; text-transform: uppercase; }
@@ -130,6 +131,9 @@
 .selftest-head { display: flex; align-items: center; gap: 6px; font-weight: 600; }
 .selftest-head.ok .icon { color: var(--ok); }
 .selftest-head.bad { color: var(--danger); }
+.selftest-head.unsure .icon { color: var(--warn); }
+.selftest-item.inconclusive .selftest-dot { background: var(--warn-dot); }
+.selftest-item.allowed .selftest-dot { background: var(--danger); }
 .selftest-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; line-height: 1.45; }
 .selftest-item { display: flex; gap: 8px; align-items: baseline; }
 .selftest-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--fg-4); transform: translateY(-1px); }

@@ -4,6 +4,8 @@
 // throws away every store, cache and model in memory. The address (#/chat/<id>, #/settings/…) is kept, so
 // after unlocking the user is back where they were.
 
+import * as api from './api.js';
+
 const hooks = new Set();
 let locking = false;
 
@@ -16,11 +18,38 @@ export function onLockdown(fn) { hooks.add(fn); return () => hooks.delete(fn); }
 export function isLockError(e) {
   if (!e || typeof e.status !== 'number') return false;
   if (e.status === 401 && e.code === 'auth_required') return true;
+  if (e.status === 503 && ['vault_corrupt', 'vault_missing'].includes(e.code)) return true; // state `error`
   return e.status === 423 && ['locked', 'needs_setup', 'migrating'].includes(e.code);
+}
+
+/**
+ * While a once-only secret (a new recovery key) is on screen, a conversion that started with it (re-keying,
+ * turning encryption on) must not reload the page and lose the key: such lockdowns wait until `release()`.
+ * Real locks (the user, idle, auth) still happen at once.
+ */
+let held = 0;
+let deferred = null;
+export function holdLockdown() {
+  held++;
+  let done = false;
+  return function release() {
+    if (done) return;
+    done = true;
+    held--;
+    if (!held && deferred) { const r = deferred; deferred = null; lockdown(r); }
+  };
 }
 
 export function lockdown(reason = 'locked') {
   if (locking) return;
+  if (held && reason !== 'manual' && reason !== 'idle') {
+    // A conversion (re-keying, turning encryption on) closes the event stream too: ask what really happened.
+    if (reason === 'migrating') { deferred = reason; return; }
+    api.security.status().then((s) => {
+      if (s.state === 'migrating' || (s.state === 'unlocked' && s.session?.authenticated)) { if (held) deferred = 'migrating'; else lockdown('migrating'); } else { held = 0; lockdown(reason); }
+    }, () => { held = 0; lockdown(reason); });
+    return;
+  }
   locking = true;
   for (const fn of hooks) { try { fn(reason); } catch { /* keep going */ } }
   // Clear the screen first, synchronously: dialogs, popovers, toasts and the app itself.
