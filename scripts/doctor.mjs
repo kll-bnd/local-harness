@@ -214,7 +214,7 @@ if (running) {
   if (runningSec?.unlock?.keychainError) add('warn', `The Keychain did not open Harness: ${runningSec.unlock.keychainError.message}`, 'Your password still opens it.');
 } else if (inApp) {
   add('info', `Harness is open in the Harness app (pid ${inApp.pid})`,
-    'The app has no local address (by design), so this tool cannot ask it whether it is locked, run its internet self-test or see the loaded model.\n      In the app: Settings → Privacy & security shows the lock state and the blocker, with a "Test" button.');
+    'The app has no local address (by design), so this tool cannot ask it whether it is locked, run its internet self-test or see the loaded model.\n      In the app: Settings → Privacy & security shows the protection and the blocker, with the button "Check that nothing can get out".');
 } else {
   add(probe?.sec?.state === 'error' ? 'fail' : 'info', `Harness is not running${probe?.sec ? ` — ${stText(probe.sec.state, probe.sec)}` : ''}`);
 }
@@ -249,7 +249,7 @@ const call = (p, o = {}) => (api ? getJson(`${api.url}${p}`, o.timeoutMs || 1500
 const selfTest = running ? await selfTestOf(running.url) : probe?.test || { ok: false };
 const where = running ? 'in the running Harness' : 'in Harness with this folder\'s settings';
 if (!offline && !selfTest.ok) {
-  add('info', `Internet blocker: ${launch.offlineLock === false ? 'off' : 'on'} (launch.json); ${inApp ? 'run its self-test in the app (Settings → Privacy & security → Test)' : 'no self-test available'}`);
+  add('info', `Internet blocker: ${launch.offlineLock === false ? 'off' : 'on'} (launch.json); ${inApp ? 'run its self-test in the app (Settings → Privacy & security → "Check that nothing can get out")' : 'no self-test available'}`);
 } else {
   const o = { ...(offline || { enabled: launch.offlineLock !== false, blocked: launch.offlineLock !== false, osScope: 'none', externalOllama: false }), ...(typeof selfTest.data?.osEnforced === 'boolean' ? { osEnforced: selfTest.data.osEnforced } : {}) };
   const results = selfTest.data?.results || [];
