@@ -199,9 +199,19 @@ export async function openApp(stack, { hash = '', colorScheme = 'light', width =
   page.setDefaultTimeout(30000); // generous: a busy CI Mac or an 8 GB M1 under memory pressure is slow
   const errors = [];
   const requests = [];
-  page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) errors.push(`console: ${m.text()}`); });
-  page.on('request', (r) => requests.push(r.url()));
+  // WebKit reports every same-origin request that a navigation (a reload, page.goto, Harness locking) cancels
+  // as an error "… due to access control checks." — noise, not a fault of the page: it is ignored when it
+  // happens around a navigation of the page. (The UI makes no cross-origin requests at all.)
+  const navigations = [];
+  const raw = []; // { text, at } — classified when asserted (the navigation may be reported after its noise)
+  const navNoise = ({ text, at }) => /\/api\/\S* due to access control checks\.?$/.test(text) && navigations.some((t) => Math.abs(at - t) < 3000);
+  page.on('request', (r) => {
+    requests.push(r.url());
+    try { if (r.isNavigationRequest() && r.frame() === page.mainFrame()) navigations.push(Date.now()); } catch { /* frame gone */ }
+  });
+  const record = (text) => { raw.push({ text, at: Date.now() }); errors.push(text); };
+  page.on('pageerror', (e) => record(`pageerror: ${e.message}`));
+  page.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) record(`console: ${m.text()}`); });
   await page.goto(`${stack.url}/${hash}`);
   await page.waitForSelector('html.ready');
   return {
@@ -209,7 +219,7 @@ export async function openApp(stack, { hash = '', colorScheme = 'light', width =
     /** No uncaught errors, console errors or CSP violations happened. */
     async assertClean(assert) {
       const csp = await page.evaluate(() => window.__csp || []).catch(() => []);
-      assert.deepEqual([...errors, ...csp.map((c) => `csp: ${c}`)], []);
+      assert.deepEqual([...raw.filter((e) => !navNoise(e)).map((e) => e.text), ...csp.map((c) => `csp: ${c}`)], []);
     },
     async shot(name) {
       if (!process.env.HARNESS_UI_SHOTS) return;
@@ -223,11 +233,15 @@ export async function openApp(stack, { hash = '', colorScheme = 'light', width =
 // ------------------------------------------------------------------------------------------------ helpers
 /** Type into the composer and send with Enter. */
 export async function send(page, text, { wait = true } = {}) {
+  const before = await page.evaluate(() => document.querySelectorAll('.turn').length);
   const input = page.locator('.composer-input');
   await input.click();
   await input.fill(text);
   await input.press('Enter');
-  if (wait) await waitIdle(page);
+  if (!wait) return;
+  // First the message's turn appears — otherwise "idle" could be the moment before the request started.
+  await page.waitForFunction((n) => document.querySelectorAll('.turn').length > n, before);
+  await waitIdle(page);
 }
 
 /** Wait until the current chat is not generating (send button is not a stop button) and the DOM settled. */

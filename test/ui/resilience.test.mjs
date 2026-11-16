@@ -30,18 +30,26 @@ test('errors: Ollama stopping mid-session gives a human message, and the typed t
     const { page } = app;
     await send(page, 'hello');
     await stack.fake.close();
+    // Diagnostics for a failure: every toast that appears, and the requests sent from here on.
+    await page.evaluate(() => {
+      window.__toastLog = [];
+      new MutationObserver(() => { for (const x of document.querySelectorAll('.toast')) { const t = `${x.className}: ${x.textContent}`; if (!window.__toastLog.includes(t)) window.__toastLog.push(t); } }).observe(document.body, { childList: true, subtree: true });
+    });
+    const fromRequest = app.requests.length;
     await page.locator('.composer-input').fill('are you still there?');
     await page.locator('.composer-input').press('Enter');
     const t = page.locator('.toast-error');
     await t.waitFor().catch(async (e) => {
       // Say what the page showed instead (the CI log prints only the failure).
       const seen = await page.evaluate(() => ({
-        toasts: [...document.querySelectorAll('.toast')].map((x) => `${x.className}: ${x.textContent}`),
-        last: document.querySelectorAll('.turn')[document.querySelectorAll('.turn').length - 1]?.textContent.slice(0, 400),
+        toasts: window.__toastLog,
+        hash: location.hash,
+        active: document.activeElement?.className,
+        last: document.querySelectorAll('.turn')[document.querySelectorAll('.turn').length - 1]?.textContent.slice(0, 300),
         composer: document.querySelector('.composer-input')?.value,
-        sending: !!document.querySelector('.send-btn.stop'),
+        sendBtn: document.querySelector('.send-btn')?.outerHTML.slice(0, 200),
       })).catch(() => null);
-      throw new Error(`${e.message}\npage: ${JSON.stringify(seen)}`);
+      throw new Error(`${e.message}\npage: ${JSON.stringify(seen)}\nrequests: ${app.requests.slice(fromRequest).map((u) => u.replace(stack.url, '')).join(' ')}`);
     });
     assert.match(await t.textContent(), /isn.t running|isn.t reachable|not running/i);
     // Nothing typed is lost: either it is back in the composer (failed before the stream started) or it is
