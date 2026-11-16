@@ -1,8 +1,8 @@
 // Generic OpenAI-compatible client (llama.cpp llama-server, LM Studio, MLX-LM, vLLM, LocalAI, ...).
-import { ProviderError, isAbortError } from '../lib/errors.mjs';
+import { ProviderError } from '../lib/errors.mjs';
 import { readSse } from '../lib/streams.mjs';
+import { backendFetch, guardStream } from '../lib/backend-http.mjs';
 import { newId } from '../lib/ids.mjs';
-import { withTimeout } from '../lib/util.mjs';
 
 export function classifyOpenAIError(status, message, providerId) {
   const msg = String(message || `HTTP ${status}`);
@@ -60,14 +60,7 @@ export class OpenAICompatProvider {
   }
 
   async request(path, { method = 'GET', body, signal, timeoutMs } = {}) {
-    let res;
-    try {
-      res = await fetch(this.baseUrl + path, { method, headers: this.headers(body !== undefined), body: body !== undefined ? JSON.stringify(body) : undefined, signal: withTimeout(signal, timeoutMs) });
-    } catch (e) {
-      if (signal?.aborted || isAbortError(e)) throw e;
-      if (e?.name === 'TimeoutError') throw new ProviderError(`${this.name} timed out (${path})`, { code: 'timeout', providerId: this.id });
-      throw new ProviderError(`Cannot reach ${this.name} at ${this.baseUrl}`, { code: 'connection_failed', providerId: this.id, cause: e });
-    }
+    const res = await backendFetch(this, path, { method, body, signal, timeoutMs });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       let msg = text;
@@ -153,7 +146,7 @@ export class OpenAICompatProvider {
     let finish = null;
     let usage = null;
     let timings = null;
-    for await (const ev of readSse(res.body)) {
+    for await (const ev of readSse(guardStream(res.body, this, '/v1/chat/completions', signal))) {
       if (ev.data === '[DONE]') break;
       let j;
       try { j = JSON.parse(ev.data); } catch { continue; }

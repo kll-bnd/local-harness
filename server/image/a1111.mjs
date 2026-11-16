@@ -1,6 +1,7 @@
 // AUTOMATIC1111-compatible image API (Draw Things HTTP API server, AUTOMATIC1111, Forge, SD.Next).
 import { imageJson, imageRequest, sniffImageMime } from './http.mjs';
 import { ProviderError } from '../lib/errors.mjs';
+import { backendFetch } from '../lib/backend-http.mjs';
 
 export class A1111Provider {
   /** Progress polling interval (ms). */
@@ -16,17 +17,39 @@ export class A1111Provider {
     this.capabilities = { img2img: true, progress: true, models: true, negativePrompt: true, seed: true, steps: true, cfg: true, sampler: true };
   }
 
+  /**
+   * Detect an A1111-compatible API. Only JSON answers count, so an unrelated web service on the same port is
+   * never mistaken for Draw Things: /sdapi/v1/options (A1111, Forge), then /sd-models or /samplers (arrays),
+   * then GET on the POST-only txt2img route (FastAPI answers 405/422 with a JSON `detail`), then GET / (Draw Things
+   * is assumed to answer with its current configuration JSON).
+   */
   async status() {
-    try {
-      const opts = await imageJson(this, '/sdapi/v1/options', { timeoutMs: 1500, accept404: true });
-      if (opts) return { ok: true, currentModel: opts.sd_model_checkpoint || opts.model || null };
-      // Some servers only implement txt2img/img2img; a 405/422 on txt2img GET proves the API exists.
-      const r = await fetch(this.baseUrl + '/sdapi/v1/txt2img', { method: 'GET', signal: AbortSignal.timeout(1500) });
-      if ([405, 422, 200].includes(r.status)) return { ok: true, currentModel: null };
-      return { ok: false, error: `No A1111-compatible API at ${this.baseUrl}` };
-    } catch (e) {
-      return { ok: false, error: e.message };
+    const probe = async (path) => {
+      try {
+        const res = await backendFetch(this, path, { timeoutMs: 1500 });
+        const text = (await res.text()).slice(0, 500000);
+        let json = null;
+        if (/^\s*[{[]/.test(text)) { try { json = JSON.parse(text); } catch { /* not JSON */ } }
+        return { status: res.status, json };
+      } catch (e) {
+        return { error: e };
+      }
+    };
+    const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+    const opts = await probe('/sdapi/v1/options');
+    if (opts.error) return { ok: false, error: opts.error.message };
+    if (opts.status === 200 && isObj(opts.json)) return { ok: true, currentModel: opts.json.sd_model_checkpoint || opts.json.model || null };
+    for (const path of ['/sdapi/v1/sd-models', '/sdapi/v1/samplers']) {
+      const r = await probe(path);
+      if (r.status === 200 && Array.isArray(r.json)) return { ok: true, currentModel: null };
     }
+    const t2i = await probe('/sdapi/v1/txt2img');
+    if ([405, 422].includes(t2i.status) && isObj(t2i.json) && ('detail' in t2i.json || 'error' in t2i.json)) return { ok: true, currentModel: null };
+    const root = await probe('/');
+    if (root.status === 200 && isObj(root.json) && 'steps' in root.json && ('model' in root.json || 'guidance_scale' in root.json || 'sampler' in root.json)) {
+      return { ok: true, currentModel: typeof root.json.model === 'string' ? root.json.model : null };
+    }
+    return { ok: false, error: `No A1111-compatible API at ${this.baseUrl}` };
   }
 
   async listModels() {
@@ -111,6 +134,10 @@ export class A1111Provider {
       if (Array.isArray(info?.all_seeds) && info.all_seeds.length) seeds = info.all_seeds.slice(0, out.length);
       else if (Number.isFinite(info?.seed)) seeds = out.map((_, i) => info.seed + i);
       return { images: out, seeds };
+    } catch (e) {
+      // Whatever went wrong (timeout, dropped connection, bad answer), never leave the backend generating.
+      if (!signal?.aborted) this.interrupt();
+      throw e;
     } finally {
       polling = false;
       signal?.removeEventListener('abort', onAbort);

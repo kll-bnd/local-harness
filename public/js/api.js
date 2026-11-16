@@ -152,6 +152,8 @@ export const models = {
   unload: (r) => post('/api/models/unload', ref(r)),
   loaded: () => get('/api/models/loaded'),
   embeddings: () => get('/api/embeddings/status'),
+  measurements: (r) => get(`/api/models/measurements${qs(ref(r))}`),
+  resetMeasurements: (r) => del(`/api/models/measurements${qs(ref(r))}`),
 };
 
 // ------------------------------------------------------------------------------------------------ 5.5–5.8

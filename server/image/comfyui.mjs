@@ -8,7 +8,7 @@ import { sleep } from '../lib/util.mjs';
 export const DEFAULT_TXT2IMG_WORKFLOW = {
   3: { class_type: 'KSampler', inputs: { seed: '{{seed}}', steps: '{{steps}}', cfg: '{{cfg}}', sampler_name: '{{sampler}}', scheduler: '{{scheduler}}', denoise: 1, model: ['4', 0], positive: ['6', 0], negative: ['7', 0], latent_image: ['5', 0] } },
   4: { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: '{{model}}' } },
-  5: { class_type: 'EmptyLatentImage', inputs: { width: '{{width}}', height: '{{height}}', batch_size: '{{count}}' } },
+  5: { class_type: 'EmptyLatentImage', inputs: { width: '{{width}}', height: '{{height}}', batch_size: 1 } },
   6: { class_type: 'CLIPTextEncode', inputs: { text: '{{prompt}}', clip: ['4', 1] } },
   7: { class_type: 'CLIPTextEncode', inputs: { text: '{{negative_prompt}}', clip: ['4', 1] } },
   8: { class_type: 'VAEDecode', inputs: { samples: ['3', 0], vae: ['4', 2] } },
@@ -123,6 +123,10 @@ export class ComfyUIProvider {
     }
   }
 
+  /**
+   * One queued prompt per image (batch size 1, seed + i), like the A1111 path: a parallel batch multiplies peak
+   * memory, which an 8 GB Mac cannot afford. `{{count}}` in a custom workflow is therefore always 1.
+   */
   async generate(p, { signal, onProgress } = {}) {
     let model = p.model;
     const custom = this.getWorkflow?.() || this.workflow;
@@ -134,44 +138,55 @@ export class ComfyUIProvider {
     let image = '';
     if (p.initImage) image = await this.upload(p.initImage);
     const template = custom || (p.initImage ? DEFAULT_IMG2IMG_WORKFLOW : DEFAULT_TXT2IMG_WORKFLOW);
-    const workflow = fillWorkflow(template, {
-      prompt: p.prompt, negative_prompt: p.negativePrompt || '', seed: p.seed, steps: p.steps, cfg: p.cfg, width: p.width, height: p.height,
-      count: p.count, denoise: p.denoise ?? 0.6, model: model || '', sampler: p.sampler || p.comfy?.sampler || 'euler', scheduler: p.scheduler || p.comfy?.scheduler || 'normal', image,
-    });
+    const count = Math.max(1, p.count || 1);
     const clientId = crypto.randomUUID();
-    const ws = this.openProgressSocket(clientId, onProgress);
+    let current = 0;
+    const ws = this.openProgressSocket(clientId, (pr) => onProgress?.({ ...pr, progress: Math.min(0.99, (current + pr.progress) / count), image: current + 1, images: count }));
     let promptId = null;
     const onAbort = () => { this.interrupt(promptId); };
     signal?.addEventListener('abort', onAbort, { once: true });
+    const images = [];
+    const seeds = [];
     try {
-      const q = await imageJson(this, '/prompt', { method: 'POST', body: { prompt: workflow, client_id: clientId }, signal, timeoutMs: 30000 });
-      if (q.node_errors && Object.keys(q.node_errors).length) throw new ProviderError(`${this.name}: workflow error ${JSON.stringify(q.node_errors).slice(0, 300)}`, { status: 400, providerId: this.id });
-      promptId = q.prompt_id;
-      if (!promptId) throw new ProviderError(`${this.name}: no prompt_id returned`, { providerId: this.id });
-      let entry = null;
-      for (;;) {
-        if (signal?.aborted) throw signal.reason ?? new Error('Aborted');
-        const h = await imageJson(this, `/history/${promptId}`, { signal, timeoutMs: 10000 });
-        entry = h?.[promptId];
-        if (entry?.status?.status_str === 'error') {
-          const msg = entry.status.messages?.find((m) => m[0] === 'execution_error')?.[1]?.exception_message;
-          throw new ProviderError(`${this.name}: generation failed${msg ? `: ${msg}` : ''}`, { providerId: this.id });
+      for (current = 0; current < count; current++) {
+        const seed = p.seed + current;
+        const workflow = fillWorkflow(template, {
+          prompt: p.prompt, negative_prompt: p.negativePrompt || '', seed, steps: p.steps, cfg: p.cfg, width: p.width, height: p.height,
+          count: 1, denoise: p.denoise ?? 0.6, model: model || '', sampler: p.sampler || p.comfy?.sampler || 'euler', scheduler: p.scheduler || p.comfy?.scheduler || 'normal', image,
+        });
+        const q = await imageJson(this, '/prompt', { method: 'POST', body: { prompt: workflow, client_id: clientId }, signal, timeoutMs: 30000 });
+        if (q.node_errors && Object.keys(q.node_errors).length) throw new ProviderError(`${this.name}: workflow error ${JSON.stringify(q.node_errors).slice(0, 300)}`, { status: 400, providerId: this.id });
+        promptId = q.prompt_id;
+        if (!promptId) throw new ProviderError(`${this.name}: no prompt_id returned`, { providerId: this.id });
+        let entry = null;
+        for (;;) {
+          if (signal?.aborted) throw signal.reason ?? new Error('Aborted');
+          const h = await imageJson(this, `/history/${encodeURIComponent(promptId)}`, { signal, timeoutMs: 10000 });
+          entry = h?.[promptId];
+          if (entry?.status?.status_str === 'error') {
+            const msg = entry.status.messages?.find((m) => m[0] === 'execution_error')?.[1]?.exception_message;
+            throw new ProviderError(`${this.name}: generation failed${msg ? `: ${msg}` : ''}`, { providerId: this.id });
+          }
+          if (entry && (entry.status?.completed || Object.keys(entry.outputs || {}).length)) break;
+          await sleep(400, signal);
         }
-        if (entry && (entry.status?.completed || Object.keys(entry.outputs || {}).length)) break;
-        await sleep(400, signal);
-      }
-      const files = [];
-      for (const out of Object.values(entry.outputs || {})) for (const img of out.images || []) if (img.type !== 'temp') files.push(img);
-      if (!files.length) for (const out of Object.values(entry.outputs || {})) for (const img of out.images || []) files.push(img);
-      const images = [];
-      for (const f of files) {
+        const files = [];
+        for (const out of Object.values(entry.outputs || {})) for (const img of out.images || []) if (img.type !== 'temp') files.push(img);
+        if (!files.length) for (const out of Object.values(entry.outputs || {})) for (const img of out.images || []) files.push(img);
+        if (!files.length) throw new ProviderError(`${this.name} produced no images (does the workflow end in a SaveImage node?)`, { providerId: this.id });
+        // one image per prompt (a custom workflow with a larger batch still yields `count` images in total)
+        const f = files[0];
         const qs = new URLSearchParams({ filename: f.filename, subfolder: f.subfolder || '', type: f.type || 'output' });
         const res = await imageRequest(this, `/view?${qs}`, { signal, timeoutMs: 60000 });
-        const buffer = Buffer.from(await res.arrayBuffer());
+        const buffer = await res.buffer();
         images.push({ buffer, mime: sniffImageMime(buffer) });
+        seeds.push(seed);
+        promptId = null;
       }
-      if (!images.length) throw new ProviderError(`${this.name} produced no images (does the workflow end in a SaveImage node?)`, { providerId: this.id });
-      return { images, seeds: images.map((_, i) => p.seed + i), model };
+      return { images, seeds, model };
+    } catch (e) {
+      if (!signal?.aborted) this.interrupt(promptId);
+      throw e;
     } finally {
       signal?.removeEventListener('abort', onAbort);
       try { ws?.close(); } catch { /* ignore */ }

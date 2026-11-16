@@ -1,20 +1,10 @@
 // Shared HTTP helper for image backends.
-import { ProviderError, isAbortError } from '../lib/errors.mjs';
-import { withTimeout } from '../lib/util.mjs';
+import { ProviderError } from '../lib/errors.mjs';
+import { backendFetch } from '../lib/backend-http.mjs';
 
 export async function imageRequest(provider, path, { method = 'GET', body, rawBody, headers = {}, signal, timeoutMs, accept404 = false } = {}) {
-  let res;
-  const h = { ...headers };
-  if (body !== undefined) h['content-type'] = 'application/json';
-  if (provider.apiKey) h.authorization = `Bearer ${provider.apiKey}`;
-  try {
-    res = await fetch(provider.baseUrl + path, { method, headers: h, body: rawBody ?? (body !== undefined ? JSON.stringify(body) : undefined), signal: withTimeout(signal, timeoutMs) });
-  } catch (e) {
-    if (signal?.aborted || isAbortError(e)) throw e;
-    if (e?.name === 'TimeoutError') throw new ProviderError(`${provider.name} timed out (${path})`, { code: 'timeout', providerId: provider.id });
-    throw new ProviderError(`Cannot reach ${provider.name} at ${provider.baseUrl}`, { code: 'connection_failed', providerId: provider.id, cause: e });
-  }
-  if (accept404 && res.status === 404) return null;
+  const res = await backendFetch(provider, path, { method, body, rawBody, headers, signal, timeoutMs });
+  if (accept404 && res.status === 404) { res.cancel(); return null; }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     let msg = text;

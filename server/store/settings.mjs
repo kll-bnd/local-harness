@@ -69,7 +69,8 @@ const url = () => custom((v, p) => {
   try { const u = new URL(v); if (!/^https?:$/.test(u.protocol)) return `${p} must be http(s)`; } catch { return `${p} must be a valid URL`; }
   return null;
 });
-const keepAlive = custom((v, p) => (typeof v === 'number' || (typeof v === 'string' && /^-?\d+(\.\d+)?(ms|s|m|h)?$/.test(v)) ? null : `${p} must be a duration like "30m", "-1" or a number of seconds`), { nullable: true });
+// Number of seconds (negative = forever), a numeric string (sent to Ollama as a number), or a Go duration ("30m", "1h30m").
+const keepAlive = custom((v, p) => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && (/^\s*-?\d+(\.\d+)?\s*$/.test(v) || /^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(v))) ? null : `${p} must be a duration like "30m", "-1" or a number of seconds`, { nullable: true });
 const thinkV = oneOf(['auto', 'on', 'off', 'low', 'medium', 'high']);
 const params = obj({
   temperature: num(0, 5), top_p: num(0, 1), top_k: num(0, 1000, { int: true }), min_p: num(0, 1), repeat_penalty: num(0, 5),

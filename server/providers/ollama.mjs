@@ -1,8 +1,8 @@
 // Ollama native API client (/api/chat, /api/tags, /api/show, /api/pull, /api/delete, /api/ps, /api/embed).
-import { ProviderError, isAbortError } from '../lib/errors.mjs';
+import { ProviderError } from '../lib/errors.mjs';
 import { readNdjson } from '../lib/streams.mjs';
+import { backendFetch, guardStream } from '../lib/backend-http.mjs';
 import { newId } from '../lib/ids.mjs';
-import { withTimeout } from '../lib/util.mjs';
 
 export function classifyOllamaError(status, message, providerId) {
   const msg = String(message || `HTTP ${status}`);
@@ -42,6 +42,15 @@ export function parseModelfileParameters(text) {
   return out;
 }
 
+/**
+ * Ollama parses string keep_alive values with Go's time.ParseDuration, which rejects unit-less strings
+ * ("-1", "30") → HTTP 400. Numeric strings are therefore sent as numbers (seconds; negative = forever).
+ */
+export function normalizeKeepAlive(v) {
+  if (typeof v === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(v)) return Number(v);
+  return v;
+}
+
 export function toOllamaMessage(m) {
   const out = { role: m.role, content: m.content ?? '' };
   if (m.images?.length) out.images = m.images.map((i) => i.base64);
@@ -61,19 +70,7 @@ export class OllamaProvider {
   }
 
   async request(path, { method = 'GET', body, signal, timeoutMs } = {}) {
-    let res;
-    try {
-      res = await fetch(this.baseUrl + path, {
-        method,
-        headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-        signal: withTimeout(signal, timeoutMs),
-      });
-    } catch (e) {
-      if (signal?.aborted || isAbortError(e)) throw e;
-      if (e?.name === 'TimeoutError') throw new ProviderError(`${this.name} timed out (${path})`, { code: 'timeout', providerId: this.id });
-      throw new ProviderError(`Cannot reach ${this.name} at ${this.baseUrl}`, { code: 'connection_failed', providerId: this.id, cause: e });
-    }
+    const res = await backendFetch(this, path, { method, body, signal, timeoutMs });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       let msg = text;
@@ -126,12 +123,12 @@ export class OllamaProvider {
   async *chat({ model, messages, tools, options, keepAlive, think, format, signal }) {
     const body = { model, messages: messages.map(toOllamaMessage), stream: true };
     if (options && Object.keys(options).length) body.options = options;
-    if (keepAlive !== undefined && keepAlive !== null) body.keep_alive = keepAlive;
+    if (keepAlive !== undefined && keepAlive !== null) body.keep_alive = normalizeKeepAlive(keepAlive);
     if (tools?.length) body.tools = tools;
     if (think !== undefined && think !== null) body.think = think;
     if (format) body.format = format;
     const res = await this.request('/api/chat', { method: 'POST', body, signal });
-    for await (const obj of readNdjson(res.body)) {
+    for await (const obj of readNdjson(guardStream(res.body, this, '/api/chat', signal))) {
       if (obj.error) throw classifyOllamaError(500, obj.error, this.id);
       const m = obj.message || {};
       if (m.thinking) yield { type: 'thinking', text: m.thinking };
@@ -161,7 +158,7 @@ export class OllamaProvider {
 
   async embed({ model, input, keepAlive, signal }) {
     const body = { model, input };
-    if (keepAlive !== undefined && keepAlive !== null) body.keep_alive = keepAlive;
+    if (keepAlive !== undefined && keepAlive !== null) body.keep_alive = normalizeKeepAlive(keepAlive);
     const j = await this.json('/api/embed', { method: 'POST', body, signal, timeoutMs: 120000 });
     return j.embeddings || [];
   }
@@ -169,7 +166,7 @@ export class OllamaProvider {
   /** Stream pull progress: yields `{status, digest, total, completed}`. */
   async *pull({ model, signal }) {
     const res = await this.request('/api/pull', { method: 'POST', body: { model, stream: true }, signal });
-    for await (const obj of readNdjson(res.body)) {
+    for await (const obj of readNdjson(guardStream(res.body, this, '/api/pull', signal))) {
       if (obj.error) throw new ProviderError(obj.error, { code: /not found|does not exist|manifest/i.test(obj.error) ? 'model_not_found' : 'provider_error', providerId: this.id });
       yield { status: obj.status || '', digest: obj.digest || null, total: obj.total ?? null, completed: obj.completed ?? null };
     }
@@ -206,7 +203,7 @@ export class OllamaProvider {
   /** Preload a model into memory (empty generate request). */
   async load(model, { keepAlive, options } = {}) {
     const body = { model };
-    if (keepAlive !== undefined) body.keep_alive = keepAlive;
+    if (keepAlive !== undefined && keepAlive !== null) body.keep_alive = normalizeKeepAlive(keepAlive);
     if (options) body.options = options;
     await this.request('/api/generate', { method: 'POST', body, timeoutMs: 300000 });
   }

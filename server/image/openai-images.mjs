@@ -45,10 +45,9 @@ export class OpenAIImagesProvider {
         images.push({ buffer, mime: sniffImageMime(buffer) });
       } else if (d.url) {
         const url = new URL(d.url, this.baseUrl);
-        const res = url.origin === new URL(this.baseUrl).origin
-          ? await imageRequest(this, url.pathname + url.search, { signal, timeoutMs: 60000 })
-          : await fetch(url, { signal });
-        const buffer = Buffer.from(await res.arrayBuffer());
+        if (url.origin !== new URL(this.baseUrl).origin) throw new ProviderError(`${this.name} returned an image URL on another host (${url.host}); only b64_json or same-server URLs are accepted`, { providerId: this.id });
+        const res = await imageRequest(this, url.pathname + url.search, { signal, timeoutMs: 60000 });
+        const buffer = await res.buffer();
         images.push({ buffer, mime: sniffImageMime(buffer) });
       }
     }

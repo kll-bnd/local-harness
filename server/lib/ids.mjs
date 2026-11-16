@@ -19,3 +19,20 @@ export function newId(prefix) {
 export function sha1(s) {
   return crypto.createHash('sha1').update(s).digest('hex');
 }
+
+/** Ids minted by newId(): `<prefix>_<base36 time+seq><hex>`. Anything else must never reach the filesystem. */
+export const SAFE_ID_RE = /^[a-z]{2,12}_[0-9a-z]{8,64}$/;
+
+export function isSafeId(id, prefix) {
+  return typeof id === 'string' && SAFE_ID_RE.test(id) && (!prefix || id.startsWith(`${prefix}_`));
+}
+
+/** Throw unless `id` is a well-formed id (optionally with the given prefix). Used before every path join. */
+export function assertSafeId(id, prefix) {
+  if (!isSafeId(id, prefix)) {
+    const e = new Error(`Unsafe ${prefix || ''} id: ${String(id).slice(0, 80)}`);
+    e.code = 'unsafe_id';
+    throw e;
+  }
+  return id;
+}

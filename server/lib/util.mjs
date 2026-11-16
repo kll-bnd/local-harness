@@ -10,7 +10,7 @@ export function deepMerge(base, patch) {
   if (!isPlainObject(base) || !isPlainObject(patch)) return patch === undefined ? base : clone(patch);
   const out = { ...base };
   for (const [k, v] of Object.entries(patch)) {
-    if (v === undefined) continue;
+    if (v === undefined || k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     out[k] = isPlainObject(v) && isPlainObject(base[k]) ? deepMerge(base[k], v) : clone(v);
   }
   return out;

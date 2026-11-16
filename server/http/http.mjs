@@ -25,7 +25,11 @@ export class Router {
       if (!m) continue;
       if (r.method !== method && !(method === 'HEAD' && r.method === 'GET')) { (allowed ||= []).push(r.method); continue; }
       const params = {};
-      r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+      try {
+        r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+      } catch {
+        throw new HttpError(400, 'bad_request', 'Malformed percent-encoding in URL');
+      }
       return { route: r, params };
     }
     return allowed ? { allowed } : null;
@@ -123,6 +127,9 @@ export function openSse(req, res) {
 // ---------------------------------------------------------------------------------------------- security
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
+/** Baseline CSP sent with every HTML page (the UI adds a stricter <meta> policy of its own). */
+export const HTML_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
 function hostnameOf(hostHeader) {
   if (!hostHeader) return null;
   const h = hostHeader.trim().toLowerCase();
@@ -137,26 +144,31 @@ export function extraAllowedOrigins() {
 /**
  * DNS-rebinding + CSRF protection. Returns null if allowed, else a reason.
  * - Host must be localhost / 127.0.0.1 / [::1] (any port).
- * - Origin (when present) must be an http(s) localhost origin or in HARNESS_ALLOWED_ORIGINS; "null" is rejected.
+ * - Origin (when present) must be this server's own origin (same port) or explicitly allowed
+ *   (`HARNESS_ALLOWED_ORIGINS`, `settings.security.allowedOrigins`); "null" and everything else is rejected.
  * - Sec-Fetch-Site: cross-site is rejected unless the Origin is explicitly allowed.
  */
-export function checkRequestOrigin(req) {
+export function checkRequestOrigin(req, { ownPort = null, allowed = [] } = {}) {
   const host = hostnameOf(req.headers.host);
   if (!host || !LOCAL_HOSTNAMES.has(host)) return `Host "${req.headers.host || ''}" is not allowed`;
   const origin = req.headers.origin;
   if (origin !== undefined) {
-    if (!isAllowedOrigin(origin)) return `Origin "${origin}" is not allowed`;
+    if (!isAllowedOrigin(origin, { ownPort: ownPort ?? req.socket?.localPort, allowed })) return `Origin "${origin}" is not allowed`;
   } else if (req.headers['sec-fetch-site'] === 'cross-site') {
     return 'Cross-site request rejected';
   }
   return null;
 }
 
-export function isAllowedOrigin(origin) {
-  if (extraAllowedOrigins().includes(origin)) return true;
+export function isAllowedOrigin(origin, { ownPort = null, allowed = [] } = {}) {
+  if (typeof origin !== 'string' || !origin || origin === 'null') return false;
+  const extra = [...extraAllowedOrigins(), ...(allowed || [])].map((o) => String(o).replace(/\/+$/, ''));
+  if (extra.includes(origin)) return true;
   try {
     const u = new URL(origin);
-    return (u.protocol === 'http:' || u.protocol === 'https:') && LOCAL_HOSTNAMES.has(u.hostname.toLowerCase() === '::1' ? '[::1]' : u.hostname.toLowerCase());
+    const host = u.hostname.toLowerCase();
+    const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+    return u.protocol === 'http:' && LOCAL_HOSTNAMES.has(host === '::1' ? '[::1]' : host) && ownPort != null && port === Number(ownPort);
   } catch {
     return false;
   }
@@ -185,7 +197,10 @@ export async function serveStatic(req, res, publicDir, pathname) {
     st = await fsp.stat(file).catch(() => null);
     if (!st) return false;
   }
-  res.writeHead(200, { 'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream', 'content-length': st.size, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' });
+  const ext = path.extname(file).toLowerCase();
+  const headers = { 'content-type': MIME[ext] || 'application/octet-stream', 'content-length': st.size, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' };
+  if (ext === '.html' || ext === '.htm') headers['content-security-policy'] = HTML_CSP;
+  res.writeHead(200, headers);
   if (req.method === 'HEAD') { res.end(); return true; }
   fs.createReadStream(file).pipe(res);
   return true;
