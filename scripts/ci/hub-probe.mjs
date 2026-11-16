@@ -52,37 +52,28 @@ const HF = 'https://huggingface.co';
 const REPO = 'unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF';
 const slim = (m) => ({ id: m.id, modelId: m.modelId, author: m.author, downloads: m.downloads, likes: m.likes, trendingScore: m.trendingScore, lastModified: m.lastModified, createdAt: m.createdAt, pipeline_tag: m.pipeline_tag, library_name: m.library_name, gated: m.gated, private: m.private, tags: (m.tags || []).slice(0, 14), gguf: m.gguf ? Object.fromEntries(Object.entries(m.gguf).map(([k, v]) => [k, typeof v === 'string' ? v.slice(0, 40) : v])) : undefined, siblings: m.siblings ? `${m.siblings.length}: ${JSON.stringify(m.siblings.slice(0, 3))}` : undefined });
 
-console.log('## Hugging Face');
-await json('trending GGUF', `${HF}/api/models?filter=gguf&sort=trendingScore&direction=-1&limit=3`, slim);
-await json('most downloaded GGUF, full=true', `${HF}/api/models?filter=gguf&sort=downloads&direction=-1&limit=2&full=true`, slim);
-await json('search nemotron', `${HF}/api/models?search=nemotron&filter=gguf&sort=downloads&direction=-1&limit=3`, slim);
-await json('text-generation, most liked', `${HF}/api/models?filter=gguf&pipeline_tag=text-generation&sort=likes&direction=-1&limit=2`, slim);
-await json('image-text-to-text (vision)', `${HF}/api/models?filter=gguf&pipeline_tag=image-text-to-text&sort=downloads&direction=-1&limit=2`, slim);
-await json('feature-extraction (embeddings)', `${HF}/api/models?filter=gguf&pipeline_tag=feature-extraction&sort=downloads&direction=-1&limit=2`, slim);
-await json('recently updated with expand[]', `${HF}/api/models?filter=gguf&sort=lastModified&direction=-1&limit=2&expand[]=gguf&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=pipeline_tag&expand[]=tags&expand[]=gated&expand[]=author&expand[]=trendingScore`, slim);
-await json('apps=ollama', `${HF}/api/models?apps=ollama&sort=trendingScore&direction=-1&limit=2`, slim);
-await json('author=unsloth', `${HF}/api/models?filter=gguf&author=unsloth&sort=downloads&direction=-1&limit=2`, slim);
-await json('num_parameters range', `${HF}/api/models?filter=gguf&num_parameters=min:3B,max:6B&sort=downloads&direction=-1&limit=2`, slim);
-await json('two filters (gguf + conversational)', `${HF}/api/models?filter=gguf&filter=conversational&sort=downloads&direction=-1&limit=2`, slim);
-await json('repo detail ?blobs=true', `${HF}/api/models/${REPO}?blobs=true`, (m) => ({ ...slim(m), cardDataKeys: m.cardData ? Object.keys(m.cardData) : null, license: m.cardData?.license, base_model: m.cardData?.base_model, sha: m.sha, usedStorage: m.usedStorage, keys: Object.keys(m) }));
-await json('repo tree', `${HF}/api/models/${REPO}/tree/main`, (f) => f);
-{
-  const r = await get(`${HF}/${REPO}/raw/main/README.md`);
-  console.log(`\n# model card\nGET ${HF}/${REPO}/raw/main/README.md\n-> ${r.status} ${r.type} ${r.text.length} B\nhead: ${clip(r.text.replace(/\s+/g, ' '), 400)}`);
-  const r2 = await get(`${HF}/${REPO}/resolve/main/README.md`);
-  console.log(`resolve/main/README.md -> ${r2.status} ${r2.type} ${r2.text.length} B`);
+console.log('## ollama.com page structure');
+async function structure(label, url, linkRe, n = 2, span = 1500) {
+  const r = await get(url, { accept: 'text/html' });
+  console.log(`\n# ${label}\nGET ${url}\n-> ${r.status} ${r.text.length} B${r.finalUrl && r.finalUrl !== url ? ` (redirected to ${r.finalUrl})` : ''}`);
+  const idx = [...r.text.matchAll(linkRe)].map((m) => m.index);
+  console.log(`matching links: ${idx.length}`);
+  for (const at of idx.slice(0, n)) console.log(`html: ${r.text.slice(Math.max(0, at - 120), at + span).replace(/\s+/g, ' ')}`);
+  const forms = [...r.text.matchAll(/<(?:select|input|a)[^>]*(?:name|href)="[^"]*(?:sort|o=|c=|page|p=)[^"]*"[^>]*>/g)].map((m) => m[0].replace(/\s+/g, ' ')).slice(0, 10);
+  console.log(`sort/filter/pagination controls: ${JSON.stringify(forms).slice(0, 1400)}`);
+  const hx = [...r.text.matchAll(/<[^>]*hx-get="[^"]*"[^>]*>/g)].map((m) => m[0].replace(/\s+/g, ' ')).slice(0, 4);
+  console.log(`hx elements: ${JSON.stringify(hx).slice(0, 1200)}`);
 }
-await json('gated repo detail (meta-llama)', `${HF}/api/models/meta-llama/Llama-3.2-3B-Instruct`, (m) => ({ id: m.id, gated: m.gated, private: m.private, keys: Object.keys(m) }));
-await json('unknown repo', `${HF}/api/models/no-such-owner-xyz/no-such-repo-xyz`);
-
-console.log('\n\n## ollama.com');
-await json('api/tags', 'https://ollama.com/api/tags', (j) => ({ count: j.models?.length, first: j.models?.slice(0, 2) }));
-await json('registry _catalog', 'https://registry.ollama.ai/v2/_catalog');
-await json('registry tags/list', 'https://registry.ollama.ai/v2/library/qwen3/tags/list', (j) => ({ name: j.name, count: j.tags?.length, tags: j.tags?.slice(0, 12) }));
-await json('api/search', 'https://ollama.com/api/search?q=qwen');
-await json('api/models', 'https://ollama.com/api/models');
-await html('search page', 'https://ollama.com/search?q=qwen');
-await html('search page, popular + capability', 'https://ollama.com/search?c=tools&o=popular');
-await html('library page', 'https://ollama.com/library?sort=popular');
-await html('model tags page', 'https://ollama.com/library/qwen3/tags');
-await html('model page', 'https://ollama.com/library/qwen3');
+await structure('library, popular', 'https://ollama.com/library?sort=popular', /<a[^>]*href="\/library\/[a-z0-9._-]+"/g, 2, 1700);
+await structure('library, newest', 'https://ollama.com/library?sort=newest', /<a[^>]*href="\/library\/[a-z0-9._-]+"/g, 1, 500);
+await structure('search qwen', 'https://ollama.com/search?q=qwen', /<a[^>]*href="\/library\/[a-z0-9._-]+"/g, 1, 1700);
+await structure('search page 2', 'https://ollama.com/search?q=qwen&page=2', /<a[^>]*href="\/library\/[a-z0-9._-]+"/g, 1, 300);
+await structure('tags of qwen3', 'https://ollama.com/library/qwen3/tags', /<a[^>]*href="\/library\/qwen3:[^"]+"/g, 3, 900);
+await structure('model page qwen3', 'https://ollama.com/library/qwen3', /<a[^>]*href="\/library\/qwen3:[^"]+"/g, 1, 900);
+{
+  const r = await get('https://ollama.com/library/qwen3', { accept: 'text/html' });
+  const meta = [...r.text.matchAll(/<meta[^>]*(?:name|property)="(?:description|og:description|og:title)"[^>]*>/g)].map((m) => m[0].replace(/\s+/g, ' '));
+  console.log(`meta: ${JSON.stringify(meta).slice(0, 900)}`);
+  const readme = r.text.search(/id="readme"|id="display"|class="[^"]*prose/);
+  console.log(`readme marker at ${readme}: ${readme >= 0 ? r.text.slice(readme, readme + 500).replace(/\s+/g, ' ') : '-'}`);
+}
