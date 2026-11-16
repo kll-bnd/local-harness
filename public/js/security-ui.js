@@ -49,6 +49,15 @@ export function strengthMeter(input) {
   return { el, update };
 }
 
+/**
+ * An error line about some fields goes away as soon as the user edits one of them (a retry countdown is a
+ * separate line and stays).
+ */
+export function clearOnEdit(errEl, ...inputs) {
+  for (const i of inputs) i?.addEventListener('input', () => { errEl.textContent = ''; });
+  return errEl;
+}
+
 // ------------------------------------------------------------------------------------------------ countdown
 export function fmtWait(ms) {
   const s = Math.ceil(ms / 1000);
@@ -171,6 +180,7 @@ export async function confirmWithPassword({ title, message = null, confirmLabel 
         return false;
       }
     };
+    clearOnEdit(err, pw.input);
     const form = h('form.pw-confirm', { on: { submit: (e) => { e.preventDefault(); submit(dlg.close); } } },
       message ? h('p.dialog-text', message) : null,
       body,

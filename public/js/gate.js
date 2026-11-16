@@ -5,7 +5,7 @@ import { h, mount, add, dragRegion } from './lib/dom.js';
 import { icon } from './lib/icons.js';
 import * as api from './api.js';
 import { looksLikeRecoveryKey } from './lib/password.js';
-import { passwordField, strengthMeter, recoveryKeyPanel, retryCountdown, migrationProgress, RECOVERY_WARNING } from './security-ui.js';
+import { passwordField, strengthMeter, recoveryKeyPanel, retryCountdown, migrationProgress, RECOVERY_WARNING, clearOnEdit } from './security-ui.js';
 
 const root = () => document.getElementById('app');
 let passwordReset = null; // { until } after unlocking with the recovery key
@@ -111,6 +111,7 @@ function lockFlow(sec) {
     const keyInput = h('textarea.input.rk-input', { id: 'rk-input', rows: 2, placeholder: 'HRK1-XXXX-XXXX-…', attrs: { 'aria-label': 'Recovery key', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false' } });
     const keychainFirst = mode === 'keychain' && sec.state === 'locked' && !!sec.session?.authenticated;
     const submitBtn = h(`button.btn${keychainFirst ? '' : '.btn-primary'}.btn-large.gate-submit`, { type: 'submit' }, keychainFirst ? 'Unlock with password' : 'Unlock');
+    clearOnEdit(err, pw.input, keyInput);
     const fieldBox = h('div.gate-field');
     const switchLink = h('button.btn-link.gate-switch', { type: 'button', on: { click: () => { useKey = !useKey; render(); } } });
     const keyNote = h('p.gate-note', { hidden: true }, 'Your recovery key is the one Harness showed you once when you chose your password (it starts with HRK1). After unlocking with it you can choose a new password.');
@@ -203,6 +204,7 @@ function passwordResetScreen(until) {
     const meter = strengthMeter(pw.input);
     const err = h('div.gate-error', { role: 'alert' });
     const btn = h('button.btn.btn-primary.btn-large', { type: 'submit' }, 'Save new password');
+    clearOnEdit(err, pw.input, again.input);
     const time = new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const form = h('form.gate-form', { on: { submit: async (e) => {
       e.preventDefault();
@@ -242,6 +244,7 @@ function setupFlow(sec) {
     const meter = strengthMeter(pw.input);
     const err = h('div.gate-error', { role: 'alert' });
     const btn = h('button.btn.btn-primary.btn-large', { type: 'submit' }, 'Continue');
+    clearOnEdit(err, pw.input, again.input);
     const form = h('form.gate-form', { on: { submit: async (e) => {
       e.preventDefault();
       const r = meter.update();

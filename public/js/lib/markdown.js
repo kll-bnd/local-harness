@@ -260,25 +260,54 @@ export class StreamingMarkdown {
     const tail = text.slice(this.stableLen);
     if (this.fence && this.fence.start >= this.stableLen) {
       const pre = text.slice(this.stableLen, this.fence.start);
-      const body = text.slice(Math.min(this.fence.bodyStart, text.length));
-      if (this.open && this.open.start === this.fence.start && this.open.pre === pre && body.startsWith(this.open.body)) {
-        if (body.length > this.open.body.length) this.open.node.appendData(body.slice(this.open.body.length));
-        this.open.body = body;
+      const bodyStart = Math.min(this.fence.bodyStart, text.length);
+      const o = this.open;
+      // Same open block, only longer: append the new characters (the prefix check compares lengths and the
+      // seam only — `text` already started with the previous text, checked above).
+      if (o && o.start === this.fence.start && o.bodyStart === bodyStart && o.preLen === pre.length) {
+        const len = text.length - bodyStart;
+        if (len > o.len) this._appendCode(text.slice(bodyStart + o.len));
+        o.len = len;
         return;
       }
       const frag = document.createDocumentFragment();
       if (pre.trim()) add(frag, renderMarkdown(pre));
       const lang = (this.fence.info || '').split(/\s+/)[0].toLowerCase();
-      const node = document.createTextNode(body);
-      const pre2 = h('pre', h('code', node));
+      const code = h('code.streaming-code');
+      const pre2 = h('pre', code);
       add(frag, pre2);
       mount(this.tail, frag);
       codeBlockShell(pre2, lang, { streaming: true });
-      this.open = { start: this.fence.start, pre, body, node };
+      this.open = { start: this.fence.start, bodyStart, preLen: pre.length, len: 0, code, node: null, lines: 0 };
+      this._appendCode(text.slice(bodyStart));
+      this.open.len = text.length - bodyStart;
       return;
     }
     this.open = null;
     mount(this.tail, tail ? renderMarkdown(tail) : '');
+  }
+
+  /**
+   * Append to the open code block in chunks of `chunkLines` lines, each its own block box: an engine then lays
+   * out only the last chunk per update instead of the whole block (WebKit re-lays out a whole text node when
+   * data is appended to it), so a streamed update costs O(delta + chunk), not O(block).
+   */
+  _appendCode(s) {
+    const o = this.open;
+    const per = StreamingMarkdown.chunkLines;
+    if (!o.node) { o.node = document.createTextNode(''); add(o.code, per ? h('span.code-chunk', o.node) : o.node); }
+    if (!per) { if (s) o.node.appendData(s); return; }
+    while (s) {
+      let k = o.lines;
+      let cut = -1;
+      for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) { if (++k >= per) { cut = i; break; } }
+      if (cut < 0) { o.node.appendData(s); o.lines = k; return; }
+      o.node.appendData(s.slice(0, cut + 1));
+      s = s.slice(cut + 1);
+      o.node = document.createTextNode('');
+      add(o.code, h('span.code-chunk', o.node));
+      o.lines = 0;
+    }
   }
 
   finish(text) {
@@ -287,6 +316,9 @@ export class StreamingMarkdown {
     mount(this.el, renderMarkdown(text, { cacheKey: this.cacheKey }));
   }
 }
+
+/** Lines per chunk of a code block while it streams (0 = one text node; kept switchable for measurements). */
+StreamingMarkdown.chunkLines = 64;
 
 /** Render a user's message (markdown structure, raw HTML shown literally). */
 export function renderUserMarkdown(text, { cacheKey = null } = {}) {

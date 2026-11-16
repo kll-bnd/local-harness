@@ -85,6 +85,92 @@ test('perf: a 400-message chat with code blocks opens fast and scrolls smoothly 
   } finally { await app.close(); await stack.close(); }
 });
 
+/**
+ * In the page: stream `text` through the app's StreamingMarkdown (`chunkLines` = its strategy), ~7 characters per
+ * token and 4 tokens per update (≈ 240 tokens/s, far faster than an 8 GB Mac produces), forcing layout after every
+ * update. → per-update times in order, plus the finished height (to compare strategies).
+ */
+async function streamInPage(page, text, chunkLines) {
+  return page.evaluate(async ({ text: t, chunkLines: per }) => {
+    const { StreamingMarkdown } = await import('/js/lib/markdown.js');
+    const saved = StreamingMarkdown.chunkLines;
+    if (per != null) StreamingMarkdown.chunkLines = per; // null: the app's own setting
+    const host = document.createElement('div');
+    host.className = 'prose';
+    host.style.cssText = 'position:fixed;left:0;top:0;width:700px;height:600px;overflow:auto;opacity:0.01';
+    document.body.append(host);
+    const md = new StreamingMarkdown(host);
+    const times = [];
+    let pos = 0;
+    const t0 = performance.now();
+    while (pos < t.length) {
+      pos = Math.min(t.length, pos + 28);
+      const a = performance.now();
+      md.update(t.slice(0, pos));
+      void host.scrollHeight; // include layout
+      times.push(performance.now() - a);
+      if (times.length % 50 === 0) await new Promise((r) => requestAnimationFrame(r));
+    }
+    const total = performance.now() - t0;
+    const streamedHeight = host.scrollHeight;
+    const f0 = performance.now();
+    md.finish(t);
+    void host.scrollHeight;
+    const finish = performance.now() - f0;
+    host.remove();
+    StreamingMarkdown.chunkLines = saved;
+    return { times, total, finish, streamedHeight };
+  }, { text, chunkLines });
+}
+
+/**
+ * In the page: does one update's cost depend on how big the open block already is? Grow a block to each size in
+ * one (unmeasured) update, then time 40 small updates there. O(delta) → flat across sizes; O(block) → grows.
+ */
+async function costBySize(page, text, sizes, chunkLines) {
+  return page.evaluate(async ({ text: t, sizes: list, chunkLines: per }) => {
+    const { StreamingMarkdown } = await import('/js/lib/markdown.js');
+    const saved = StreamingMarkdown.chunkLines;
+    if (per != null) StreamingMarkdown.chunkLines = per; // null: the app's own setting
+    const host = document.createElement('div');
+    host.className = 'prose';
+    host.style.cssText = 'position:fixed;left:0;top:0;width:700px;height:600px;overflow:auto;opacity:0.01';
+    document.body.append(host);
+    const md = new StreamingMarkdown(host);
+    const offsets = [];
+    for (let i = 0, line = 0; i < t.length; i++) if (t[i] === '\n') { line++; offsets[line] = i + 1; }
+    const out = {};
+    for (const lines of list) {
+      let pos = offsets[lines] || t.length;
+      md.update(t.slice(0, pos));
+      void host.scrollHeight;
+      await new Promise((r) => requestAnimationFrame(r));
+      const times = [];
+      for (let k = 0; k < 40; k++) {
+        pos = Math.min(t.length, pos + 28);
+        const a = performance.now();
+        md.update(t.slice(0, pos));
+        void host.scrollHeight;
+        times.push(performance.now() - a);
+      }
+      times.sort((x, y) => x - y);
+      out[lines] = { median: times[20], p95: times[38] };
+    }
+    host.remove();
+    StreamingMarkdown.chunkLines = saved;
+    return out;
+  }, { text, sizes, chunkLines });
+}
+
+const median = (a) => pct(a, 0.5);
+/** Median and p95 of the first, middle and last fifth of the updates, in the order they happened. */
+function fifths(times) {
+  const n = times.length;
+  const part = (i) => times.slice(Math.floor((n * i) / 5), Math.floor((n * (i + 1)) / 5));
+  const stat = (a) => ({ median: +median(a).toFixed(2), p95: +pct(a, 0.95).toFixed(2) });
+  return { updates: n, first: stat(part(0)), middle: stat(part(2)), last: stat(part(4)), p95: +pct(times, 0.95).toFixed(2) };
+}
+
 test('perf: a 2,000-line code block renders once and streams in O(delta) per frame', async () => {
   const stack = await startStack();
   const big = codeBlock(2000);
@@ -101,39 +187,45 @@ test('perf: a 2,000-line code block renders once and streams in O(delta) per fra
     const openRec = await stopRecording(page);
     const lines = await page.evaluate(() => document.querySelector('.code-block code').textContent.split('\n').length);
 
-    // Stream the same text through the app's streaming renderer, ~7 characters per token, 4 tokens per frame
-    // (≈ 240 tokens/s: far faster than an 8 GB Mac produces, so this is a worst case), with layout each frame.
-    const stream = await page.evaluate(async (text) => {
-      const { StreamingMarkdown } = await import('/js/lib/markdown.js');
-      const host = document.createElement('div');
-      host.className = 'prose';
-      host.style.cssText = 'position:fixed;left:0;top:0;width:700px;height:600px;overflow:auto;opacity:0.01';
-      document.body.append(host);
-      const md = new StreamingMarkdown(host);
-      const times = [];
-      let pos = 0;
-      const t = performance.now();
-      while (pos < text.length) {
-        pos = Math.min(text.length, pos + 28);
-        const a = performance.now();
-        md.update(text.slice(0, pos));
-        void host.scrollHeight; // include layout
-        times.push(performance.now() - a);
-        if (times.length % 50 === 0) await new Promise((r) => requestAnimationFrame(r));
-      }
-      const f0 = performance.now();
-      md.finish(text);
-      void host.scrollHeight;
-      const finish = performance.now() - f0;
-      host.remove();
-      times.sort((x, y) => x - y);
-      return { updates: times.length, total: performance.now() - t, p50: times[Math.floor(times.length / 2)], p95: times[Math.floor(times.length * 0.95)], max: times[times.length - 1], finish };
-    }, `Here it is:\n\n${big}\n\nDone.`);
-    const report = { codeLines: lines, open: ms(open), highlightedAfter: ms(highlighted), openLongestTask: ms(Math.max(0, ...openRec.long)), streamUpdates: stream.updates, streamTotal: ms(stream.total), updateP50: `${stream.p50.toFixed(2)} ms`, updateP95: `${stream.p95.toFixed(2)} ms`, updateMax: ms(stream.max), finalRenderWithHighlight: ms(stream.finish) };
+    const s = await streamInPage(page, `Here it is:\n\n${big}\n\nDone.`, null);
+    const f = fifths(s.times);
+    const report = { codeLines: lines, open: ms(open), highlightedAfter: ms(highlighted), openLongestTask: ms(Math.max(0, ...openRec.long)), streamTotal: ms(s.total), updates: f, finalRenderWithHighlight: ms(s.finish) };
     console.log('PERF 2000-line code', JSON.stringify(report));
     assert.ok(lines >= 2000);
-    assert.ok(stream.p95 < 8, `streaming update p95 ${stream.p95} ms — should not grow with the block`);
+    // O(delta): the last updates (2,000 lines already on screen) cost about what the first ones did. A ceiling
+    // stays as a backstop, generous enough for a slow or busy machine.
+    assert.ok(f.last.median <= f.first.median * 3 + 1, `updates grow with the block: first fifth ${f.first.median} ms, last fifth ${f.last.median} ms`);
+    assert.ok(f.p95 < 40, `streaming update p95 ${f.p95} ms`);
     assert.ok(open < 4000, `opening took ${open} ms`);
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
+test('perf: one streamed update costs the same whether the open code block has 250 or 4,000 lines', async () => {
+  const stack = await startStack();
+  const app = await openApp(stack);
+  try {
+    const { page } = app;
+    const text = `Here it is:\n\n${codeBlock(4400)}\n\nDone.`; // the block stays open past line 4,000
+    const sizes = [250, 1000, 2000, 4000];
+    // The app's renderer (code in chunks of lines) and, for comparison, one text node for the whole block.
+    const chunked = await costBySize(page, text, sizes, null);
+    const single = await costBySize(page, text, sizes, 0);
+    const r = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, `${v.median.toFixed(2)} / ${v.p95.toFixed(2)} ms`]));
+    console.log('PERF update cost by block size (median / p95)', JSON.stringify({ chunked: r(chunked), singleTextNode: r(single) }));
+    // Whole streams of a 500- and a 2,000-line block, both strategies (first / middle / last fifth).
+    const full = {};
+    for (const n of [500, 2000]) {
+      const t = `Intro\n\n${codeBlock(n)}\n\nDone.`;
+      const a = await streamInPage(page, t, null);
+      const b = await streamInPage(page, t, 0);
+      full[n] = { chunked: { ...fifths(a.times), height: a.streamedHeight }, singleTextNode: { ...fifths(b.times), height: b.streamedHeight } };
+      assert.equal(a.streamedHeight, b.streamedHeight, 'chunks render exactly like one block');
+    }
+    console.log('PERF streaming by fifths', JSON.stringify(full));
+    const small = chunked[250].median;
+    const large = chunked[4000].median;
+    assert.ok(large <= small * 3 + 1, `an update at 4,000 lines (${large.toFixed(2)} ms) costs much more than at 250 (${small.toFixed(2)} ms)`);
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });

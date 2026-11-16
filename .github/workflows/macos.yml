@@ -157,6 +157,8 @@ jobs:
           set +e
           HARNESS_UI_BROWSER=webkit node --test --test-concurrency=2 --test-reporter=spec ${UI_FILTER:+--test-name-pattern="$UI_FILTER"} "test/ui/*.test.mjs" > "$RUNNER_TEMP/ui-webkit.log" 2>&1
           code=$?
+          # The measurements the perf tests print (streaming cost by block size, open times, …).
+          LC_ALL=C grep -a 'PERF ' "$RUNNER_TEMP/ui-webkit.log" | cut -c1-3000
           awk '/failing tests:/{p=1} p' "$RUNNER_TEMP/ui-webkit.log" | grep -vE 'node:(internal|async_hooks)' | cut -c1-700 | head -n 320
           LC_ALL=C grep -aE '^[^a-zA-Z0-9]{1,5}(tests|suites|pass|fail|cancelled|skipped|duration_ms) [0-9.]+$' "$RUNNER_TEMP/ui-webkit.log"
           echo "node --test exit code $code"

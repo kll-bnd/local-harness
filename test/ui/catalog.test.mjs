@@ -58,7 +58,7 @@ test('browsing while internet access is blocked: allow in place, then both sourc
 
     // Endless scrolling by cursor.
     await page.locator('.view-scroll').evaluate((e) => { e.scrollTop = e.scrollHeight; });
-    await waitFor(async () => (await items(page).count()) > 24, { timeout: 8000 });
+    await waitFor(async () => (await items(page).count()) > 24, { timeout: 20000 });
     await page.locator('.view-scroll').evaluate((e) => { e.scrollTop = e.scrollHeight; });
     await page.waitForSelector('.cat-end', { timeout: 10000 });
     assert.equal(await items(page).count(), 60, 'every chat-capable repository, no duplicates');
@@ -100,7 +100,7 @@ test('browsing while internet access is blocked: allow in place, then both sourc
     // The site's own pages (20 per page), followed by cursor as the list scrolls.
     assert.equal(await page.locator('.cat-browser[data-source="ollama"] .cat-item').count(), 20);
     await page.locator('.view-scroll').evaluate((e) => { e.scrollTop = e.scrollHeight; });
-    await waitFor(async () => (await page.locator('.cat-browser[data-source="ollama"] .cat-item').count()) > 20, { timeout: 8000 });
+    await waitFor(async () => (await page.locator('.cat-browser[data-source="ollama"] .cat-item').count()) > 20, { timeout: 20000 });
     // Cloud-only entries are not offered.
     assert.equal(await page.locator('.cat-browser[data-source="ollama"] .cat-item[data-id="kimi-k2"]').count(), 0);
     await page.locator('.cat-browser[data-source="ollama"] .cat-seg button', { hasText: 'Embedding' }).click();

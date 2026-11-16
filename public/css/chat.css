@@ -117,6 +117,9 @@
 .code-copy:disabled { opacity: 0.4; }
 .code-block pre { margin: 0; padding: 11px 14px 13px; overflow-x: auto; font-size: 12.5px; line-height: 1.58; tab-size: 4; }
 .code-block code { font-family: var(--font-mono); white-space: pre; }
+/* A code block while it streams: blocks of lines, so each update lays out only the last one. */
+.code-block code.streaming-code { display: block; }
+.code-chunk { display: block; }
 .prose pre:not(.code-block pre) { margin: 0 0 1em; padding: 10px 12px; background: var(--code-bg); border-radius: var(--r-md); overflow-x: auto; font-size: 12.5px; }
 
 /* syntax colours (our own theme; restrained, legible in both modes) */

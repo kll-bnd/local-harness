@@ -5,7 +5,7 @@ import { icon } from '../lib/icons.js';
 import { fmtRelative, plural, fmtFull, truncate } from '../lib/format.js';
 import { store, bus, patchSettings } from '../state.js';
 import * as api from '../api.js';
-import { toast, confirmDialog } from '../ui/overlays.js';
+import { toast, confirmDialog, undoToast } from '../ui/overlays.js';
 import { showError } from '../errors.js';
 import { navigate } from '../router.js';
 
@@ -17,6 +17,9 @@ const ORIGIN_LABEL = { auto: 'learned', manual: 'added by you', tool: 'saved by 
 export const needsReview = (m) => !!(m.needsReview || m.unverified || m.review === 'pending' || m.status === 'unverified');
 
 export class MemoryView {
+  static instances = new Set();
+  static unloadHooked = false;
+
   constructor(shell) {
     this.shell = shell;
     this.q = '';
@@ -158,14 +161,24 @@ export class MemoryView {
   }
 
   remove(m) {
-    const timer = setTimeout(async () => {
-      this.pendingDelete.delete(m.id);
-      try { await api.memories.remove(m.id); } catch (e) { showError(e, 'delete the memory'); }
-      this.load();
-    }, 5000);
-    this.pendingDelete.set(m.id, timer);
+    // Deleted when the toast goes away without Undo (and at once if the page is closed meanwhile).
+    const u = undoToast({
+      message: 'Memory deleted', detail: truncate(m.content, 100), timeout: 5000, id: `memdel-${m.id}`,
+      commit: async ({ unloading }) => {
+        this.pendingDelete.delete(m.id);
+        if (unloading) { api.beacon('DELETE', `/api/memories/${encodeURIComponent(m.id)}`); return; }
+        try { await api.memories.remove(m.id); } catch (e) { showError(e, 'delete the memory'); }
+        this.load();
+      },
+      undo: () => { this.pendingDelete.delete(m.id); this.render(); },
+    });
+    this.pendingDelete.set(m.id, u);
     this.render();
-    toast({ message: 'Memory deleted', detail: truncate(m.content, 100), timeout: 5000, id: `memdel-${m.id}`, action: { label: 'Undo', run: () => { clearTimeout(timer); this.pendingDelete.delete(m.id); this.render(); } } });
+    if (!MemoryView.unloadHooked) {
+      MemoryView.unloadHooked = true;
+      window.addEventListener('pagehide', () => { for (const v of MemoryView.instances) for (const x of [...v.pendingDelete.values()]) x.flush(true); });
+    }
+    MemoryView.instances.add(this);
   }
 
   tester() {

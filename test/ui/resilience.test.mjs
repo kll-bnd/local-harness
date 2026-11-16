@@ -2,7 +2,7 @@
 // already generating in the same chat (409 chat_busy).
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startStack, openApp, closeBrowser, send, lastTurn, sleep } from './harness.mjs';
+import { startStack, openApp, closeBrowser, send, lastTurn, waitFor } from './harness.mjs';
 
 after(closeBrowser);
 
@@ -48,14 +48,15 @@ test('busy: a chat already generating elsewhere answers 409 → "still replying"
   try {
     const { page } = app;
     await send(page, 'first message');
-    await sleep(500); // let the server release the first turn
     const chatId = page.url().split('/chat/')[1];
+    // Let the server release the first turn.
+    await waitFor(async () => !(await stack.api('GET', `/api/chats/${chatId}`)).data.chat?.generating);
     // Another window starts a long generation in this chat.
     const ac = new AbortController();
     let otherStatus = null;
     const other = fetch(`${stack.url}/api/chats/${chatId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'long answer 3000' }), signal: ac.signal })
       .then((r) => { otherStatus = r.status; return r.body?.getReader().read(); }).catch(() => {});
-    await sleep(300);
+    await waitFor(() => otherStatus === 200);
     assert.equal(otherStatus, 200, 'the other generation is running');
     await page.locator('.composer-input').fill('my second message');
     await page.locator('.composer-input').press('Enter');

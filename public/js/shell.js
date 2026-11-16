@@ -10,7 +10,7 @@ import { Inspector } from './views/inspector.js';
 import { ChatView } from './views/chat/chat-view.js';
 import { navigate } from './router.js';
 import { runAction, keyLabel, getAction } from './actions.js';
-import { openMenu, toast, openDialog, confirmDialog } from './ui/overlays.js';
+import { openMenu, toast, openDialog, confirmDialog, undoToast } from './ui/overlays.js';
 import { showError } from './errors.js';
 import { peekChatModel, forgetChatModel, mergeChatSummary } from './chat/session.js';
 import { shieldButton } from './views/network.js';
@@ -276,19 +276,23 @@ export class Shell {
     this.sidebar.hideForDelete(id, true);
     const r = store.get('route');
     if (r.view === 'chat' && r.chatId === id) navigate('/chat');
-    const commit = async () => {
-      this.pendingDeletes.delete(id);
-      try {
-        await api.chats.remove(id);
-        forgetChatModel(id);
-        store.set('chats', (store.get('chats') || []).filter((x) => x.id !== id));
-        if (store.get('archived')) store.set('archived', store.get('archived').filter((x) => x.id !== id));
-      } catch (e) { this.sidebar.hideForDelete(id, false); showError(e, 'delete the chat'); }
-      this.sidebar.hideForDelete(id, false);
-    };
-    const timer = setTimeout(commit, 6000);
-    this.pendingDeletes.set(id, timer);
-    toast({ kind: 'info', message: 'Chat deleted', detail: c.title || 'Untitled', timeout: 6000, id: `del-${id}`, action: { label: 'Undo', run: () => { clearTimeout(timer); this.pendingDeletes.delete(id); this.sidebar.hideForDelete(id, false); } } });
+    // Deleted when the toast goes away without Undo (its timer pauses while it is hovered), or on page exit.
+    const u = undoToast({
+      message: 'Chat deleted', detail: c.title || 'Untitled', timeout: 6000, id: `del-${id}`,
+      commit: async ({ unloading }) => {
+        this.pendingDeletes.delete(id);
+        if (unloading) { api.beacon('DELETE', api.chats.removeUrl(id)); return; }
+        try {
+          await api.chats.remove(id);
+          forgetChatModel(id);
+          store.set('chats', (store.get('chats') || []).filter((x) => x.id !== id));
+          if (store.get('archived')) store.set('archived', store.get('archived').filter((x) => x.id !== id));
+        } catch (e) { this.sidebar.hideForDelete(id, false); showError(e, 'delete the chat'); }
+        this.sidebar.hideForDelete(id, false);
+      },
+      undo: () => { this.pendingDeletes.delete(id); this.sidebar.hideForDelete(id, false); },
+    });
+    this.pendingDeletes.set(id, u);
   }
 
   async deleteChatAndMemories(c) {
@@ -303,8 +307,9 @@ export class Shell {
     } catch (e) { showError(e, 'delete the chat'); }
   }
 
-  flushPendingDeletes() {
-    for (const [id, timer] of this.pendingDeletes) { clearTimeout(timer); api.beacon('DELETE', api.chats.removeUrl(id)); }
+  /** Commit pending deletes now. unloading: the page is going away (keepalive requests). */
+  flushPendingDeletes({ unloading = true } = {}) {
+    for (const u of [...this.pendingDeletes.values()]) u.flush(unloading);
     this.pendingDeletes.clear();
   }
 

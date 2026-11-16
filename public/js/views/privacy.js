@@ -9,7 +9,7 @@ import { store, patchSettings, loadChats, loadSettings, loadPresets } from '../s
 import { openDialog, toast } from '../ui/overlays.js';
 import { showError } from '../errors.js';
 import { runAction, keyLabel, getAction } from '../actions.js';
-import { confirmWithPassword, passwordField, strengthMeter, recoveryKeyPanel, migrationProgress, RECOVERY_WARNING, setSecurityContext, confirmationHeader } from '../security-ui.js';
+import { confirmWithPassword, passwordField, strengthMeter, recoveryKeyPanel, migrationProgress, RECOVERY_WARNING, setSecurityContext, confirmationHeader, clearOnEdit } from '../security-ui.js';
 import { networkState, scopeSentence, allowFor, blockNow, setBlocker, selfTest } from './network.js';
 import { lockdown, holdLockdown } from '../lockdown.js';
 
@@ -186,7 +186,7 @@ function choosePassword() {
     const pw = passwordField({ label: 'New password', autocomplete: 'new-password' });
     const again = passwordField({ label: 'New password again', autocomplete: 'new-password', name: 'password2' });
     const meter = strengthMeter(pw.input);
-    const err = h('div.field-error', { role: 'alert' });
+    const err = clearOnEdit(h('div.field-error', { role: 'alert' }), pw.input, again.input);
     let got = null;
     openDialog({
       title: 'Choose a password', size: 'small',
@@ -268,7 +268,7 @@ function changePasswordDialog() {
   const next = passwordField({ label: 'New password', autocomplete: 'new-password' });
   const again = passwordField({ label: 'New password again', autocomplete: 'new-password', name: 'password2' });
   const meter = strengthMeter(next.input);
-  const err = h('div.field-error', { role: 'alert' });
+  const err = clearOnEdit(h('div.field-error', { role: 'alert' }), cur.input, next.input, again.input);
   const body = h('form.stack', { on: { submit: (e) => e.preventDefault() } },
     reset ? h('p.field-help', 'You opened Harness with your recovery key, so the current password is not needed.') : [h('label.field-label', { htmlFor: cur.input.id }, 'Current password'), cur.el],
     h('label.field-label', { htmlFor: next.input.id }, 'New password'), next.el, meter.el,
@@ -319,7 +319,7 @@ export function backupDialog() {
     h('p.field-help', 'You need this passphrase to restore the backup. It can differ from your Harness password; write it down with the backup’s location.'));
   const plainNote = h('p.field-help.warn-text', { hidden: true }, 'Without a passphrase the backup is a plain file: anyone who gets it can read your chats.');
   protect.addEventListener('change', () => { fields.hidden = !protect.checked; plainNote.hidden = protect.checked; });
-  const err = h('div.field-error', { role: 'alert' });
+  const err = clearOnEdit(h('div.field-error', { role: 'alert' }), pass.input, again.input, protect);
   openDialog({
     title: 'Download a full backup',
     body: h('div.stack',
@@ -387,7 +387,7 @@ export async function restoreBackup() {
     h('option', { value: 'safe' }, 'Restore settings, but keep this Mac’s paths and servers'),
     h('option', { value: 'full' }, 'Restore all settings exactly'));
   const pass = encrypted ? passwordField({ label: 'Backup passphrase', autocomplete: 'off', name: 'passphrase' }) : null;
-  const err = h('div.field-error', { role: 'alert' });
+  const err = clearOnEdit(h('div.field-error', { role: 'alert' }), pass?.input);
   const body = h('div.stack',
     h('p.field-help', encrypted ? 'This backup is encrypted. Everything is added next to what you have — nothing is overwritten, and restored items get new ids.' : `Backup from ${fmtFull(payload.exportedAt)}${payload.app?.version ? ` (Harness ${payload.app.version})` : ''}. Everything is added next to what you have — nothing is overwritten, and restored items get new ids.`),
     encrypted ? [h('label.field-label', { htmlFor: pass.input.id }, 'Passphrase of the backup'), pass.el] : null,

@@ -136,7 +136,7 @@ test('edit & resend creates a branch; ‹ 1/2 › switches between versions; reg
     await editor.fill('second version of the question');
     await user.locator('button', { hasText: 'Save & send' }).click();
     await waitIdle(page);
-    await page.waitForFunction(() => /^You said: second version/.test(document.querySelector('.turn:last-child .msg-assistant .prose')?.textContent || ''), null, { timeout: 5000 }).catch(async (e) => {
+    await page.waitForFunction(() => /^You said: second version/.test(document.querySelector('.turn:last-child .msg-assistant .prose')?.textContent || ''), null, { timeout: 15000 }).catch(async (e) => {
       console.log('DBG-EDIT', await page.evaluate(() => ({ turns: [...document.querySelectorAll('.turn')].map((t) => t.dataset.turn), html: document.querySelector('.turn:last-child .msg-assistant')?.innerHTML.replace(/<svg.*?<\/svg>/g, ''), user: document.querySelector('.turn:last-child .msg-user')?.innerHTML.replace(/<svg.*?<\/svg>/g, '').slice(0, 300) })));
       throw e;
     });

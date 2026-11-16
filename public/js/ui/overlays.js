@@ -22,32 +22,61 @@ function host() {
  */
 export function toast(opts) {
   if (typeof opts === 'string') opts = { message: opts };
-  const { message, detail = null, kind = 'info', action = null, timeout = kind === 'error' ? 9000 : 4500, id = null } = opts;
-  if (id && toastsById.has(id)) toastsById.get(id).dismiss(true);
+  const { message, detail = null, kind = 'info', action = null, timeout = kind === 'error' ? 9000 : 4500, id = null, onDismiss = null } = opts;
+  if (id && toastsById.has(id)) toastsById.get(id).dismiss(true, 'replaced');
   const iconName = { info: 'info', success: 'check', warn: 'warning', error: 'error' }[kind] || 'info';
   let timer = null;
   const el = h(`div.toast.toast-${kind}`, { role: kind === 'error' ? 'alert' : 'status' },
     h('span.toast-icon', icon(iconName)),
     h('div.toast-body', h('div.toast-msg', message), detail ? h('div.toast-detail', detail) : null),
-    action ? h('button.btn.btn-small.toast-action', { type: 'button', on: { click: () => { dismiss(); action.run(); } } }, action.label) : null,
-    h('button.icon-btn.toast-close', { type: 'button', 'aria-label': 'Dismiss', on: { click: () => dismiss() } }, icon('x', { size: 14 })),
+    action ? h('button.btn.btn-small.toast-action', { type: 'button', on: { click: () => { dismiss(false, 'action'); action.run(); } } }, action.label) : null,
+    h('button.icon-btn.toast-close', { type: 'button', 'aria-label': 'Dismiss', on: { click: () => dismiss(false, 'close') } }, icon('x', { size: 14 })),
   );
-  const dismiss = (immediate = false) => {
+  let gone = false;
+  /** reason: 'timeout' | 'close' | 'action' | 'replaced' | 'flush' (→ onDismiss, once). */
+  const dismiss = (immediate = false, reason = 'close') => {
     clearTimeout(timer);
-    if (id) toastsById.delete(id);
+    if (id && toastsById.get(id) === handle) toastsById.delete(id);
+    if (!gone) { gone = true; try { onDismiss?.(reason); } catch (e) { console.error(e); } }
     if (immediate) { el.remove(); return; }
     el.classList.add('leaving');
     setTimeout(() => el.remove(), 180);
   };
-  const arm = () => { if (timeout > 0) timer = setTimeout(dismiss, timeout); };
+  // The timer pauses while the pointer or focus is on the toast — also when it appeared under a resting pointer
+  // (no mouseenter then), so it is checked again when the time is up.
+  const arm = () => {
+    if (timeout <= 0) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => { if (el.matches(':hover') || el.contains(document.activeElement)) arm(); else dismiss(false, 'timeout'); }, timeout);
+  };
   el.addEventListener('mouseenter', () => clearTimeout(timer));
   el.addEventListener('mouseleave', arm);
   el.addEventListener('focusin', () => clearTimeout(timer));
+  const handle = { dismiss, el };
   add(host(), el);
   arm();
-  const handle = { dismiss, el };
   if (id) toastsById.set(id, handle);
   return handle;
+}
+
+/**
+ * "Deleted — Undo": the change is committed when the toast goes away without Undo (its timeout, which pauses
+ * while the pointer or focus is on it, the close button, or being replaced) — so Undo is never shown for
+ * something already done. flush(unloading) commits at once (e.g. the page is going away).
+ *   commit({ unloading }) · undo()
+ */
+export function undoToast({ message, detail = null, timeout = 6000, id = null, commit, undo }) {
+  let state = 'pending';
+  const done = (unloading = false) => { if (state !== 'pending') return; state = 'committed'; commit({ unloading }); };
+  const t = toast({
+    message, detail, timeout, id,
+    action: { label: 'Undo', run: () => { if (state !== 'pending') return; state = 'undone'; undo?.(); } },
+    onDismiss: (reason) => { if (reason !== 'action' && reason !== 'flush') done(false); },
+  });
+  return {
+    get pending() { return state === 'pending'; },
+    flush(unloading = false) { if (state !== 'pending') return; done(unloading); t.dismiss(true, 'flush'); },
+  };
 }
 
 // ------------------------------------------------------------------------------------------------ dialogs

@@ -85,9 +85,17 @@ test('memory: add, edit, pin, delete with undo', async () => {
     await page.waitForSelector('.mem-list .empty');
     await page.locator('.toast button', { hasText: 'Undo' }).click();
     await page.waitForSelector('.mem-row .mem-content');
-    // delete for real
+    // The delete waits for the toast: while it holds the focus (or the pointer), Undo is still possible past 5 s.
     await page.locator('.mem-row button[aria-label="Delete memory"]').first().click();
-    await waitFor(async () => (await stack.api('GET', '/api/memories')).data.total === 0, { timeout: 9000 });
+    await page.locator('.toast:not(.leaving)', { hasText: 'Memory deleted' }).locator('button', { hasText: 'Undo' }).focus();
+    await page.waitForTimeout(5600);
+    assert.equal((await stack.api('GET', '/api/memories')).data.total, 1, 'not deleted while the toast is held');
+    await page.locator('.toast button', { hasText: 'Undo' }).click();
+    await page.waitForSelector('.mem-row .mem-content');
+    // delete for real: closing the toast commits it
+    await page.locator('.mem-row button[aria-label="Delete memory"]').first().click();
+    await page.locator('.toast:not(.leaving)', { hasText: 'Memory deleted' }).locator('button[aria-label="Dismiss"]').click();
+    await waitFor(async () => (await stack.api('GET', '/api/memories')).data.total === 0, { timeout: 20000 });
     list = (await stack.api('GET', '/api/memories')).data.memories;
     assert.equal(list.length, 0);
     await app.assertClean(assert);

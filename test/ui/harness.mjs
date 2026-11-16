@@ -196,7 +196,7 @@ export async function openApp(stack, { hash = '', colorScheme = 'light', width =
   await ctx.addInitScript(CSP_INIT);
   if (desktop) await ctx.addInitScript(DESKTOP_INIT);
   const page = await ctx.newPage();
-  page.setDefaultTimeout(15000);
+  page.setDefaultTimeout(30000); // generous: a busy CI Mac or an 8 GB M1 under memory pressure is slow
   const errors = [];
   const requests = [];
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
@@ -241,9 +241,30 @@ export async function waitIdle(page, timeout = 20000) {
 
 export function lastTurn(page) { return page.locator('.turn').last(); }
 
+/** Whether the page considers itself on a Mac — decided the way the app decides (navigator.platform). */
+export function pageIsMac(page) {
+  return page.evaluate(() => /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent));
+}
+
+/**
+ * Press a shortcut written the way the app writes them ("Mod+K", "Mod+Ctrl+L", "Mod+Shift+F"): `Mod` is ⌘ on a
+ * Mac and Ctrl elsewhere, `Ctrl` is the Control key — for whatever platform the page runs on.
+ */
+export async function pressChord(page, chord) {
+  const mac = await pageIsMac(page);
+  const keys = chord.split('+').map((k) => {
+    if (k === 'Mod') return mac ? 'Meta' : 'Control';
+    if (k === 'Ctrl') return 'Control';
+    if (/^[A-Z]$/.test(k)) return `Key${k}`;
+    if (/^[0-9]$/.test(k)) return `Digit${k}`;
+    return k;
+  });
+  await page.keyboard.press(keys.join('+'));
+}
+
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export async function waitFor(fn, { timeout = 10000, interval = 50 } = {}) {
+export async function waitFor(fn, { timeout = 20000, interval = 50 } = {}) {
   const t0 = Date.now();
   for (;;) {
     const v = await fn();

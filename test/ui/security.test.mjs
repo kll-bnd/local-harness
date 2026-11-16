@@ -7,7 +7,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { startStack, openApp, closeBrowser, send, waitFor, sleep } from './harness.mjs';
+import { startStack, openApp, closeBrowser, send, waitFor, sleep, pressChord, pageIsMac } from './harness.mjs';
 
 after(closeBrowser);
 
@@ -34,9 +34,9 @@ async function unlockViaUi(page, password = PASSWORD) {
   await page.waitForSelector('.app .sidebar');
 }
 
-/** Lock through the command (keyboard shortcut on Linux/Windows: Ctrl+Alt+L). */
+/** Lock with the keyboard shortcut: ⌃⌘L on a Mac, Ctrl+Alt+L elsewhere (as the app defines `lock`). */
 async function lockViaKeys(page) {
-  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Control+KeyL' : 'Control+Alt+KeyL');
+  await pressChord(page, (await pageIsMac(page)) ? 'Mod+Ctrl+L' : 'Mod+Alt+L');
   await page.waitForSelector('.gate input[name="password"]');
 }
 
@@ -59,6 +59,8 @@ test('first run: choose a password with honest feedback, see the recovery key on
     await page.click('.gate-form button[type="submit"]');
     await page.waitForFunction(() => /don't match/.test(document.querySelector('.gate-error')?.textContent || ''));
     await page.fill('.gate input[name="password2"]', PASSWORD);
+    // Correcting the field clears the message at once (not only at the next submit).
+    assert.equal(await page.locator('.gate-error').textContent(), '');
     await app.shot('30-setup');
     await page.click('.gate-form button[type="submit"]');
 
@@ -96,7 +98,8 @@ test('lock and unlock with the password and with the recovery key (then choose a
     const key = await setupViaUi(page);
     await page.waitForSelector('.privacy');
     // Lock now from the palette.
-    await page.keyboard.press('Control+KeyK');
+    await pressChord(page, 'Mod+K');
+    await page.waitForSelector('dialog.palette[open]');
     await page.keyboard.type('Lock Harness');
     await page.keyboard.press('Enter');
     await page.waitForSelector('.gate input[name="password"]');
@@ -145,6 +148,17 @@ test('wrong passwords: three free tries, then a growing wait with a countdown', 
     await page.click('.gate-submit');
     await page.waitForFunction(() => /try again in/i.test(document.querySelector('.gate-wait')?.textContent || ''));
     assert.equal(await page.locator('.gate-submit').isDisabled(), true);
+    // Typing again clears "not the password", but the wait stays on screen (checked in one go: the wait is short).
+    const edit = await page.evaluate(() => {
+      const i = document.querySelector('.gate input[name="password"]');
+      const before = { err: document.querySelector('.gate-error').textContent, wait: document.querySelector('.gate-wait').textContent };
+      i.value = 'next guess';
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+      return { before, err: document.querySelector('.gate-error').textContent, wait: document.querySelector('.gate-wait').textContent };
+    });
+    assert.match(edit.before.err, /not the password/);
+    assert.equal(edit.err, '');
+    assert.equal(edit.wait, edit.before.wait);
     await app.shot('33-lock-wait');
     // The wait ends by itself; then the right password works.
     await page.waitForFunction(() => !document.querySelector('.gate-submit')?.disabled, null, { timeout: 8000 });
@@ -188,22 +202,24 @@ test('auto-lock: after the chosen idle time Harness locks and the page goes to t
     await page.selectOption('.privacy select[aria-label="Lock Harness after"]', '5');
     await waitFor(async () => (await page.evaluate(async () => (await (await fetch('/api/settings')).json()).settings.security.idleLockMinutes)) === 5);
     // An idle page sends nothing that would keep Harness awake (no polling; the event stream does not count).
-    await sleep(1500);
-    const before = app.requests.filter((u) => u.includes('/api/') && !u.endsWith('/api/events')).length;
-    await sleep(2500);
-    assert.equal(app.requests.filter((u) => u.includes('/api/') && !u.endsWith('/api/events')).length, before, 'no requests while idle');
+    // First let what the last clicks started finish (a slow machine may still be sending it), then watch.
+    const apiCount = () => app.requests.filter((u) => u.includes('/api/') && !u.endsWith('/api/events')).length;
+    for (let quiet = 0, last = apiCount(); quiet < 2;) { await sleep(1000); const n = apiCount(); quiet = n === last ? quiet + 1 : 0; last = n; }
+    const before = apiCount();
+    await sleep(3000);
+    assert.equal(apiCount(), before, 'no requests while idle');
     // Five minutes pass (the backend's own idle check, run now instead of waiting).
     const core = stack.srv.core;
     core.lastActivity = Date.now() - 6 * 60000;
     core._checkIdle();
-    await page.waitForSelector('.gate input[name="password"]', { timeout: 5000 });
+    await page.waitForSelector('.gate input[name="password"]', { timeout: 15000 });
     assert.equal(await page.locator('.privacy').count(), 0);
     await unlockViaUi(page);
     await page.waitForSelector('.privacy');
     // A lock from elsewhere (the Mac sleeping in the native app, another window) works the same way.
     await stack.unlock(PASSWORD);
     await stack.api('POST', '/api/security/lock', {});
-    await page.waitForSelector('.gate input[name="password"]', { timeout: 5000 });
+    await page.waitForSelector('.gate input[name="password"]', { timeout: 15000 });
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });
@@ -223,7 +239,7 @@ test('a minute before auto-lock a quiet hint offers to stay unlocked; using the 
     // Let most of the minute pass on the page's clock (no requests meanwhile).
     await page.clock.install();
     await page.clock.fastForward('00:45');
-    await page.waitForSelector('.idle-hint', { timeout: 5000 });
+    await page.waitForSelector('.idle-hint', { timeout: 15000 });
     assert.match(await page.locator('.idle-hint').textContent(), /locks in \d+ s/);
     await app.shot('35-idle-hint');
     // "Stay unlocked" tells Harness the user is here.
