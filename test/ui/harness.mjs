@@ -48,7 +48,8 @@ export function freePort() {
  * @param {number} [o.delayMs=2]       fake Ollama delay per streamed chunk
  * @param {number} [o.stepMs=30]       fake diffusion step time
  * @param {object} [o.settings]        merged into settings.json before the server starts
- * @param {boolean} [o.ollamaBinary]   install a fake `ollama` binary (Ollama "installed but stopped")
+ * @param {boolean|'slow-gpu'} [o.ollamaBinary]  install a fake `ollama` binary (Ollama "installed but stopped");
+ *                                     'slow-gpu': one whose GPU discovery takes FAKE_GPU_DELAY_MS
  * @param {boolean} [o.secure=false]   0.2 defaults ON: password protection, API sessions and "Block all internet
  *                                     access" (the UI meets the setup screen first). Off = the explicit opt-out of
  *                                     docs/API.md 10.10, so flows that are not about security start in the app.
@@ -75,7 +76,9 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
     // Outside the data dir: Harness 0.2 makes every file in there 0600 (not executable).
     binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-bin-'));
     const bin = path.join(binDir, 'ollama');
-    await fs.writeFile(bin, `#!/bin/sh\nexec "${process.execPath}" "${path.join(here, '..', 'fake-ollama-bin.mjs')}" "$@"\n`);
+    // 'slow-gpu': listens at once but answers only after FAKE_GPU_DELAY_MS (another app loading onto the GPU).
+    const script = ollamaBinary === 'slow-gpu' ? path.join(here, 'fake-ollama-slow-gpu.mjs') : path.join(here, '..', 'fake-ollama-bin.mjs');
+    await fs.writeFile(bin, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`);
     await fs.chmod(bin, 0o755);
     extra.ollama = { binaryPath: bin, autoStart: false, stopOnExit: true };
   }

@@ -578,3 +578,52 @@ test('browser storage holds nothing derived from the user: drafts live in the UI
 });
 
 export { sleep };
+
+test('how the blocker is enforced: Ollama waiting to go back into the sandbox, and macOS refusing the sandbox', async () => {
+  const stack = await startStack({ offlineLock: true });
+  const app = await openApp(stack, { hash: '#/settings/privacy' });
+  try {
+    const { page } = app;
+    await page.waitForSelector('.privacy .scope-note');
+    // Drive Harness's real status through its bus, as its Ollama process would report it.
+    const core = stack.srv.core;
+    const report = (o) => {
+      core.network.ollamaInfo = () => ({ managed: true, sandboxed: false, external: false, osPending: false, osFallback: null, ...o });
+      core.app.bus.publish('network.status', { offlineLock: core.network.status() });
+    };
+    const PENDING = 'Ollama is still running outside the macOS sandbox from the last download; Harness puts it back as soon as it is idle, at the latest when it locks.';
+    const FALLBACK = "macOS could not start Ollama inside its sandbox, so it is running without it. Harness's own blocking still applies; Harness tries the sandbox again the next time it locks.";
+
+    // 1. Put back into the sandbox soon: one calm sentence, no warning.
+    report({ osPending: true });
+    await page.waitForFunction((t) => document.querySelector('.privacy .scope-note')?.textContent.includes(t), PENDING);
+    assert.equal(await page.locator('.privacy .scope-warn').count(), 0, 'not a warning');
+    assert.equal(await page.locator('.net-shield-wrap').getAttribute('data-state'), 'blocked');
+    assert.equal(await page.locator('.net-shield-wrap').getAttribute('data-os-warn'), 'false');
+    await page.locator('.net-shield').click();
+    assert.match(await page.locator('.net-pop').textContent(), /still running outside the macOS sandbox from the last download/);
+    await page.keyboard.press('Escape');
+
+    // 2. macOS could not sandbox it: a warning the owner notices, the details on demand, one sentence only.
+    report({ osPending: true, osFallback: { at: new Date().toISOString(), reason: 'sandboxed_exit', detail: 'sandbox-exec: Ollama exited with code 1\nlevel=ERROR msg="Metal not available"', count: 1 } });
+    await page.waitForSelector('.privacy .scope-warn');
+    const warnText = await page.locator('.privacy .scope-warn p').textContent();
+    assert.equal(warnText.trim(), FALLBACK);
+    assert.ok(!(await page.locator('.privacy .scope-warn').textContent()).includes('from the last download'), 'the fallback sentence replaces the pending one');
+    assert.equal(await page.locator('.privacy .scope-detail pre').isVisible(), false, 'details only on demand');
+    await page.locator('.privacy .scope-detail summary').click();
+    assert.match(await page.locator('.privacy .scope-detail pre').textContent(), /Metal not available/);
+    assert.equal(await page.locator('.net-shield-wrap').getAttribute('data-os-warn'), 'true');
+    assert.match(await page.locator('.net-shield').getAttribute('title'), /Ollama runs without the macOS sandbox/);
+    await page.locator('.net-shield').click();
+    assert.ok((await page.locator('.net-pop').textContent()).includes(FALLBACK));
+    await app.shot('39-os-fallback');
+    await page.keyboard.press('Escape');
+
+    // 3. Back in the sandbox: neither line any more.
+    report({ sandboxed: true, osPending: false, osFallback: { at: new Date().toISOString(), reason: 'sandboxed_exit', detail: 'x', count: 1 } });
+    await page.waitForFunction(() => /macOS also keeps the Ollama that Harness started in a sandbox/.test(document.querySelector('.privacy .scope-note')?.textContent || ''));
+    assert.equal(await page.locator('.privacy .scope-warn').count(), 0);
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});

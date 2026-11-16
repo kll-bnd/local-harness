@@ -318,7 +318,14 @@ function registerBusHandlers() {
   });
   on('presets.updated', () => loadPresets().catch(() => {}));
   on('providers.status', () => { refreshSystemSoon(); refreshModelsSoon(); });
-  on('ollama.status', () => { refreshSystemSoon(); refreshModelsSoon(); });
+  on('ollama.status', (d) => {
+    // { starting: true, phase } while Harness starts its Ollama; anything else ends that.
+    const prev = store.get('ollamaStart');
+    store.set('ollamaStart', d.starting ? { phase: d.phase || 'starting', since: prev?.since || Date.now() } : null);
+    // Just started: ask the backend to look again, so nothing shows "not running" in between.
+    if (d.running) loadSystem({ refresh: true }).catch(() => {}); else refreshSystemSoon();
+    refreshModelsSoon();
+  });
   on('model.pull', (d) => {
     const pulls = { ...(store.get('pulls') || {}) };
     const prev = pulls[d.pullId] || {};

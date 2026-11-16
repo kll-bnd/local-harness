@@ -10,7 +10,7 @@ import { openDialog, toast } from '../ui/overlays.js';
 import { showError } from '../errors.js';
 import { runAction, keyLabel, getAction } from '../actions.js';
 import { confirmWithPassword, passwordField, strengthMeter, recoveryKeyPanel, migrationProgress, RECOVERY_WARNING, setSecurityContext, confirmationHeader, clearOnEdit } from '../security-ui.js';
-import { networkState, scopeSentence, allowFor, blockNow, setBlocker, selfTest } from './network.js';
+import { networkState, scopeNote, allowFor, blockNow, setBlocker, selfTest } from './network.js';
 import { lockdown, holdLockdown } from '../lockdown.js';
 
 const MODES = [
@@ -155,7 +155,7 @@ function internetBlock(view) {
       h('div.form-label', h('label.field-label', 'Block all internet access'), h('div.field-help', 'On by default. Harness only goes online when you allow it, for example to download a model, and blocks it again by itself.')),
       h('div.form-control', sw)),
     h('p.net-status', { dataset: { state: s.state } }, status),
-    ol ? h('p.field-help', scopeSentence(ol)) : null,
+    ol ? scopeNote(ol) : null,
     h('div.row-wrap',
       s.state === 'blocked' ? h('button.btn', { type: 'button', on: { click: () => allowFor(15) } }, icon('globe', { size: 14 }), 'Allow for 15 minutes…') : null,
       s.state === 'allowed' ? h('button.btn.btn-primary', { type: 'button', on: { click: () => blockNow() } }, 'Block now') : null,

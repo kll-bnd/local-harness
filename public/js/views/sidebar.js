@@ -3,7 +3,7 @@
 import { h, debounce, delegate, mount, add, dragRegion } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { recencyGroup, modelShort, fmtBytes, fmtWhen, fmtTokens, residentOf } from '../lib/format.js';
-import { store, loadArchived, ollamaStatus } from '../state.js';
+import { store, loadArchived, ollamaStatus, ollamaStartText } from '../state.js';
 import * as api from '../api.js';
 import { runAction, keyLabel, getAction } from '../actions.js';
 import { navigate } from '../router.js';
@@ -61,7 +61,7 @@ export class Sidebar {
 
     this.offs = [
       store.watch(['chats', 'archived', 'route'], () => this.renderList()),
-      store.watch(['system', 'route', 'imageJobs', 'pulls', 'memoryCount', 'security'], () => { this.renderNav(); this.renderFoot(); }),
+      store.watch(['system', 'route', 'imageJobs', 'pulls', 'memoryCount', 'security', 'ollamaStart'], () => { this.renderNav(); this.renderFoot(); }),
     ];
     this.renderNav();
     this.renderList();
@@ -106,7 +106,9 @@ export class Sidebar {
     const lines = [];
     if (!sys) lines.push(h('span.m-line', h('span.dot'), h('span.m-label', 'Connecting…')));
     else {
-      lines.push(h('span.m-line', h(`span.dot${running ? '.ok' : '.err'}`), h('span.m-label', h('b', 'Ollama'), running ? ` ${provider?.version || ''}`.trimEnd() : ' not running', others.length ? ` · +${others.length} server${others.length > 1 ? 's' : ''}` : '')));
+      const starting = !running && ollamaStartText();
+      if (starting) lines.push(h('span.m-line', h('span.dot.busy'), h('span.m-label', starting)));
+      else lines.push(h('span.m-line', h(`span.dot${running ? '.ok' : '.err'}`), h('span.m-label', h('b', 'Ollama'), running ? ` ${provider?.version || ''}`.trimEnd() : ' not running', others.length ? ` · +${others.length} server${others.length > 1 ? 's' : ''}` : '')));
       if (unloadedForImage) lines.push(h('span.m-line', h('span.dot.warn'), h('span.m-label', 'Chat model unloaded for images')));
       else if (loaded.length) lines.push(h('span.m-line', h('span.dot.ok'), h('span.m-label', { title: loaded.map((m) => `${m.model} — ${fmtBytes(residentOf(m))} in memory${m.residentBasis === 'measured' ? ' (measured)' : ''}${m.contextLength ? `, ${fmtTokens(m.contextLength)} context` : ''}`).join('\n') }, h('b', modelShort(loaded[0].model, 24)), ` · ${fmtBytes(residentOf(loaded[0]))}`, loaded.length > 1 ? ` +${loaded.length - 1}` : '')));
       else if (running) lines.push(h('span.m-line', h('span.dot'), h('span.m-label', 'No model loaded')));

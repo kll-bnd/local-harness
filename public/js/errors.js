@@ -60,6 +60,18 @@ export function explainError(err, context = '') {
       return { title: 'The model server returned an error', detail: msg };
     case 'timeout':
       return { title: 'The model took too long to respond', detail: 'On a small machine the first reply after loading can be slow. Try again.' };
+    case 'gpu_discovery_timeout':
+      return { title: 'Ollama is still waiting for the GPU', detail: 'It looked for the graphics chip for two minutes without finishing — usually another app (for example Draw Things) is loading a model. Try again when that app is done.', action: { label: 'Try again', run: () => runAction('start-ollama') } };
+    case 'not_responding':
+      return { title: 'Another Ollama is there but not answering', detail: `${msg} Wait a moment, or quit the other Ollama, then try again.`, action: { label: 'Try again', run: () => runAction('start-ollama') } };
+    case 'port_in_use':
+      return { title: "Ollama's address is taken by another program", detail: `${msg} Quit that program, or choose another Ollama address in Settings → Providers.`, action: { label: 'Providers', run: () => runAction('open-settings', 'providers') } };
+    case 'not_listening':
+    case 'exited':
+    case 'spawn_failed':
+      return { title: "Ollama didn't start", detail: msg, action: { label: 'Try again', run: () => runAction('start-ollama') } };
+    case 'not_loopback':
+      return { title: 'Harness starts Ollama only on this Mac', detail: msg, action: { label: 'Providers', run: () => runAction('open-settings', 'providers') } };
     case 'start_timeout':
       return { title: "Ollama didn't start in time", detail: (err.details?.logTail || []).slice(-3).join('\n') || msg, action: { label: 'Try again', run: () => runAction('start-ollama') } };
     case 'not_installed':

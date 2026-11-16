@@ -3,7 +3,7 @@
 import { h, mount, add, copyText } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtTokens, modelLabel, modelShort, fmtUntil, fmtWhen, plural, residentOf } from '../lib/format.js';
-import { store, loadModels, loadSystem, loadRecommended, patchSettings, sameRef, dropModelInfo } from '../state.js';
+import { store, loadModels, loadSystem, loadRecommended, patchSettings, sameRef, dropModelInfo, ollamaStartText } from '../state.js';
 import * as api from '../api.js';
 import { pullModel, pullFor, activePulls, cancelPull } from './pulls.js';
 import { recCard, pullProgress } from './setup.js';
@@ -27,7 +27,7 @@ export class ModelsView {
     this.headEl = h('div.page-head.models-head');
     this.bodyEl = h('div.models-body');
     add(this.page, this.headEl, this.bodyEl);
-    store.watch(['models', 'system', 'recommended', 'pulls', 'defaultModel', 'settings'], () => { if (this.tab === 'local' && !this.modelId) this.render(); else this.renderHead(); });
+    store.watch(['models', 'system', 'recommended', 'pulls', 'defaultModel', 'settings', 'ollamaStart'], () => { if (this.tab === 'local' && !this.modelId) this.render(); else this.renderHead(); });
     this.scroller.addEventListener('scroll', () => this.shell.setScrolled(this.scroller.scrollTop > 4), { passive: true });
   }
 
@@ -129,7 +129,12 @@ export class ModelsView {
     const pullBtn = h('button.btn', { type: 'button', disabled: !canPull, on: { click: () => { const v = name.value.trim(); if (v) { pullModel({ model: v }); name.value = ''; } } } }, icon('download', { size: 14 }), 'Download');
     name.addEventListener('keydown', (e) => { if (e.key === 'Enter') pullBtn.click(); });
 
+    const starting = !providers.find((p) => p.id === 'ollama' && p.status === 'running') && ollamaStartText(true);
+    const proc = sys?.ollama;
+    const startProblem = !starting && proc?.installed && proc?.lastError && !providers.find((p) => p.id === 'ollama' && p.status === 'running');
     mount(this.bodyEl,
+      starting ? h('div.callout.accent.ollama-start', h('span.spinner.small'), h('div', starting)) : null,
+      startProblem ? h('div.callout.warn.ollama-start', icon('warning'), h('div.grow', h('b', "Ollama isn't running. "), proc.lastError), h('button.btn.btn-small', { type: 'button', on: { click: () => runAction('start-ollama') } }, 'Try again')) : null,
       loadedSec,
       downloads,
       h('section.panel-section', h('div.section-head', h('h2.h2', 'Installed')), installed),

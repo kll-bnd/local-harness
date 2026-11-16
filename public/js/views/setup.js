@@ -4,7 +4,7 @@
 import { h, mount } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtTokens, modelLabel, modelShort } from '../lib/format.js';
-import { store, loadRecommended, chatModels, ollamaStatus, loadSystem, loadModels, patchSettings, findModel } from '../state.js';
+import { store, loadRecommended, chatModels, ollamaStatus, loadSystem, loadModels, patchSettings, findModel, ollamaStartText } from '../state.js';
 import { textOnlyFlow } from './model-flows.js';
 import { runAction } from '../actions.js';
 import { navigate } from '../router.js';
@@ -19,7 +19,7 @@ export class SetupView {
     this.scroller = h('div.view-scroll', this.page);
     this.el = h('div.view', this.scroller);
     this.showAll = false;
-    store.watch(['system', 'models', 'recommended', 'pulls', 'defaultModel'], () => this.render());
+    store.watch(['system', 'models', 'recommended', 'pulls', 'defaultModel', 'ollamaStart'], () => this.render());
     this.scroller.addEventListener('scroll', () => this.shell.setScrolled(this.scroller.scrollTop > 4), { passive: true });
   }
 
@@ -54,6 +54,8 @@ export class SetupView {
       backendBody = h('div.stack', h('p', `Ollama ${provider.version || ''} is running at `, h('code', provider.baseUrl), process?.managed ? ' (started by Harness).' : '.'),
         prot && prot.inEffect === false ? h('div.callout.warn.small', icon('warning'), h('div.grow', h('div', h('b', 'Memory protections are not in effect. ')), h('div', prot.message))) : null,
         others.length ? h('p.muted', `Also found: ${others.map((p) => p.name).join(', ')}.`) : null);
+    } else if (ollamaStartText()) {
+      backendBody = h('div.stack', h('div.row', h('span.spinner.small'), h('p', ollamaStartText(true))));
     } else if (process?.installed) {
       backendBody = h('div.stack', h('p', 'Ollama is installed but not running.'), h('div.row', h('button.btn.btn-primary', { type: 'button', on: { click: () => runAction('start-ollama') } }, icon('power', { size: 14 }), 'Start Ollama'), h('span.faint.small', process.binaryPath)),
         process.lastError ? h('div.callout.warn', icon('warning'), h('div', process.lastError, process.logTail?.length ? h('pre.log-tail', process.logTail.slice(-6).join('\n')) : null)) : null,

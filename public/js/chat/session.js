@@ -214,6 +214,11 @@ export function describeLive(model) {
     const what = st.reason === 'model_in_use' ? 'Waiting for the model to finish another task' : 'Waiting for image generation to finish';
     return { label: `${what}… ${s} s`, phase: 'waiting', hint: s >= 5 ? `On ${mac} the chat model and image generation take turns, so they never compete for memory.` : null };
   }
+  if (st?.phase === 'loading' && st.reason === 'waiting_for_gpu') {
+    // Ollama listens but is still looking for the GPU, which waits while another app loads a model onto it.
+    const s = Math.max(since(st.at), Math.round((st.elapsedMs || 0) / 1000));
+    return { label: `Waiting for the GPU… ${s} s`, phase: 'loading', hint: s >= 4 ? 'Another app is using the graphics chip right now (for example Draw Things loading a model). Your message is sent as soon as Ollama is ready.' : null };
+  }
   if (st?.phase === 'loading' && st.reason === 'starting_ollama') {
     // Harness is still starting Ollama (e.g. right after unlocking): the turn waits instead of failing.
     const s = Math.max(since(st.at), Math.round((st.elapsedMs || 0) / 1000));
@@ -332,7 +337,8 @@ function handleEvent(model, ev) {
       if (ev.phase === 'loaded') { changed(model, model.live?.assistantId); break; }
       const keep = ['waiting', 'loading', 'evaluating'].includes(ev.phase);
       setLive(model, {
-        modelStatus: keep ? { ...ev, at: prev?.phase === ev.phase ? prev.at : Date.now() - (ev.elapsedMs || 0) } : null,
+        // The clock restarts when the phase or its reason changes (starting Ollama → waiting for the GPU → loading).
+        modelStatus: keep ? { ...ev, at: prev?.phase === ev.phase && (prev?.reason || null) === (ev.reason || null) ? prev.at : Date.now() - (ev.elapsedMs || 0) } : null,
         seenModelStatus: true,
         ...(ev.phase === 'ready' ? { stepStartedAt: Date.now() } : {}),
       });

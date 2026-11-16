@@ -23,6 +23,7 @@ export const store = createStore({
   uiPrefs: getUi('prefs', {}) || {}, // UI preferences (theme, layout, …), kept in the UI-state store
   security: null, // GET /api/security (state, mode, recoveryKey, idleLockMinutes, session, offlineLock)
   network: null, // offlineLock status (GET /api/network, network.status events)
+  ollamaStart: null, // { phase: 'starting' | 'waiting_for_gpu', since } while Harness starts its Ollama (ollama.status events)
 });
 
 /** Bus for app-level events that are not state (e.g. "focus composer"). */
@@ -123,6 +124,18 @@ export function ollamaStatus() {
   const sys = store.get('system');
   const p = sys?.providers?.find((x) => x.id === 'ollama');
   return { provider: p || null, process: sys?.ollama || null, running: p?.status === 'running' };
+}
+
+/** A plain sentence for Harness's Ollama while it starts, or null. */
+export function ollamaStartText(long = false) {
+  const st = store.get('ollamaStart');
+  if (!st) return null;
+  if (st.phase === 'waiting_for_gpu') {
+    return long
+      ? 'Ollama is starting and waiting for the GPU — another app (for example Draw Things) is probably loading a model. Harness carries on as soon as Ollama is ready.'
+      : 'Ollama is waiting for the GPU…';
+  }
+  return long ? 'Harness is starting Ollama…' : 'Starting Ollama…';
 }
 
 export function imageProviders() {

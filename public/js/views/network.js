@@ -73,11 +73,49 @@ const SCOPE = {
   none: 'Harness blocks it in its own code; no macOS sandbox is in force.',
 };
 
-export function scopeSentence(ol) {
-  if (!ol) return '';
-  let s = ol.osEnforced ? (SCOPE[ol.osScope] || SCOPE.none) : SCOPE.none;
-  if (ol.externalOllama) s += ' The Ollama in use was not started by Harness, so Harness cannot confine it — only what Harness itself sends is blocked.';
-  return s;
+export const OS_PENDING_TEXT = 'Ollama is still running outside the macOS sandbox from the last download; Harness puts it back as soon as it is idle, at the latest when it locks.';
+export const OS_FALLBACK_TEXT = "macOS could not start Ollama inside its sandbox, so it is running without it. Harness's own blocking still applies; Harness tries the sandbox again the next time it locks.";
+const FALLBACK_REASON = {
+  sandboxed_exit: 'Ollama stopped right after starting inside the sandbox.',
+  sandboxed_not_listening: 'Ollama did not start listening inside the sandbox in time.',
+  sandbox_unavailable: 'The macOS sandbox tool could not run.',
+};
+
+/** Ollama is running without the sandbox right now because macOS could not start it inside (not just "pending"). */
+const fallbackNow = (ol) => !!ol?.osFallback && !(ol.osEnforced && ol.osScope === 'ollama') && ol.osScope !== 'backend';
+
+/**
+ * How "Block all internet access" is enforced right now, in plain words: { text, warn, detail } — `warn` when the
+ * owner should notice (macOS could not sandbox Ollama), `detail` (what went wrong) only for a disclosure.
+ */
+export function scopeInfo(ol) {
+  if (!ol) return { text: '', warn: false, detail: null };
+  let text = ol.osEnforced ? (SCOPE[ol.osScope] || SCOPE.none) : SCOPE.none;
+  let warn = false;
+  let detail = null;
+  if (ol.blocked && fallbackNow(ol)) {
+    // One sentence, also when putting it back is pending.
+    text = OS_FALLBACK_TEXT;
+    warn = true;
+    const f = ol.osFallback;
+    detail = [FALLBACK_REASON[f.reason] || null, f.detail || null, f.at ? `(${new Date(f.at).toLocaleString()}${f.count > 1 ? `, ${f.count} times` : ''})` : null].filter(Boolean).join('\n');
+  } else if (ol.blocked && ol.osPending) {
+    text = `Harness blocks it in its own code. ${OS_PENDING_TEXT}`;
+  }
+  if (ol.externalOllama) text += ' The Ollama in use was not started by Harness, so Harness cannot confine it — only what Harness itself sends is blocked.';
+  return { text, warn, detail };
+}
+
+export function scopeSentence(ol) { return scopeInfo(ol).text; }
+
+/** The same as an element: a calm line, or a warning line with "What happened" on demand. */
+export function scopeNote(ol, { className = 'field-help' } = {}) {
+  const info = scopeInfo(ol);
+  if (!info.text) return null;
+  if (!info.warn) return h(`p.scope-note.${className}`, info.text);
+  return h(`div.scope-note.scope-warn.${className}`,
+    h('p', icon('warning', { size: 13 }), h('span', info.text)),
+    info.detail ? h('details.scope-detail', h('summary', 'What happened'), h('pre', info.detail)) : null);
 }
 
 // ------------------------------------------------------------------------------------------------ allow prompt
@@ -242,9 +280,11 @@ export function shieldButton() {
     blockBtn.hidden = s.state !== 'allowed';
     let label;
     let text = null;
+    const osWarn = s.state === 'blocked' && fallbackNow(ol);
+    el.dataset.osWarn = String(osWarn);
     if (s.state === 'blocked') {
-      label = 'Internet access is blocked';
-      mount(btn, icon('shieldCheck', { size: 15 }));
+      label = osWarn ? 'Internet access is blocked — Ollama runs without the macOS sandbox (Harness’s own blocking applies)' : 'Internet access is blocked';
+      mount(btn, icon('shieldCheck', { size: 15 }), osWarn ? h('span.net-warn-dot', { attrs: { 'aria-hidden': 'true' } }) : null);
     } else if (s.state === 'allowed') {
       label = s.waitingFor ? 'Internet allowed until the download finishes' : `Internet allowed for ${fmtWait(s.leftMs)}`;
       text = s.waitingFor ? 'Online until done' : `Online ${fmtClock(s.leftMs)}`;
@@ -279,7 +319,7 @@ function openShieldPopover(anchor) {
       : s.state === 'allowed'
         ? 'Model downloads and the online catalogue work now. Harness blocks internet access again by itself.'
         : 'Harness and the models it starts can reach the internet. Turn blocking back on in Privacy & security.'),
-    ol ? h('p.net-pop-scope.faint', scopeSentence(ol)) : null,
+    ol ? scopeNote(ol, { className: 'net-pop-scope' }) : null,
     h('div.row.net-pop-actions',
       s.state === 'blocked' ? h('button.btn.btn-small', { type: 'button', on: { click: () => { close(); allowFor(15); } } }, 'Allow for 15 minutes…') : null,
       s.state === 'allowed' ? h('button.btn.btn-small.btn-primary', { type: 'button', on: { click: () => { close(); blockNow(); } } }, 'Block now') : null,
