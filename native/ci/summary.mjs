@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 const lines = fs.readFileSync(process.env.FACTS || '/tmp/native-facts.txt', 'utf8').split('\n').filter(Boolean);
 const expected = process.argv.slice(2);
-const keep = lines.filter((l) => /^(build\||bundle\||electron\|)|\.memory:|summary:|\.PASS:|markerNotOnDisk|\.sockets|cleanQuit.*"ok":false|^ollama\| (sandbox-ollama sandboxed\.(chat|ps|pullSmall)|net-probe)/.test(l));
+const keep = lines.filter((l) => /^(build\||bundle\||electron\||guard\|)|\.memory:|summary:|\.PASS:|markerNotOnDisk|\.sockets|cleanQuit.*"ok":false|^ollama\| (sandbox-ollama sandboxed\.(chat|ps|pullSmall)|net-probe)/.test(l));
 console.log(`---- summary (${keep.length} of ${lines.length} fact lines) ----`);
 for (const l of keep) console.log(l.slice(0, 600));
 const problems = [];

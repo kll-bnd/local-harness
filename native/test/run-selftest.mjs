@@ -4,7 +4,7 @@
 //   node native/test/run-selftest.mjs --app dist/native/Harness.app --label mock --script native/test/selftest-mock.js
 //        [--backend native/test/mock-backend.mjs] [--launches 2] [--files a,b] [--data <dir>] [--timeout 300]
 // Prints one `selftest| <label> …` line per fact and appends them to $FACTS.
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,13 +18,52 @@ const backend = opt('backend') ? path.resolve(opt('backend')) : null;
 const launches = Number(opt('launches', '1'));
 const files = opt('files', '');
 const timeoutS = Number(opt('timeout', '300'));
-// `--data default` means the real default data folder (~/Library/Application Support/Harness). It is wiped before and
-// after, so it is allowed only on CI and with --allow-default-data (never on someone's own Mac).
-const defaultData = path.join(os.homedir(), 'Library', 'Application Support', 'Harness');
+// `--data default`: run on the real default data folder (~/Library/Application Support/Harness) to test what a real
+// user has (the Keychain account `data-key`). SAFETY, by construction: this can never delete or change existing
+// Harness data or the user's Keychain item —
+//   * only on GitHub Actions (GITHUB_ACTIONS=true) and only with --allow-default-data;
+//   * if ~/Library/Application Support/Harness exists at all (file, symlink or directory, empty or not), refuse
+//     (exit 2) and touch nothing; nothing is ever wiped "before";
+//   * if the login Keychain already has the item service `local.harness` / account `data-key` (or that cannot be
+//     checked), refuse (exit 2) and touch nothing;
+//   * afterwards, remove only what this run created: the folder (never through a symlink) and the Keychain item,
+//     both of which did not exist at the start.
+// So this step cannot run on a Mac that has Harness data. native/test/run-selftest-guard.test.mjs proves the refusal.
+const DEFAULT_DATA = path.join(os.homedir(), 'Library', 'Application Support', 'Harness');
 const useDefault = opt('data') === 'default';
-if (useDefault && !(process.env.CI === 'true' && argv.includes('--allow-default-data'))) { console.error('--data default wipes ~/Library/Application Support/Harness: CI only, with --allow-default-data'); process.exit(2); }
-if (useDefault) fs.rmSync(defaultData, { recursive: true, force: true });
-const dataDir = useDefault ? defaultData : path.resolve(opt('data', fs.mkdtempSync(path.join(os.tmpdir(), `harness-${label}-data-`))));
+const KEYCHAIN_ITEM = ['-s', 'local.harness', '-a', 'data-key'];
+const keychainHasItem = () => {
+  const r = spawnSync('/usr/bin/security', ['find-generic-password', ...KEYCHAIN_ITEM], { stdio: 'ignore', timeout: 15000 });
+  return r.status === 0 ? true : r.status === 44 ? false : null; // 44 = not found; anything else = unknown
+};
+if (useDefault) {
+  if (!(process.env.GITHUB_ACTIONS === 'true' && argv.includes('--allow-default-data'))) {
+    console.error('refusing --data default: it runs only on GitHub Actions (GITHUB_ACTIONS=true) with --allow-default-data');
+    process.exit(2);
+  }
+  let present = true;
+  try { fs.lstatSync(DEFAULT_DATA); } catch (e) { present = e.code !== 'ENOENT'; }
+  if (present) {
+    console.error(`refusing --data default: ${DEFAULT_DATA} exists — this step never runs on a Mac that has Harness data (nothing was touched)`);
+    process.exit(2);
+  }
+  if (process.platform === 'darwin' && keychainHasItem() !== false) {
+    console.error('refusing --data default: the login Keychain has (or may have) the Harness item local.harness / data-key — nothing was touched');
+    process.exit(2);
+  }
+  // Neither existed: whatever is there when this process ends was made by this run, and only that is removed.
+  process.on('exit', () => {
+    try {
+      const st = fs.lstatSync(DEFAULT_DATA);
+      if (st.isDirectory() && !st.isSymbolicLink()) fs.rmSync(DEFAULT_DATA, { recursive: true, force: true });
+      else fs.unlinkSync(DEFAULT_DATA); // a link or a file: remove the entry itself, never what it points to
+    } catch { /* not there */ }
+    if (process.platform === 'darwin' && keychainHasItem() === true) {
+      spawnSync('/usr/bin/security', ['delete-generic-password', ...KEYCHAIN_ITEM], { stdio: 'ignore', timeout: 15000 });
+    }
+  });
+}
+const dataDir = useDefault ? DEFAULT_DATA : path.resolve(opt('data', fs.mkdtempSync(path.join(os.tmpdir(), `harness-${label}-data-`))));
 const outDir = fs.mkdtempSync(path.join(os.tmpdir(), `harness-${label}-out-`));
 const FACTS = process.env.FACTS || '/tmp/native-facts.txt';
 const lines = [];
@@ -136,6 +175,5 @@ if (fs.existsSync(appLog)) {
   for (const l of tail) say('log', l.replace(/^\[native \S+\] /, '').slice(0, 200));
 }
 fs.appendFileSync(FACTS, lines.join('\n') + '\n');
-if (useDefault) fs.rmSync(defaultData, { recursive: true, force: true });
 // The job's last step (native/ci/summary.mjs) turns any failure into a failed job, after every step has run.
 process.exit(0);

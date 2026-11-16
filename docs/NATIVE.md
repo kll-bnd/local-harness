@@ -135,9 +135,15 @@ Exactly the one in `docs/DESKTOP.md` ("Contract with the web UI"), injected at d
   screen talks to the backend's unlock route through the bridge. The password never leaves the two processes.
 * **Keychain mode (opt-in, `launch.json` `"encryption": "keychain"`).** When the user switches to it, the backend sends
   `keychain-key`; the app stores the value as a generic password in the login Keychain (service `local.harness`,
-  account `data-key`, label `Harness data key`, value = base64 of 32 bytes) with the Security framework and sends it as
-  `hello.dataKey` at every later start. Leaving keychain mode (`keychain-key` with `null`) deletes the item. The key is
-  never written to disk, logs, argv or the environment by the app.
+  label `Harness data key`, value = base64 of 32 bytes) with the Security framework and sends it as `hello.dataKey`
+  at every later start. The account is scoped to the data folder exactly as the backend names it: `data-key` for the
+  default folder (`~/Library/Application Support/Harness`, what a real user has), `data-key-<first 16 hex digits of
+  SHA-256 of the folder's real path>` for any other folder (the real path as `realpath(3)` gives it, e.g.
+  `/private/var/…`), so a test or a second installation never touches the user's item. In bridge mode the backend
+  decides and the app executes: when the user leaves keychain mode the backend sends `keychain-key` with `null` only
+  if the item holds this data's key (the key the app sent in `hello` or received in this session), and the app then
+  deletes it; an item with a key that does not open this data is left alone. The key is never written to disk, logs,
+  argv or the environment by the app.
 * **What macOS does with an ad-hoc-signed app** (measured on the runner, `native/probe/KeychainProbe.swift`): the item's
   access list names the exact build that created it. The same build reads it silently; **a rebuilt app (new ad-hoc
   signature) cannot read it without the system prompt** ("Harness wants to use your confidential information stored
@@ -305,6 +311,9 @@ Found with the probes in `native/probe/` on macOS 26.7.2 before the app was buil
   native/test/selftest-real.js --launches 3` (needs Ollama with `qwen3:0.6b`) run the self-tests on a Mac; each prints
   `selftest| …` lines. The self-test mode is inert unless the app is started with `--self-test <dir>`; the
   `--backend` override is honoured only then.
+* In CI the job's last step (`native/ci/summary.mjs`) prints the key facts and then every failing check with its
+  details, and fails the job when any check failed or a self-test did not finish. `--data default` (the real default
+  folder, wiped before and after) is accepted only with `CI=true` and `--allow-default-data`.
 * `native/ci/sandbox-ollama.mjs`, `native/ci/sb-variants.mjs`, `native/ci/net-probe.mjs` prove the offline-lock
   profile; `native/ci/electron-memory.mjs` measures the Electron build; `native/probe/` holds the first fact-finding
   probes (scheme handler, Keychain) and the draft profile they were compared with.

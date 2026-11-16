@@ -358,6 +358,14 @@ jobs:
             echo "bundle| node: $($A/Contents/MacOS/node -v) $(codesign -dv $A/Contents/MacOS/node 2>&1 | grep -E '^(Authority|TeamIdentifier)' | head -n 2 | tr '\n' ' ')"
             echo "bundle| $(file -b $A/Contents/MacOS/Harness)"
           } >> "$FACTS"
+      - name: The default-folder self-test refuses to touch existing Harness data
+        run: |
+          if node --test native/test/run-selftest-guard.test.mjs > /tmp/guard.log 2>&1; then echo "guard| run-selftest --data default refuses existing data: $(grep -E '^# (pass|fail)' /tmp/guard.log | tr '\n' ' ')" >> "$FACTS"
+          else grep -E '^not ok|# (pass|fail)' /tmp/guard.log | sed 's/^/build-error| guard: /' >> "$FACTS"; exit 1; fi
+      - name: Keychain mode on the default data folder (the real user's case; first, on a fresh runner)
+        continue-on-error: true
+        run: |
+          node native/test/run-selftest.mjs --app dist/native/Harness.app --label keychain-default --script native/test/selftest-keychain-default.js --launches 2 --timeout 240 --data default --allow-default-data > /dev/null 2> /tmp/keychain-default.err || sed 's/^/build-error| keychain-default: /' /tmp/keychain-default.err >> "$FACTS"
       - name: Self-test against the mock backend (two launches, one data folder)
         run: |
           node -e "const n=20*1024*1024,b=Buffer.alloc(n);for(let i=0;i<n;i++)b[i]=(Math.imul(i,31)+7)&255;require('fs').writeFileSync('/tmp/pick-20mb.bin',b)"
@@ -373,10 +381,6 @@ jobs:
         run: |
           node native/test/bridge-client.mjs server/index.mjs "$RUNNER_TEMP/bridge-check" 2>&1 | sed 's/^/bridge| /' >> "$FACTS"
           node native/test/run-selftest.mjs --app dist/native/Harness.app --label real --script native/test/selftest-real.js --launches 3 --timeout 900 --settle 5 --log-lines 20 --show chatStreamsFromRealModel,appNapHeldOnlyWhileGenerating,offlineLockAroundOllama,allowThenBlockAgain,lockUnloadsAndLocks,keychainModeOpensWithoutPassword,wrongKeychainKeyFallsBackToPassword > /dev/null
-      - name: Keychain mode on the default data folder (the real user's case)
-        if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
-        continue-on-error: true
-        run: node native/test/run-selftest.mjs --app dist/native/Harness.app --label keychain-default --script native/test/selftest-keychain-default.js --launches 2 --timeout 240 --data default --allow-default-data > /dev/null
       - name: Idle memory, native app on the real UI
         if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
         continue-on-error: true

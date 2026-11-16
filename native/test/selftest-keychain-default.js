@@ -1,6 +1,11 @@
-// Keychain mode on the DEFAULT data folder (~/Library/Application Support/Harness — what the real user has), CI
-// only: the app must use the account `data-key` there (docs/BRIDGE.md `keychain-key`). Two launches: switch to
-// keychain mode and check the item; then open without a password and leave keychain mode, which deletes the item.
+// Keychain mode on the DEFAULT data folder (~/Library/Application Support/Harness — what the real user has): the app
+// must use the account `data-key` there (docs/BRIDGE.md `keychain-key`). Two launches: switch to keychain mode and
+// check the item; then open without a password and leave keychain mode, which deletes the item.
+//
+// SAFETY: run only through `run-selftest.mjs --data default --allow-default-data` on GitHub Actions. That runner
+// refuses (exit 2, touching nothing) when the default data folder exists in any form or the login Keychain already
+// has the item local.harness / data-key, and afterwards removes only what this run created. It cannot run on a Mac
+// that has Harness data. Proven by native/test/run-selftest-guard.test.mjs.
 (async () => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const st = await native('stashAll');
