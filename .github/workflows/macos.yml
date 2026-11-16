@@ -214,12 +214,9 @@ jobs:
           node scripts/doctor.mjs 2>&1 | grep -E 'Harness .*running|Harness is not running|Data protection|Internet blocker|self-test' || true
           # The data dir holds no readable chat text: grep for a word every settings file used to contain.
           if grep -rIl 'providers' "$HOME/Library/Application Support/Harness" 2>/dev/null | grep -vE '/(logs|Electron)/|launch.json|vault.json|harness.lock|measurements.json' | head -n 5; then echo "NOTE: plain-text files above"; else echo "no plain-text data files found"; fi
-      - name: The user's scenario, end to end
-        # nemotron-e2e.mjs drives its own temporary Harness over plain HTTP: use the documented development opt-out
-        # for that process (docs/API.md 10.10); the 0.2 defaults are covered by the steps above and the live job.
-        env:
-          HARNESS_ENCRYPTION: "off"
-          HARNESS_API_AUTH: "0"
+      - name: The user's scenario, end to end, with the shipped defaults
+        # Password, encryption and the internet blocker are all on: the script sets a throw-away password,
+        # allows the network with it for the download, and proves the lock and the on-disk encryption.
         run: node scripts/ci/nemotron-e2e.mjs
 
   hub:
