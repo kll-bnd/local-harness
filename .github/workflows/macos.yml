@@ -13,7 +13,7 @@ on:
         description: "Which jobs to run"
         type: choice
         default: all
-        options: [all, backend, desktop, ui, native, live, sandbox, e2e, hub, ollama, nemotron]
+        options: [all, backend, desktop, ui, native, live, sandbox, sandbox-timing, e2e, hub, ollama, nemotron]
       live_groups:
         description: "live-check groups to run"
         type: string
@@ -224,6 +224,30 @@ jobs:
         # A throw-away Harness per round (temporary data folder, random password) starts its own Ollama on a spare
         # port while internet access is blocked; a model pull sent straight to that Ollama must fail every time.
         run: node scripts/ci/sandbox-ollama-repeat.mjs 10
+
+  sandbox_timing:
+    name: How long Ollama needs to start, sandboxed and plain (fact-finding)
+    if: ${{ inputs.jobs == 'sandbox-timing' }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install and start an external Ollama, pull tiny models (nothing loaded yet)
+        run: |
+          set -euo pipefail
+          brew install ollama > /dev/null
+          OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 nohup ollama serve > /tmp/harness-ci-ollama.log 2>&1 &
+          for _ in $(seq 1 100); do
+            curl -fsS "$O/api/version" > /dev/null 2>&1 && break
+            sleep 0.3
+          done
+          ollama pull qwen3:0.6b > /dev/null 2>&1
+          ollama pull gemma3:270m > /dev/null 2>&1
+      - name: Start timings
+        run: node scripts/ci/sandbox-start-timing.mjs
 
   e2e:
     name: Real Nemotron through Harness, end to end
