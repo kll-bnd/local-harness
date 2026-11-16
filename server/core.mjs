@@ -234,10 +234,10 @@ export class Core extends EventEmitter {
   async refreshOllamaPresence() {
     const p = this.ollamaProcess;
     if (p.managed) { p.external = false; return; }
-    if (this._presence && Date.now() - this._presence.at < 5000) return this._presence.promise;
     const provider = this.app?.registry.ollama() || this._lockedOllamaProvider();
+    if (this._presence && this._presence.url === provider.baseUrl && Date.now() - this._presence.at < 5000) return this._presence.promise;
     const promise = Promise.resolve(provider.status()).then((st) => { if (!p.managed) p.external = !!st?.ok; }, () => {});
-    this._presence = { at: Date.now(), promise };
+    this._presence = { at: Date.now(), promise, url: provider.baseUrl };
     return promise;
   }
 

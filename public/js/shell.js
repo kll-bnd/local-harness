@@ -2,7 +2,7 @@
 // chat-level actions (rename, pin, fork, export, archive, delete with undo) and the reconnect banner.
 import { h, mount, download, add, dragRegion } from './lib/dom.js';
 import { icon } from './lib/icons.js';
-import { fmtTokens, fmtBytes, modelLabel, modelShort, fmtUntil, residentOf } from './lib/format.js';
+import { fmtTokens, fmtBytes, modelShort, fmtUntil, residentOf } from './lib/format.js';
 import { store, uiPrefs, setUiPref, findModel, modelInfo, loadChats, loadArchived } from './state.js';
 import * as api from './api.js';
 import { Sidebar } from './views/sidebar.js';

@@ -1,10 +1,10 @@
 // Settings: every key of the settings schema, grouped into sections with the essentials first and the
 // rest behind "Advanced". Each control saves immediately (text fields on change), shows the server's
 // validation message inline, and offers "Reset" when it differs from the default.
-import { h, debounce, download, pickFiles, mount, add } from '../lib/dom.js';
+import { h, debounce, download, mount, add } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
-import { fmtBytes, fmtTokens, modelLabel, fmtFull, isMac } from '../lib/format.js';
-import { store, patchSettings, setUiPref, uiPrefs, chatModels, loadSettings, loadPresets, loadSystem, loadModels, loadChats } from '../state.js';
+import { fmtBytes, fmtTokens, modelLabel, isMac } from '../lib/format.js';
+import { store, patchSettings, setUiPref, uiPrefs, chatModels, loadSettings, loadPresets, loadSystem, loadModels } from '../state.js';
 import * as api from '../api.js';
 import { SETTINGS_SECTIONS } from './settings-sections.js';
 import { navigate } from '../router.js';

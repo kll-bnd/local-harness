@@ -7,7 +7,7 @@ import { store, loadArchived, ollamaStatus } from '../state.js';
 import * as api from '../api.js';
 import { runAction, keyLabel, getAction } from '../actions.js';
 import { navigate } from '../router.js';
-import { openMenu, bindContextMenu } from '../ui/overlays.js';
+import { bindContextMenu } from '../ui/overlays.js';
 import { peekChatModel } from '../chat/session.js';
 
 export class Sidebar {

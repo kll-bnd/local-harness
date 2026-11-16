@@ -1,7 +1,7 @@
 // Building blocks for everything password-related, shared by the lock/setup screens (gate.js) and the app:
 // a password field with an honest strength line, the one-time recovery-key panel, retry countdowns and the
 // reusable "confirm with your password" dialog used by every action that lowers protection (docs/API.md 10.3).
-import { h, add, mount, download, nextId } from './lib/dom.js';
+import { h, add, download, nextId } from './lib/dom.js';
 import { icon } from './lib/icons.js';
 import { openDialog } from './ui/overlays.js';
 import * as api from './api.js';
@@ -216,5 +216,3 @@ export function migrationProgress() {
   };
   return { el, update };
 }
-
-export { mount, add };

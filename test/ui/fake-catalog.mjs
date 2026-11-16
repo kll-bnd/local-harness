@@ -110,23 +110,35 @@ export const OLLAMA_MODELS = [
 // More library entries so the list pages (24 per page in the backend).
 for (let i = 0; i < 30; i++) OLLAMA_MODELS.push({ name: `community-model-${i}`, desc: `A smaller community model number ${i}.`, caps: i % 3 ? ['tools'] : [], sizes: [`${(i % 7) + 1}b`], pulls: `${100 - i}K`, updated: i + 1 });
 
-/** One library entry in the real ollama.com markup (captured live by the coordinator; no x-test-* attributes). */
-function libraryItem(m) {
-  const updated = new Date(T0 - m.updated * DAY);
-  const stamp = `${updated.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })} ${updated.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'UTC' })} UTC`;
-  const caps = m.caps.map((c) => `<span class="inline-flex items-center rounded-md bg-indigo-50 px-2 py-[2px] text-xs sm:text-[13px] font-medium text-indigo-600">${c}</span>`).join(' ');
-  const sizes = m.sizes.map((z) => `<span class="inline-flex items-center rounded-md bg-[#ddf4ff] px-2 py-[2px] text-xs sm:text-[13px] font-medium text-blue-600">${z}</span>`).join(' ');
-  return `<li class="flex items-baseline border-b border-neutral-200 py-6"> <a href="/library/${m.name}" class="group w-full space-y-5"> <div title="${m.name}" class="flex flex-col"> <h2 class="truncate text-xl font-medium underline-offset-2 group-hover:underline md:text-2xl"> <div class="flex items-center"> <span class="group-hover:underline truncate">${m.name}</span> </div> </h2> <p class="max-w-lg break-words text-neutral-800 text-md">${m.desc.replace(/'/g, '&#39;')}</p> </div> <div class="flex flex-col space-y-2"> <div class="flex flex-wrap space-x-2"> ${caps} ${sizes} </div> <p class="flex space-x-5 text-[13px] font-medium text-neutral-500"> <span class="flex items-center"> <svg class="mr-1.5 h-[14px] w-[14px]" viewBox="0 0 24 24"></svg> <span >${m.pulls}</span> <span class="hidden sm:flex">&nbsp;Pulls</span> </span> <span class="flex items-center"> <svg class="mr-1.5 h-[14px] w-[14px]" viewBox="0 0 24 24"></svg> <span >${m.sizes.length + 1}</span> <span class="hidden sm:flex">&nbsp;Tags</span> </span> <span class="flex items-center" title="${stamp}"> <svg class="mr-1.5 h-[14px] w-[14px]" viewBox="0 0 24 24"></svg> <span class="hidden sm:flex">Updated&nbsp;</span> <span >${m.updated} days ago</span> </span> </p> </div> </a> </li>`;
+const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const pullsOf = (m) => { const x = /^([\d.]+)([KM])$/.exec(m.pulls); return x ? Math.round(Number(x[1]) * (x[2] === 'M' ? 1e6 : 1e3)) : 0; };
+const smallestGB = (m) => Math.min(...m.sizes.map((z) => { const x = /^([\d.]+)([mb])$/.exec(z); return x ? Number(x[1]) * (x[2] === 'b' ? 0.62 : 0.00062) : 0.3; }), m.sizes.length ? Infinity : 0.3);
+
+/**
+ * One entry of ollama.com/search in the real markup (as in test/fixtures/ollama/search-*.html, captured live):
+ * no x-test-* attributes; capability chips bg-indigo-50, size chips bg-[#ddf4ff], exact downloads in a title.
+ */
+function searchItem(m) {
+  const updated = new Date(T0 - m.updated * DAY).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+  const caps = m.caps.map((c) => `<span class="inline-flex items-center rounded-md bg-indigo-50 px-2 py-[2px] text-xs font-medium text-indigo-600">${c}</span>`).join('');
+  const sizes = m.sizes.map((z) => `<span class="inline-flex items-center rounded-md bg-[#ddf4ff] px-2 py-[2px] text-[13px] font-medium text-blue-600">${z}</span>`).join(' ');
+  return `<li class="border-t-[0.5px] border-line first:border-t-0"> <a href="/library/${m.name}" class="group grid grid-cols-1 gap-y-1 px-1 py-4"> <div class="flex min-w-0 items-baseline gap-2.5"> <h2 class="truncate text-[17px] font-medium text-ink group-hover:underline" title="${m.name}"> <span >${m.name}</span> </h2> <span class="flex-none text-[15px] tabular-nums text-muted" title="Updated ${updated}">${m.updated}d</span> </div> <div class="order-last flex flex-wrap gap-1.5">${caps} </div> <p class="mt-1 line-clamp-2 text-[15px] text-muted">${esc(m.desc)}</p> <div class="mt-3 flex flex-wrap items-center gap-2 text-[13px]"> <span class="inline-flex items-center gap-1.5 tabular-nums text-ink sm:mr-1" title="${pullsOf(m).toLocaleString('en-US')} downloads"><svg/><span >${m.pulls}</span></span> <span class="inline-flex items-center gap-1.5 tabular-nums text-ink sm:mr-1"><svg/><span >${m.sizes.length + 1} tags</span></span> ${sizes} </div> </a> </li>`;
 }
 
+/** The tag rows of /library/<name>/tags, as on the site (tag link, digest • size • context window • inputs). */
 function tagsFor(m) {
   const vision = m.caps.includes('vision');
   const sizes = m.sizes.length ? m.sizes : ['latest'];
-  return sizes.map((s, i) => {
-    const params = /^(\d+(?:\.\d+)?)([mb])$/.exec(s);
-    const gb = params ? (Number(params[1]) * (params[2] === 'b' ? 1 : 0.001) * 0.62 + (vision ? 0.8 : 0.05)).toFixed(1) : '0.3';
-    return { tag: s, digest: `${(i + 1).toString(16).padStart(2, '0')}c0ffee${'ab'.repeat(2)}`.slice(0, 12), size: `${gb}GB`, ctx: m.caps.includes('embedding') ? '2K' : '128K', inputs: vision ? 'Text, Image' : 'Text' };
+  return sizes.map((z, i) => {
+    const params = /^(\d+(?:\.\d+)?)([mb])$/.exec(z);
+    const gb = params ? (Number(params[1]) * (params[2] === 'b' ? 1 : 0.001) * 0.62 + (vision ? 0.8 : 0.05)) : 0.3;
+    const size = gb >= 1 ? `${gb.toFixed(1)}GB` : `${Math.round(gb * 1000)}MB`;
+    return { tag: z, digest: `${(i + 1).toString(16).padStart(2, '0')}c0ffee${'ab'.repeat(2)}`.slice(0, 12), size, ctx: m.caps.includes('embedding') ? '2K' : '128K', inputs: vision ? 'Text, Image' : 'Text' };
   });
+}
+
+function tagRow(name, t) {
+  return `<div class="group px-4 py-3"> <a href="/library/${name}:${t.tag}" class="md:hidden flex flex-col space-y-[6px] group"> <div class="flex items-center justify-between"> <span class="group-hover:underline">${name}:${t.tag}</span> </div> <div class="flex flex-col text-neutral-500 text-[13px]"> <span> <span class="font-mono"> ${t.digest}</span> • ${t.size} • ${t.ctx} context window • <span class="hidden sm:inline"> ${t.inputs} input • 3 weeks ago </span> </span> </div> </a> <div class="hidden md:flex flex-col space-y-[6px]"> <div class="grid grid-cols-12 items-center"> <span class="flex items-center font-medium col-span-6 group text-sm"> <a href="/library/${name}:${t.tag}" class="group-hover:underline">${name}:${t.tag}</a> <input class="command hidden" value="${name}:${t.tag}" /> </span> <p class="col-span-2 text-neutral-500 text-[13px]">${t.size}</p> <p class="col-span-2 text-neutral-500 text-[13px]">${t.ctx}</p> <div class="col-span-2 text-neutral-500 text-[13px]">${t.inputs.replace(', ', ', ')}</div> </div> <div class="flex text-neutral-500 text-xs items-center space-x-1"><span class="font-mono">${t.digest}</span> · 3 weeks ago</div> </div> </div>`;
 }
 
 function page(title, body) { return `<!doctype html><html><head><title>${title}</title><meta name="description" content="${title}"></head><body>${body}</body></html>`; }
@@ -194,26 +206,39 @@ export async function startFakeCatalog({ port = 0, delayMs = 40 } = {}) {
       const proj = siblingsFor(repo).find((f) => /^mmproj/.test(f.rfilename));
       return json(200, { schemaVersion: 2, layers: [{ mediaType: 'application/vnd.ollama.image.model', size: file.lfs.size }, ...(proj ? [{ mediaType: 'application/vnd.ollama.image.projector', size: proj.lfs.size }] : [])] });
     }
-    // ---- ollama.com
-    if (p === '/library' || p === '/search') {
+    // ---- ollama.com: the search page (20 per page; later pages are HTMX fragments ending in a "load more" item)
+    if (p === '/search' || p === '/library') {
       let list = [...OLLAMA_MODELS];
-      if (url.searchParams.get('sort') === 'newest') list.sort((a, b) => a.updated - b.updated);
+      const cs = url.searchParams.getAll('c');
+      if (p === '/search') {
+        if (cs.includes('local')) list = list.filter((x) => !x.caps.includes('cloud'));
+        for (const c of cs.filter((x) => x !== 'local')) list = list.filter((x) => x.caps.includes(c));
+        const sz = url.searchParams.get('s');
+        if (sz) list = list.filter((x) => (sz === 'over64' ? smallestGB(x) > 64 : smallestGB(x) <= Number(sz)));
+      }
+      const order = url.searchParams.get('o') || url.searchParams.get('sort');
+      list.sort((a, b2) => (order === 'newest' ? a.updated - b2.updated : pullsOf(b2) - pullsOf(a)));
       const q = url.searchParams.get('q');
-      if (p === '/search' && q) list = list.filter((x) => x.name.includes(q.toLowerCase()) || x.desc.toLowerCase().includes(q.toLowerCase()));
-      return html(200, page('Library', `<ul role="list">${list.map(libraryItem).join('\n')}</ul>`));
+      if (q) list = list.filter((x) => x.name.includes(q.toLowerCase()) || x.desc.toLowerCase().includes(q.toLowerCase()));
+      if (p === '/library') return html(200, page('Library', `<ul role="list">${list.map(searchItem).join('\n')}</ul>`));
+      const n = Number(url.searchParams.get('page') || 1);
+      const slice = list.slice((n - 1) * 20, n * 20);
+      const more = n * 20 < list.length;
+      const nextQs = new URLSearchParams(url.searchParams);
+      nextQs.set('page', String(n + 1));
+      const items = slice.map(searchItem).join('\n') + (more ? `<li hx-get="/search?${esc(nextQs.toString())}" hx-trigger="revealed" hx-swap="outerHTML" hx-target="this" hx-include="[name=c], [name=o], [name=s]" class="py-4 text-center text-muted">Loading more…</li>` : '');
+      if (n > 1) return html(200, items);
+      return html(200, `<!doctype html><html><body><form><input name="q" value="${esc(q || '')}"><select name="o"><option value="popular">Popular</option><option value="newest">Newest</option></select><select name="s"><option value="">Any size</option><option value="8">Up to 8 GB</option><option value="16">Up to 16 GB</option></select><select name="c"><option value="local">Local</option><option value="vision">Vision</option><option value="embedding">Embedding</option></select></form><ul role="list">${items}</ul></body></html>`);
     }
     m = /^\/library\/([^/:]+)(\/tags)?$/.exec(p);
     if (m) {
       const model = OLLAMA_MODELS.find((x) => x.name === decodeURIComponent(m[1]));
       if (!model) return html(404, page('Not found', '<h1>Not found</h1>'));
-      if (m[2]) {
-        const rows = tagsFor(model).map((t) => `<div class="row"><a href="/library/${model.name}:${t.tag}">${model.name}:${t.tag}</a> <span>${t.digest}</span> · <span>${t.size}</span> · <span>${t.ctx} context window</span> · <span>${t.inputs} input</span></div>`);
-        return html(200, page(`${model.name} tags`, rows.join('\n')));
-      }
-      return html(200, `<!doctype html><html><head><meta name="description" content="${model.desc.replace(/"/g, '&quot;')}"></head><body>
-        <div>${model.caps.map((c) => `<span class="badge">${c}</span>`).join('')}</div>
-        <div id="readme"><div id="display"><h2>Readme</h2><p>${model.name} runs locally with Ollama. <img src="https://ollama.com/assets/${model.name}.png" alt="logo"></p><pre><code>ollama run ${model.name}</code></pre><ul><li>Small and fast</li><li>Tool calling</li></ul></div></div>
-      </body></html>`);
+      if (m[2]) return html(200, `<!doctype html><html><body><section>${tagsFor(model).map((t) => tagRow(model.name, t)).join('\n')}</section></body></html>`);
+      return html(200, `<!doctype html><html><head><meta name="description" content="${esc(model.desc)}"></head><body>
+<div class="flex flex-wrap space-x-2">${model.caps.map((c) => `<span class="inline-flex items-center rounded-md bg-indigo-50 px-2 py-[2px] text-xs font-medium text-indigo-600">${c}</span>`).join('')}${model.sizes.map((z) => `<span class="inline-flex items-center rounded-md bg-[#ddf4ff] px-2 py-[2px]">${z}</span>`).join('')}</div>
+<section id="readme"><div id="editor"></div><div id="display" class="prose max-w-none"><h2>${model.name}</h2><p>${model.name} runs locally with Ollama &mdash; small and <strong>fast</strong>. <img src="https://ollama.com/assets/${model.name}.png" alt="logo"></p><ul><li>Small and fast</li><li>Tool calling</li></ul><pre><code>ollama run ${model.name}</code></pre><script>alert(1)</script><p>See <a href="https://ollama.com/blog">the blog</a>.</p></div></section>
+</body></html>`);
     }
     json(404, { error: 'not found' });
   });

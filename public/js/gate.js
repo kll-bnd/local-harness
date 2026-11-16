@@ -297,5 +297,3 @@ function migrationScreen(sec) {
     })();
   });
 }
-
-export { add };

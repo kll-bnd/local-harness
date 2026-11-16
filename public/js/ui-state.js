@@ -43,7 +43,8 @@ export function setUi(key, value, { immediate = false, delay = 400 } = {}) {
   uiStateEvents.emit('change', key, value);
   if (!loaded) return; // nothing is sent before the store was read (it would replace newer values)
   clearTimeout(timer);
-  if (immediate) flushUiState();
+  // Immediate writes (appearance) use keepalive so a reload or quit right after does not drop them.
+  if (immediate) flushUiState({ keepalive: true });
   else timer = setTimeout(() => flushUiState(), delay);
 }
 

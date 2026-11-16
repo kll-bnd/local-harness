@@ -7,7 +7,7 @@
 // The page keeps an estimate of the lock time without asking: the backend's last `idleLockAt`, moved forward by
 // every request the user's actions caused. Only near the deadline does it read GET /api/security (passive) to
 // confirm, so an idle page sends nothing at all.
-import { h, mount } from '../lib/dom.js';
+import { h } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import * as api from '../api.js';
 import { store } from '../state.js';
@@ -105,5 +105,3 @@ export function startIdleWatch(security) {
 }
 
 export function stopIdleWatch() { clearInterval(tick); hideHint(); }
-
-export { mount };

@@ -2,7 +2,7 @@
 // without typing — sorted lists with filters (kind, fits this Mac, size, publisher; search is one more filter)
 // and endless scrolling — and a page per model with its card, numbers and every file with its fit here.
 // "Will this run on my Mac?" is answered on every row; what does not fit is dimmed, never hidden.
-import { h, mount, add, debounce, copyText } from '../lib/dom.js';
+import { h, mount, debounce, copyText } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtBytes, fmtTokens, fmtRelative, fmtFull, modelShort } from '../lib/format.js';
 import { renderMarkdown } from '../lib/markdown.js';
@@ -51,7 +51,7 @@ export function fitVerdict(fit) {
     else if (/comfort|fit|yes|ok/.test(t)) v = 'comfortable';
     else return null;
   }
-  return { verdict: v, estimate: typeof fit.estimate === 'boolean' ? fit.estimate : fit.basis === 'parameters' };
+  return { verdict: v, estimate: typeof fit.estimate === 'boolean' ? fit.estimate : /parameters|estimate/.test(fit.basis || '') };
 }
 
 const FIT_LABEL = {
@@ -64,7 +64,8 @@ const FIT_LABEL = {
 function fitChip(fit) {
   const f = fitVerdict(fit);
   if (!f) return h('span.fit-chip.unknown', { title: 'Size not known yet — open it to see every file' }, 'Size unknown');
-  const size = fit.sizeBytes ? `≈ ${fmtBytes(fit.sizeBytes)}` : '';
+  const range = Array.isArray(fit.sizeRange) && fit.sizeRange[0] && fit.sizeRange[1] ? `${fmtBytes(fit.sizeRange[0]).replace(/ GB$/, '')}–${fmtBytes(fit.sizeRange[1])}` : null;
+  const size = range || (fit.sizeBytes ? `≈ ${fmtBytes(fit.sizeBytes)}` : '');
   const label = FIT_LABEL[f.verdict][f.estimate ? 1 : 0];
   const title = `${fit.note || ''}${f.estimate ? `${fit.note ? ' — ' : ''}an estimate; open it to see every file` : ''}` || label;
   const cls = f.verdict === 'comfortable' ? 'ok' : f.verdict === 'smaller' ? 'smaller' : 'no';
@@ -411,5 +412,3 @@ export async function downloadFromCatalog(f) {
   });
   return true;
 }
-
-export { add };

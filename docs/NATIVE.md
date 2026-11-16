@@ -199,13 +199,107 @@ the same data folder brings the first window forward.
 | `Harness.app` on disk | **120 MB** (Node.js 117 MB, app binary 0.7 MB, `server/`+`public/` 2 MB) | 309 MB |
 | download | 39 MB zip | 129 MB dmg |
 | processes at idle | app, `node` backend, WebKit WebContent, WebKit Networking | main (with the backend in it), renderer, GPU and network helpers |
-| resident memory (RSS), idle | **239 MB** (app 89, node 74, WebContent 56, Networking 20) | 418 MB (main 169, helpers 91 + 52, renderer 106) |
-| physical footprint, idle | **93 MB** (app 21, node 31, WebContent 36, Networking 5) | 107 MB (main 50, helpers 20 + 8, renderer 29) |
+| resident memory (RSS), idle | **240 MB** (app 89, node 74, WebContent 57, Networking 20) | 418 MB (main 170, helpers 89 + 52, renderer 107) |
+| physical footprint, idle | **96 MB** (app 21, node 31, WebContent 39, Networking 5) | 108 MB (main 51, helpers 21 + 8, renderer 28) |
 
 Both measured 15–20 s after start on a fresh data folder, at the UI's first-run password screen, with
 `ps -o rss` and macOS's `footprint` (`native/test/run-selftest.mjs`, `native/ci/electron-memory.mjs`); Ollama is the
 same in both and not included. RSS counts shared system-framework pages once per process, so the footprint is the
-better measure of what the app costs the Mac: the native app saves about 15 MB of footprint and ~180 MB of RSS at
+better measure of what the app costs the Mac: the native app saves about 12 MB of footprint and ~180 MB of RSS at
 idle, ~190 MB of disk, and Chromium entirely. Most of the remaining cost is the backend (the same Node.js process in
 every mode) and the web content; the chat model (~4 GB) dwarfs both. After a few chats the backend grows (165 MB
 footprint was measured mid-test with a model loaded), as it does in every mode.
+
+## Verified on the runner
+
+GitHub's Apple Silicon runner (macOS 26.7.2, "Apple M1 (Virtual)", 3 cores, 7 GB), the `native` job of
+`.github/workflows/macos.yml`, which builds the app with the Command Line Tools only and then drives **the built
+`Harness.app`** in self-test mode (`native/test/run-selftest.mjs` + `native/test/selftest-*.js` running inside the
+real page, `native/Sources/SelfTest.swift` on the native side).
+
+* **Build**: `scripts/build-native.sh` with `DEVELOPER_DIR=/Library/Developer/CommandLineTools` (Swift 6.3.3): ~50 s,
+  2 compiler warnings; Node.js 24.22.2 downloaded and SHA-256-verified; `codesign --verify --deep --strict` passes
+  (app ad hoc + hardened runtime, `node` keeps the Node.js project's Developer ID signature).
+* **Transport, against the mock backend** (`native/test/mock-backend.mjs`, 34 checks, two launches on one data folder):
+  UI from `harness://app/` (a secure context); the page contract (classes, frozen `harnessDesktop`, `TypeError` on a
+  bad callback, classes re-added after `className` is overwritten); JSON round trip; a streamed reply arriving in 6
+  pieces at 0/294/595/896/1199/1499 ms; 5 MB `ArrayBuffer`, 5 MB `Blob` and 50 MB `File` uploads intact (byte pattern
+  checked by the backend; 50 MB in ~0.4 s); a 20 MB file chosen through the open panel and uploaded intact; an image
+  shown; an aborted `fetch` reaching the backend as `CANCEL`; all 15 accelerators and the Dock menu; every menu action
+  reaching the page; ⌘N/⌘K/⌃⌘S handled by the menu before the page sees the key; links and `target=_blank` to http(s)
+  going to the browser hook while the page stays, `file:`/`javascript:`/`data:` refused; remote image, fetch and
+  WebSocket blocked; `showInFolder` and `setBadge` validation; the `desktop-fullscreen` class; hide on close and Dock
+  reopen; ⌘⇧Space registered and the toggle; a click in the title-bar zone reaching the page; secure event input on a
+  focused password field; a `Content-Disposition` download and a `blob:` download saved; sleep, screen lock and Lock
+  Harness each sending `lock`, with the menu item disabled, the badge cleared and 423 answers while locked;
+  `restart-required` → new backend process, page reloaded on the same `#/chat/…` route; a `keychain-key` stored and
+  read again **by the next launch** and sent in `hello` (the backend saw the same key); `keychain-key: null` deleting
+  it; the window frame restored at the next launch; a clean quit both times, no process left behind. Neither the app
+  nor the backend held any socket (`lsof`: no TCP, no UDP, no Unix socket).
+* **Against the real backend** (`node server/index.mjs --bridge`, password mode, fresh data folder, real Ollama with
+  `qwen3:0.6b`, three launches; 19 checks + 3 clean quits): `ready.locked`, every data route 423 until setup; setup
+  with a throw-away password (never printed), recovery key returned; a real chat streaming through the bridge (13
+  pieces over 12 s); App Nap held during the stream and released after it; a PNG uploaded as a `File` and shown from
+  `harness://app/api/attachments/…/content`; a chat export saved through the bridge; **the chat's marker string not
+  found in any file of the data folder**; with internet blocked `GET /api/network` reports `osEnforced: true,
+  osScope: "ollama"`, a pull through Harness is refused (403 `offline_lock`) and a pull sent straight to the sandboxed
+  Ollama fails (`lookup registry.ollama.ai: no such host`); "allow" restarts Ollama without the sandbox and the same
+  pull succeeds, "block" puts it back in the sandbox and the pull fails again — without a backend restart; `lock`
+  makes every route 423 and Ollama holds no model; a wrong password → 401 `wrong_password`; unlock → the chat is still
+  there and answers again; sleep and screen lock lock it; keychain mode → the next launch opens without the password
+  (`ready.locked: false`) with the same Keychain item; a valid but wrong key in the Keychain → `fatal: wrong_key` →
+  the app starts the backend again without the key → locked → the password opens it; leaving keychain mode deletes
+  the item. No listening socket in the app or the backend at any point; the backend's only TCP socket is its client
+  connection to Ollama on 127.0.0.1:11434, and only Ollama listens (on 127.0.0.1).
+* **Offline-lock profile**: see `docs/BRIDGE.md` ("Offline lock") for the measured blocks and their limit.
+
+## Not verified
+
+* **Nobody has looked at the window with their eyes.** Everything above was checked by the self-test in a GUI session
+  on the runner, not by a person: the title-bar look and traffic-light spacing, the icon in Finder and the Dock, the
+  absence of a white flash, the context menu, the Save/Open panels (the self-test bypasses them), dark mode.
+* Dragging the window by the UI's title bar (the page → app path is in place; a synthetic click cannot start a real
+  drag), and double-click to zoom.
+* The real Keychain prompt after a rebuild (only its cause was measured, by reading without UI) and what "Always
+  Allow" does next.
+* That App Nap is actually prevented (the activity assertion is taken and released at the right times; its effect
+  is not measured). Real sleep and real screen locking (the self-test posts the same notifications).
+* The global shortcut pressed on a real keyboard (registration and the toggle are tested separately).
+* File drag-and-drop and pasting a file into the page (WebKit's own behaviour; not driven).
+* Gatekeeper with a downloaded copy (an ad-hoc app copied from another Mac is quarantined, see `docs/DESKTOP.md`).
+* `data_dir_locked` and the start-up error dialogs (only their self-test path), and `restart-required` from the real
+  backend (it is rare now; the same code path was exercised with the mock).
+* A physical M1 with 8 GB: real speeds and memory pressure.
+
+## What real WKWebView, Keychain and sandbox behaviour turned out to be
+
+Found with the probes in `native/probe/` on macOS 26.7.2 before the app was built on them:
+
+| expected / feared | measured | what the app does |
+|---|---|---|
+| POST bodies may be missing for custom schemes | strings, `ArrayBuffer`, typed arrays (50 MB) arrive in `httpBody`; **`Blob`/`File` bodies arrive as nothing** (no body, no stream) | page-script `fetch` shim sends Blob/File bytes; UI asked to send `ArrayBuffer` |
+| streaming may be buffered | `didReceive(data)` chunks reach `fetch` readers and `EventSource` as they are sent | nothing special |
+| custom scheme may not be a secure context | `isSecureContext`, `crypto.subtle`, `randomUUID`, `navigator.clipboard` all available; the UI's CSP `'self'` matches `harness://app` | nothing special |
+| cancel may not reach the handler | an aborted `fetch` calls `webView(_:stop:)` within ~100 ms | sends `CANCEL` |
+| WebKit downloads would work | `WKDownload` fails with "unsupported URL" for custom schemes (`blob:` works) | own bridge download + Save panel |
+| — | `statusText` is wrong for custom-scheme responses (423 → "Bad Request") | UI told not to rely on it |
+| — | content-rule regexes reject disjunctions (`^(data\|blob):`) | one rule per scheme |
+| title-bar area might swallow clicks | clicks at y = 12 px reach the page under the transparent title bar | drag only on the UI's title-bar elements |
+| key equivalents go to the menu | the page sees ⌘K first, the menu fires only if the page does not take it | the web view offers key equivalents to the menu first |
+| the first `fetch` of a GET stream URL that the previous page also streamed stalled once per navigation | the second identical request and `EventSource` work | nothing needed by the UI (its only GET stream is `EventSource`) |
+| — | `NSApp.terminate` called inside a main-queue block waits for the backend in a nested run loop that cannot run main-queue blocks — a hang | quitting from GCD goes through a run-loop perform |
+| Keychain in CI might need a UI | the login Keychain works non-interactively; same build reads silently; **a rebuilt build cannot** (needs the prompt), an explicit designated requirement does not change that; data-protection Keychain refused | documented; `--sign` for a stable identity |
+| draft sandbox profile blocks the network | it blocked only DNS; TCP/UDP to the internet went through | profile rewritten and re-measured (BRIDGE.md) |
+
+## Self-test and CI
+
+* `node native/test/bridge-client.mjs <backend script> <data dir>` checks any bridge backend without the app (also on
+  Linux).
+* `node native/test/run-selftest.mjs --app dist/native/Harness.app --label mock --script native/test/selftest-mock.js
+  --backend native/test/mock-backend.mjs --launches 2 --files <file>` and `--label real --script
+  native/test/selftest-real.js --launches 3` (needs Ollama with `qwen3:0.6b`) run the self-tests on a Mac; each prints
+  `selftest| …` lines. The self-test mode is inert unless the app is started with `--self-test <dir>`; the
+  `--backend` override is honoured only then.
+* `native/ci/sandbox-ollama.mjs`, `native/ci/sb-variants.mjs`, `native/ci/net-probe.mjs` prove the offline-lock
+  profile; `native/ci/electron-memory.mjs` measures the Electron build; `native/probe/` holds the first fact-finding
+  probes (scheme handler, Keychain) and the draft profile they were compared with.

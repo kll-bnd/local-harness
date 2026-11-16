@@ -7,7 +7,7 @@ import { icon } from './lib/icons.js';
 import { truncate, isMac } from './lib/format.js';
 import * as api from './api.js';
 import { loadRecommended } from './state.js';
-import { store, bus, loadSettings, loadPresets, loadSystem, loadModels, loadChats, loadArchived, refreshSystemSoon, refreshModelsSoon, refreshChatsSoon, setUiPref, uiPrefs, chatModels, dropModelInfo } from './state.js';
+import { store, bus, loadSettings, loadPresets, loadSystem, loadModels, loadChats, loadArchived, refreshSystemSoon, refreshModelsSoon, setUiPref, uiPrefs, chatModels, dropModelInfo } from './state.js';
 import { defineAction, runAction, runActionFrom, chordOf, actionForChord, allActions } from './actions.js';
 import { Shell } from './shell.js';
 import { startRouter, navigate } from './router.js';
