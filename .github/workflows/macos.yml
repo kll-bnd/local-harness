@@ -13,7 +13,7 @@ on:
         description: "Which jobs to run"
         type: choice
         default: all
-        options: [all, backend, desktop, live, e2e, ollama, nemotron]
+        options: [all, backend, desktop, native, live, e2e, ollama, nemotron]
       live_groups:
         description: "live-check groups to run"
         type: string
@@ -30,8 +30,9 @@ on:
 permissions:
   contents: read
 
+# One run per job selection at a time: a "native" run does not cancel an "all" run and vice versa.
 concurrency:
-  group: macos-${{ github.ref }}
+  group: macos-${{ github.ref }}-${{ inputs.jobs }}
   cancel-in-progress: true
 
 env:
