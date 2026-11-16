@@ -317,6 +317,10 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
         return res.end();
       }
       if (req.method === 'POST' && url.pathname === '/api/chat') {
+        const startedAt = Date.now();
+        // like a real Ollama, total_duration is the time this request took (a fixed figure was "implausible" against
+        // the wall clock on a fast, idle machine — the live check compares the two)
+        const took = () => ({ total_duration: Math.max(1, Date.now() - startedAt) * 1e6 });
         const name = resolveName(body.model);
         const m = find(name);
         if (!m) return sendJson(res, 404, notFound(body.model));
@@ -348,7 +352,7 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
         const final = { model: name, created_at: now(), message: { role: 'assistant', content: '' }, done: true, done_reason: doneReason, total_duration: 120e6, load_duration: reloaded ? 900e6 : 5e6, prompt_eval_count: promptTokens, ...(cached > 0 ? { prompt_eval_cached_count: cached } : {}), prompt_eval_duration: 40e6, eval_count: evalCount, eval_duration: 75e6 };
         const toolCalls = out.toolCalls.map((c, i) => ({ id: `call_${Math.random().toString(36).slice(2, 10)}`, function: { index: i, name: c.name, arguments: c.arguments } }));
         if (body.stream === false) {
-          return sendJson(res, 200, { ...final, message: { role: 'assistant', content: out.content, ...(out.thinking ? { thinking: out.thinking } : {}), ...(toolCalls.length ? { tool_calls: toolCalls } : {}) } });
+          return sendJson(res, 200, { ...final, ...took(), message: { role: 'assistant', content: out.content, ...(out.thinking ? { thinking: out.thinking } : {}), ...(toolCalls.length ? { tool_calls: toolCalls } : {}) } });
         }
         // Real Ollama sends no response headers until the first token (prompt processing can take minutes).
         if (fake.headerDelayMs) await sleep(fake.headerDelayMs);
@@ -361,7 +365,7 @@ export async function startFakeOllama({ port = 0, host = '127.0.0.1', delayMs = 
         if (toolCalls.length) w({ model: name, created_at: now(), message: { role: 'assistant', content: '', tool_calls: toolCalls }, done: false });
         const midFail = takeFailure('/api/chat#stream', body);
         if (midFail) { w({ error: midFail.error }); return res.end(); }
-        w(final);
+        w({ ...final, ...took() });
         return res.end();
       }
       sendJson(res, 404, { error: `fake-ollama: no route ${req.method} ${url.pathname}` });
