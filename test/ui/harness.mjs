@@ -48,15 +48,23 @@ export function freePort() {
  * @param {number} [o.stepMs=30]       fake diffusion step time
  * @param {object} [o.settings]        merged into settings.json before the server starts
  * @param {boolean} [o.ollamaBinary]   install a fake `ollama` binary (Ollama "installed but stopped")
+ * @param {boolean} [o.secure=false]   0.2 defaults ON: password protection, API sessions and "Block all internet
+ *                                     access" (the UI meets the setup screen first). Off = the explicit opt-out of
+ *                                     docs/API.md 10.10, so flows that are not about security start in the app.
+ * @param {boolean} [o.offlineLock]    override the internet blocker (secure stacks default to on)
+ * @param {(dir: string) => Promise} [o.prepare]  write files into the data dir before the server starts
  */
-export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false } = {}) {
+export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false, secure = false, offlineLock, prepare } = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-ui-'));
   const fake = ollama ? await startFakeOllama({ port: 0, delayMs, models, pullStepMs }) : null;
   const a1111 = image ? await startFakeA1111({ port: 0, stepMs, drawThings: true }) : null;
   let ollamaUrl = fake?.url || `http://127.0.0.1:${await freePort()}`;
   const extra = {};
+  let binDir = null;
   if (ollamaBinary) {
-    const bin = path.join(dataDir, 'ollama');
+    // Outside the data dir: Harness 0.2 makes every file in there 0600 (not executable).
+    binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-bin-'));
+    const bin = path.join(binDir, 'ollama');
     await fs.writeFile(bin, `#!/bin/sh\nexec "${process.execPath}" "${path.join(here, '..', 'fake-ollama-bin.mjs')}" "$@"\n`);
     await fs.chmod(bin, 0o755);
     extra.ollama = { binaryPath: bin, autoStart: false, stopOnExit: true };
@@ -69,21 +77,43 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
     memory: { extractDelayMs: 200 },
   };
   await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify(deepMerge(deepMerge(base, extra), settings), null, 2));
-  const srv = await startServer({ port: 0, dataDir, autodetect: true, logLevel: 'error', system: { totalMem: ram * GiB, platform: 'darwin', arch: 'arm64' }, processGuards: false });
-  const api = async (method, p, body) => {
-    const res = await fetch(srv.url + p, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  if (prepare) await prepare(dataDir);
+  // Secure stacks use cheap scrypt parameters so unlocking in tests takes milliseconds, not half a second.
+  const securityOpts = secure
+    ? { security: { kdf: { N: 1024, r: 8, p: 1 } }, ...(offlineLock === undefined ? {} : { offlineLock }) }
+    : { security: { mode: 'off', apiAuth: false }, offlineLock: offlineLock ?? false };
+  const sys = { totalMem: ram * GiB, platform: 'darwin', arch: 'arm64' };
+  const srv = await startServer({ port: 0, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false, ...securityOpts });
+  let token = null; // a CLI-style session for stack.api() on secure stacks
+  const api = async (method, p, body, headers = {}) => {
+    const h = { ...(body ? { 'content-type': 'application/json' } : {}), ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers };
+    const res = await fetch(stack.url + p, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
     const ct = res.headers.get('content-type') || '';
     return { status: res.status, data: ct.includes('json') ? await res.json() : await res.text() };
   };
-  const sys = { totalMem: ram * GiB, platform: 'darwin', arch: 'arm64' };
   const stack = {
-    url: srv.url, dataDir, fake, a1111, srv, api,
+    url: srv.url, dataDir, fake, a1111, srv, api, secure,
+    /** Secure stacks: choose the password from outside the UI (→ the recovery key); stack.api() then has a session. */
+    async setupPassword(password) {
+      const r = await api('POST', '/api/security/setup', { password });
+      if (r.status !== 200) throw new Error(`setup failed: ${r.status} ${JSON.stringify(r.data)}`);
+      token = r.data.sessionToken || null;
+      return r.data;
+    },
+    /** Secure stacks: give stack.api() a session by unlocking (also unlocks a locked Harness). */
+    async unlock(password) {
+      const r = await api('POST', '/api/security/unlock', { password });
+      if (r.status !== 200) throw new Error(`unlock failed: ${r.status} ${JSON.stringify(r.data)}`);
+      token = r.data.sessionToken || token;
+      return r.data;
+    },
+    setToken(t) { token = t; },
     /** Stop the Harness server (the page sees it disappear). */
     async stopServer() { await stack.srv.close(); },
     /** Start it again on the same port and data dir. */
     async startServerAgain() {
       const port = Number(new URL(stack.url).port);
-      stack.srv = await startServer({ port, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false });
+      stack.srv = await startServer({ port, dataDir, autodetect: true, logLevel: 'error', system: sys, processGuards: false, ...securityOpts });
       if (stack.srv.url !== stack.url) throw new Error(`restarted on ${stack.srv.url}, expected ${stack.url}`);
     },
     async close() {
@@ -91,6 +121,7 @@ export async function startStack({ ram = 16, models, ollama = true, image = true
       await fake?.close().catch(() => {});
       await a1111?.close().catch(() => {});
       await fs.rm(dataDir, { recursive: true, force: true }).catch(() => {});
+      if (binDir) await fs.rm(binDir, { recursive: true, force: true }).catch(() => {});
     },
   };
   return stack;
@@ -123,6 +154,15 @@ const DESKTOP_INIT = () => {
 const CSP_INIT = () => {
   window.__csp = [];
   document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(`${e.violatedDirective} ${e.blockedURI}`));
+  // Record what kind of body every request carries: WKWebView drops Blob/File/FormData bodies on custom
+  // schemes, so the UI must only ever send strings or bytes (checked by a test).
+  window.__bodyKinds = [];
+  const orig = window.fetch;
+  window.fetch = function (input, init) {
+    const b = init && init.body;
+    if (b != null) window.__bodyKinds.push(Object.prototype.toString.call(b));
+    return orig.apply(this, arguments);
+  };
 };
 
 /** Open the UI in a fresh browser context. */

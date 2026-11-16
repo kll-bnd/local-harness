@@ -87,7 +87,7 @@ export function sendError(res, e) {
 export function openSse(req, res) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache, no-transform',
+    'cache-control': 'no-store, no-transform',
     connection: 'keep-alive',
     'x-accel-buffering': 'no',
   });

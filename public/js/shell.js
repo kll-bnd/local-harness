@@ -1,9 +1,9 @@
 // The window: sidebar | main (title bar + current view) | inspector. Owns view switching, the title bar,
 // chat-level actions (rename, pin, fork, export, archive, delete with undo) and the reconnect banner.
-import { h, mount, download, add } from './lib/dom.js';
+import { h, mount, download, add, dragRegion } from './lib/dom.js';
 import { icon } from './lib/icons.js';
 import { fmtTokens, fmtBytes, modelLabel, modelShort, fmtUntil, residentOf } from './lib/format.js';
-import { store, uiPrefs, setUiPref, localPref, findModel, modelInfo, loadChats, loadArchived } from './state.js';
+import { store, uiPrefs, setUiPref, findModel, modelInfo, loadChats, loadArchived } from './state.js';
 import * as api from './api.js';
 import { Sidebar } from './views/sidebar.js';
 import { Inspector } from './views/inspector.js';
@@ -13,6 +13,7 @@ import { runAction, keyLabel, getAction } from './actions.js';
 import { openMenu, toast, openDialog, confirmDialog } from './ui/overlays.js';
 import { showError } from './errors.js';
 import { peekChatModel, forgetChatModel, mergeChatSummary } from './chat/session.js';
+import { shieldButton } from './views/network.js';
 
 const LAZY_VIEWS = {
   images: () => import('./views/images.js').then((m) => m.ImagesView),
@@ -36,7 +37,8 @@ export class Shell {
     this.chatView = new ChatView(this);
     this.views.set('chat', this.chatView);
 
-    this.tb = h('header.titlebar.main-titlebar');
+    this.tb = dragRegion(h('header.titlebar.main-titlebar'));
+    this.shield = shieldButton(); // "Block all internet access" state, always visible
     this.viewHost = h('div.view-host');
     this.main = h('main.main', { attrs: { 'aria-label': 'Main' } }, this.tb, this.viewHost);
     this.live = h('div.sr-only', { role: 'status', 'aria-live': 'polite' });
@@ -45,7 +47,7 @@ export class Shell {
 
     this.applyLayout();
     this.narrow.addEventListener('change', () => { this.overlaySidebar = false; this.applyLayout(); });
-    store.on('settings', () => { this.applyLayout(); this.applyAppearance(); });
+    store.on('uiPrefs', () => { this.applyLayout(); this.applyAppearance(); });
     store.on('route', (r) => this.route(r));
     store.watch(['system', 'models', 'defaultModel'], () => this.updateToolbar());
     this.tb.addEventListener('dblclick', (e) => {
@@ -56,8 +58,8 @@ export class Shell {
   }
 
   // ------------------------------------------------------------------------------------------ layout
-  sidebarOpen() { return this.narrow.matches ? this.overlaySidebar : (uiPrefs().sidebar ?? localPref('sidebar', true)) !== false; }
-  inspectorOpen() { return !!(uiPrefs().inspector ?? localPref('inspector', false)); }
+  sidebarOpen() { return this.narrow.matches ? this.overlaySidebar : uiPrefs().sidebar !== false; }
+  inspectorOpen() { return !!uiPrefs().inspector; }
 
   applyLayout() {
     const sb = this.sidebarOpen();
@@ -81,6 +83,7 @@ export class Shell {
     if (theme === 'system') root.removeAttribute('data-theme'); else root.dataset.theme = theme;
     if (ui.proseFont === 'serif') root.dataset.prose = 'serif'; else root.removeAttribute('data-prose');
     if (ui.textSize && ui.textSize !== 'default') root.dataset.textSize = ui.textSize; else root.removeAttribute('data-text-size');
+    // The one value kept in browser storage: the theme, so the next window paints in the right colours.
     try { localStorage.setItem('harness.ui.theme', JSON.stringify(theme)); } catch { /* ignore */ }
   }
 
@@ -160,6 +163,7 @@ export class Shell {
       tb.status ? h('div.tb-status', tb.status) : null,
       h('div.tb-actions',
         ...(tb.actions || []),
+        this.shield,
         h('button.icon-btn', { type: 'button', title: `Inspector (${keyLabel(getAction('toggle-inspector')?.keys?.[0])})`, 'aria-label': 'Toggle inspector', 'aria-pressed': String(this.inspectorOpen()), on: { click: () => runAction('toggle-inspector') } }, icon('inspector'))),
     );
     if (store.get('route').view === 'chat') document.title = this.titleFor(store.get('route'));

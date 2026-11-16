@@ -1,7 +1,7 @@
 // Inspector (right panel) for the current chat: Context (meter, why this size, mode, compaction),
 // Memory (what was used, per-chat switches, pinned memories), Summary (view/edit/history) and Chat
 // (per-chat overrides: preset, system prompt, sampling, tools).
-import { h, debounce, mount, add, focusWhenReady } from '../lib/dom.js';
+import { h, debounce, mount, add, focusWhenReady, dragRegion } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { fmtInt, fmtFull, fmtRelative, plural, truncate, modelLabel, modelShort } from '../lib/format.js';
 import { renderMarkdown } from '../lib/markdown.js';
@@ -32,7 +32,7 @@ export class Inspector {
     this.tabsEl = h('div.segmented.inspector-tabs', { role: 'tablist', attrs: { 'aria-label': 'Inspector' } });
     this.body = h('div.inspector-body', { role: 'tabpanel', tabIndex: -1 });
     this.el = h('aside.inspector', { attrs: { 'aria-label': 'Inspector' } }, h('div.inspector-inner',
-      h('div.titlebar', this.tabsEl, h('span.spacer'), h('button.icon-btn', { type: 'button', 'aria-label': 'Close inspector', title: 'Close inspector', on: { click: () => runAction('toggle-inspector') } }, icon('x'))),
+      dragRegion(h('div.titlebar', this.tabsEl, h('span.spacer'), h('button.icon-btn', { type: 'button', 'aria-label': 'Close inspector', title: 'Close inspector', on: { click: () => runAction('toggle-inspector') } }, icon('x')))),
       this.body));
     this.render = debounce(() => this.renderNow(), 30);
     this.offs = [store.watch(['settings', 'presets', 'models'], () => this.render())];

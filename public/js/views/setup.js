@@ -99,7 +99,10 @@ export class SetupView {
     const embBody = emb ? h('div.stack.small',
       h('p', emb.available ? `Memory search uses ${modelLabel(emb.model)} plus keywords.` : 'Memory search uses keywords (BM25).'),
       emb.lowRamNote ? h('p.muted', emb.lowRamNote) : null,
-      emb.suggestion && m?.ramTier !== 'low' ? h('div.row', h('button.btn.btn-small', { type: 'button', on: { click: () => pullModel({ model: emb.suggestion }) } }, `Download ${emb.suggestion}`)) : null) : null;
+      emb.suggestion && m?.ramTier !== 'low' ? (() => {
+        const sug = typeof emb.suggestion === 'string' ? { model: emb.suggestion, name: emb.suggestion } : emb.suggestion;
+        return h('div.row', h('button.btn.btn-small', { type: 'button', title: sug.description || '', on: { click: () => pullModel({ model: sug.model }) } }, `Download ${sug.name || sug.model}${sug.approxSizeBytes ? ` (${fmtBytes(sug.approxSizeBytes)})` : ''}`));
+      })() : null) : null;
 
     mount(this.page, 
       h('div.page-head', h('h1.h1', hasModel && anyBackend ? 'Ready' : 'Welcome to Harness'), hasModel && anyBackend ? h('button.btn.btn-primary', { type: 'button', on: { click: () => runAction('new-chat') } }, icon('compose', { size: 14 }), 'Start chatting') : null),

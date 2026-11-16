@@ -6,9 +6,7 @@ import { memoryBudget, ramTier } from '../context/sizing.mjs';
 import { created } from './common.mjs';
 
 export function registerSystemRoutes(r, app) {
-  r.get('/api/health', () => ({ ok: true, name: 'harness', version: app.version }));
-
-  r.get('/api/system', async ({ query }) => {
+  r.get('/api/system', async ({ query, req, auth, bridge }) => {
     const refresh = query.get('refresh') === '1';
     const [providers, imageProviders, embeddings] = await Promise.all([
       app.registry.listStatus({ refresh }),
@@ -23,7 +21,8 @@ export function registerSystemRoutes(r, app) {
     }
     const sys = app.system;
     return {
-      app: { name: 'harness', version: app.version, node: process.version, pid: process.pid, dataDir: app.dataDir, startedAt: app.startedAt, uptimeSec: Math.round((Date.now() - Date.parse(app.startedAt)) / 1000), url: app.url || null },
+      app: { name: 'harness', version: app.version, node: process.version, pid: process.pid, dataDir: app.dataDir, startedAt: app.startedAt, uptimeSec: Math.round((Date.now() - Date.parse(app.startedAt)) / 1000), url: app.url || null, transport: app.transport || 'listener' },
+      ...(app.core ? { security: app.core.securityStatus(bridge ? { authenticated: true, via: 'bridge' } : auth?.via === 'disabled' ? { authenticated: true, via: null } : { authenticated: !!auth?.ok, via: auth?.via || null }) } : {}),
       machine: {
         platform: sys.platform, arch: sys.arch, release: os.release(), chip: sys.chip, cpus: sys.cpus, appleSilicon: sys.platform === 'darwin' && sys.arch === 'arm64',
         totalMemBytes: sys.totalMem, freeMemBytes: os.freemem(), ramTier: ramTier(sys.totalMem), memoryBudget: memoryBudget({ totalMem: sys.totalMem, platform: sys.platform, arch: sys.arch, memoryFraction: app.settings.get().context?.memoryFraction }),
@@ -45,7 +44,11 @@ export function registerSystemRoutes(r, app) {
     sse.send('hello', { version: app.version, time: new Date().toISOString() });
     const onEvent = (ev) => sse.send(ev.type, { ...ev.data, ts: ev.ts });
     app.bus.on('event', onEvent);
-    sse.signal.addEventListener('abort', () => app.bus.off('event', onEvent));
+    // Locking (or converting the data) ends the stream: nothing user-derived flows while locked.
+    const onLocking = ({ reason }) => { sse.send('locked', { reason, ts: new Date().toISOString() }); sse.end(); };
+    app.core?.once('locking', onLocking);
+    sse.signal.addEventListener('abort', () => { app.bus.off('event', onEvent); app.core?.off('locking', onLocking); });
+    res.once('close', () => { app.bus.off('event', onEvent); app.core?.off('locking', onLocking); });
   });
 
   // ---- settings

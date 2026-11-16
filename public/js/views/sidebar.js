@@ -1,6 +1,6 @@
 // Sidebar: new chat, search (instant title filter + full-text message search), navigation, the chat list
 // grouped by recency (pinned first), per-chat actions, archive, and a live "machine" status block.
-import { h, debounce, delegate, mount, add } from '../lib/dom.js';
+import { h, debounce, delegate, mount, add, dragRegion } from '../lib/dom.js';
 import { icon } from '../lib/icons.js';
 import { recencyGroup, modelShort, fmtBytes, fmtWhen, fmtTokens, residentOf } from '../lib/format.js';
 import { store, loadArchived, ollamaStatus } from '../state.js';
@@ -26,9 +26,9 @@ export class Sidebar {
     this.navEl = h('div.side-nav');
     this.footEl = h('div.side-foot');
     this.el = h('aside.sidebar', { attrs: { 'aria-label': 'Sidebar' } }, h('div.sidebar-inner',
-      h('div.titlebar.side-titlebar',
+      this.titleEl = dragRegion(h('div.titlebar.side-titlebar',
         h('button.icon-btn', { type: 'button', title: `Hide sidebar (${keyLabel(getAction('toggle-sidebar')?.keys?.[0])})`, 'aria-label': 'Hide sidebar', on: { click: () => runAction('toggle-sidebar') } }, icon('sidebar')),
-        h('button.icon-btn', { type: 'button', title: `New chat (${keyLabel(getAction('new-chat')?.keys?.[0])})`, 'aria-label': 'New chat', on: { click: () => runAction('new-chat') } }, icon('compose'))),
+        h('button.icon-btn', { type: 'button', title: `New chat (${keyLabel(getAction('new-chat')?.keys?.[0])})`, 'aria-label': 'New chat', on: { click: () => runAction('new-chat') } }, icon('compose')))),
       h('div.side-search', h('div.search-field', icon('search', { size: 14 }), this.search)),
       this.navEl,
       this.listEl,
@@ -61,7 +61,7 @@ export class Sidebar {
 
     this.offs = [
       store.watch(['chats', 'archived', 'route'], () => this.renderList()),
-      store.watch(['system', 'route', 'imageJobs', 'pulls', 'memoryCount'], () => { this.renderNav(); this.renderFoot(); }),
+      store.watch(['system', 'route', 'imageJobs', 'pulls', 'memoryCount', 'security'], () => { this.renderNav(); this.renderFoot(); }),
     ];
     this.renderNav();
     this.renderList();
@@ -118,6 +118,7 @@ export class Sidebar {
       h('div.row.side-foot-row',
         h('button.btn.btn-ghost.btn-small', { type: 'button', 'aria-pressed': String(this.showArchived), on: { click: () => this.toggleArchived() } }, icon('archive', { size: 14 }), this.showArchived ? 'Hide archived' : 'Archived'),
         h('span.spacer'),
+        store.get('security')?.mode && store.get('security').mode !== 'off' ? h('button.icon-btn.lock-btn', { type: 'button', title: `Lock Harness (${keyLabel(getAction('lock')?.keys?.[0])})`, 'aria-label': 'Lock Harness', on: { click: () => runAction('lock') } }, icon('lock')) : null,
         h('a.icon-btn', { href: '#/settings', title: `Settings (${keyLabel('Mod+,')})`, 'aria-label': 'Settings', attrs: { 'aria-current': r.view === 'settings' ? 'page' : null } }, icon('settings'))),
     );
   }

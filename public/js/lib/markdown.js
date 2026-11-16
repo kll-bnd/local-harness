@@ -127,7 +127,7 @@ export function codeBlockShell(pre, lang, { streaming = false } = {}) {
   return wrap;
 }
 
-function enhance(frag, { highlight = true } = {}) {
+function enhance(frag, { highlight = true, quietImages = false } = {}) {
   for (const code of frag.querySelectorAll('pre > code')) {
     const lang = /language-([\w+#.-]+)/.exec(code.className || '')?.[1]?.toLowerCase() || '';
     if (highlight && code.textContent.length <= DEFER_HIGHLIGHT_CHARS) highlightCode(code);
@@ -136,6 +136,11 @@ function enhance(frag, { highlight = true } = {}) {
   for (const img of frag.querySelectorAll('img[data-blocked-src]')) {
     const src = img.getAttribute('data-blocked-src');
     const alt = img.getAttribute('alt') || '';
+    if (quietImages) {
+      // Documents from the internet (model cards): a quiet placeholder, no link to the picture.
+      img.replaceWith(h('span.img-placeholder', { title: 'Pictures from the internet are not loaded' }, icon('image', { size: 12 }), alt ? h('span', alt.slice(0, 80)) : null));
+      continue;
+    }
     let host = '';
     try { host = new URL(src).host; } catch { /* not a URL */ }
     const label = h('span.blocked-img-label', `Remote image not loaded${host ? ` (${host})` : ''}${alt ? `: ${alt}` : ''}`);
@@ -165,7 +170,7 @@ function deferHighlights(frag) {
 }
 
 /** Render complete markdown to a DocumentFragment. */
-export function renderMarkdown(text, { cacheKey = null } = {}) {
+export function renderMarkdown(text, { cacheKey = null, quietImages = false } = {}) {
   text = String(text ?? '');
   if (cacheKey) {
     const hit = cache.get(cacheKey);
@@ -177,7 +182,7 @@ export function renderMarkdown(text, { cacheKey = null } = {}) {
   }
   let html;
   try { html = marked.parse(text); } catch { html = `<p>${escapeHtml(text)}</p>`; }
-  const frag = enhance(toFragment(html));
+  const frag = enhance(toFragment(html), { quietImages });
   if (cacheKey) {
     const tpl = document.createElement('template');
     add(tpl.content, frag.cloneNode(true));

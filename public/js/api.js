@@ -28,7 +28,8 @@ const qs = (o = {}) => {
  *   request  = { method: 'GET'|'POST'|'PUT'|'PATCH'|'DELETE',
  *                path: '/api/…?query'           — always a relative path starting with /api/
  *                headers: { [lower-case name]: string },
- *                body: Uint8Array | Blob | null — JSON is already UTF-8 encoded; uploads are a Blob (File)
+ *                body: Uint8Array | null       — always bytes (JSON already UTF-8 encoded, uploads read into
+ *                                                 memory): WKWebView drops Blob/File/FormData bodies
  *                signal: AbortSignal            — on abort: cancel the request, stop the body, reject with an
  *                                                 Error whose name is 'AbortError'
  *                keepalive: boolean }           — hint: the page may be unloading (fetch keepalive)
@@ -94,12 +95,16 @@ function errorFrom(status, bytes) {
   return err;
 }
 
-/** One request through the transport. body: plain object (sent as JSON), Blob/File, Uint8Array or undefined. */
+/** One request through the transport. body: plain object (sent as JSON), Blob/File/ArrayBuffer/Uint8Array (sent as
+ *  bytes) or undefined. Never reads statusText (WebKit reports wrong ones for custom schemes). */
 async function send(method, path, { body, signal, headers = {}, keepalive = false } = {}) {
   const h = { accept: 'application/json', ...headers };
   let payload = null;
   if (body !== undefined && body !== null) {
-    if (body instanceof Blob || body instanceof Uint8Array) payload = body;
+    // Bodies are always bytes: WKWebView drops Blob/File/FormData bodies on custom schemes (harness://app).
+    if (body instanceof Uint8Array) payload = body;
+    else if (body instanceof ArrayBuffer) payload = new Uint8Array(body);
+    else if (body instanceof Blob) payload = new Uint8Array(await body.arrayBuffer());
     else { payload = textEncoder.encode(JSON.stringify(body)); h['content-type'] = 'application/json'; }
   }
   try {
@@ -126,12 +131,17 @@ async function request(method, path, opts = {}) {
 }
 
 const get = (p, o) => request('GET', p, o);
+/** A request the backend described itself (e.g. error.details.allow of offline_lock). Only /api/ paths. */
+export function call(method, path, body) {
+  if (typeof path !== 'string' || !path.startsWith('/api/') || !/^(GET|POST|PUT|PATCH|DELETE)$/.test(method)) throw new ApiError(0, 'bad_request', 'Not a Harness API request.');
+  return request(method, path, method === 'GET' ? {} : { body: body ?? {} });
+}
 const post = (p, body = {}, o = {}) => request('POST', p, { ...o, body });
 const patch = (p, body, o = {}) => request('PATCH', p, { ...o, body });
 const put = (p, body, o = {}) => request('PUT', p, { ...o, body });
 const del = (p, o) => request('DELETE', p, o);
 
-/** Incremental server-sent-events parser over a chunk iterator. Calls onEvent({type, …data}). */
+/** Incremental server-sent-events parser over a chunk iterator. Calls onEvent({type, …data}, eventName). */
 async function readSse(body, onEvent) {
   const decoder = new TextDecoder();
   let buf = '';
@@ -149,7 +159,7 @@ async function readSse(body, onEvent) {
     try { ev = JSON.parse(data.join('\n')); } catch { return; }
     if (!ev.type && type) ev.type = type;
     last = ev;
-    onEvent(ev);
+    onEvent(ev, type);
   };
   for await (const chunk of body) {
     buf += decoder.decode(chunk, { stream: true });
@@ -189,6 +199,14 @@ export async function stream(path, body, onEvent, { signal, method = 'POST', hea
     if (e?.name === 'AbortError' || signal?.aborted) return { aborted: true };
     throw new ApiError(0, 'stream_interrupted', 'The connection to Harness was interrupted.');
   }
+}
+
+/**
+ * The global event stream (GET /api/events, docs/API.md 5.1) through the transport: onEvent(data, eventName).
+ * Resolves when the stream ends ({ last } — after a lock the final event is `locked`) or { aborted }.
+ */
+export function events(onEvent, { signal } = {}) {
+  return stream('/api/events', undefined, onEvent, { signal, method: 'GET' });
 }
 
 /** POST that answers with a file (backup, export): returns { blob, filename }. */
@@ -367,7 +385,7 @@ export const memories = {
 
 // ------------------------------------------------------------------------------------------------ 5.10
 export const attachments = {
-  /** Upload a File/Blob; onProgress is not available with fetch, so callers show an indeterminate state. */
+  /** Upload a File/Blob (sent as bytes); progress is not available with fetch, so callers show an indeterminate state. */
   upload: (file, { chatId, signal } = {}) => request('POST', `/api/attachments${qs({ name: file.name || 'pasted', chatId })}`, {
     body: file, signal, headers: { 'content-type': file.type || 'application/octet-stream' },
   }),

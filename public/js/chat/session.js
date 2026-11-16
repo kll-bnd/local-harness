@@ -494,9 +494,17 @@ async function run(model, kind, starter) {
       // Safety net: the server answers 409 chat_busy as JSON *before* starting anything, so retrying once
       // right after our own previous turn cannot send the message twice. (The server now releases the chat
       // before `done`, so this should not trigger any more.)
-      if (e.code !== 'chat_busy' || e.status !== 409 || !model.lastFinishedAt || Date.now() - model.lastFinishedAt > 3000) throw e;
-      await new Promise((r) => setTimeout(r, 400));
-      result = await starter((ev) => handleEvent(model, ev), controller.signal);
+      if (e.code === 'offline_lock' && e.status === 403) {
+        // A model or image service outside this Mac while internet access is blocked: nothing was started
+        // yet, so after the one "Allow internet" prompt the same request is simply sent again.
+        const { requestInternet } = await import('../views/network.js');
+        if (!(await requestInternet(e.details || {}))) { e.quiet = true; throw e; }
+        result = await starter((ev) => handleEvent(model, ev), controller.signal);
+      } else {
+        if (e.code !== 'chat_busy' || e.status !== 409 || !model.lastFinishedAt || Date.now() - model.lastFinishedAt > 3000) throw e;
+        await new Promise((r) => setTimeout(r, 400));
+        result = await starter((ev) => handleEvent(model, ev), controller.signal);
+      }
     }
   } catch (e) {
     model.live = null;
@@ -520,6 +528,13 @@ async function run(model, kind, starter) {
     model.emit('live');
   }
   model.refreshContext().catch(() => {});
+  if (model.lastError?.code === 'offline_lock' && kind === 'chat' && model.lastError.messageId) {
+    // The turn was refused mid-way (remote model while blocked): ask once, then answer the same message again.
+    const failed = model.lastError;
+    const { requestInternet } = await import('../views/network.js');
+    if (await requestInternet(failed.details || { what: 'remote_provider' })) return regenerate(model, failed.messageId);
+    return true;
+  }
   if (model.lastError && model.lastError.code !== 'aborted') {
     const x = explainError(model.lastError);
     if (['connection_failed', 'no_model', 'model_not_found', 'image_provider_unreachable', 'no_image_provider', 'image_disabled'].includes(model.lastError.code)) {

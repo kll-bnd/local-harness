@@ -5,6 +5,10 @@ import path from 'node:path';
 import { ramTier } from '../context/sizing.mjs';
 import { log } from '../lib/log.mjs';
 import { sleep } from '../lib/util.mjs';
+import { ROOT_DIR } from '../version.mjs';
+
+/** The offline-lock profile an Ollama that Harness starts runs under while internet access is blocked. */
+export const SANDBOX_PROFILE = path.join(ROOT_DIR, 'server', 'security', 'offline-lock.sb');
 
 const MAC_LOCATIONS = [
   '/opt/homebrew/bin/ollama',
@@ -70,7 +74,13 @@ const PROTECTION_LABELS = {
 };
 
 export class OllamaProcess {
-  constructor({ getSettings, getProvider, bus, totalMem }) {
+  /**
+   * @param {object} o
+   * @param {() => boolean} [o.sandbox] whether a newly started `ollama serve` should run under the offline-lock
+   *        sandbox (internet access blocked). macOS only (`/usr/bin/sandbox-exec`); `HARNESS_SANDBOX_EXEC` points
+   *        elsewhere for tests. If the sandbox is missing or Ollama misbehaves under it, Ollama runs without it.
+   */
+  constructor({ getSettings, getProvider, bus, totalMem, sandbox = () => false, sandboxExec = process.env.HARNESS_SANDBOX_EXEC || '/usr/bin/sandbox-exec', profile = SANDBOX_PROFILE, platform = process.platform }) {
     this.getSettings = getSettings;
     this.getProvider = getProvider;
     this.bus = bus;
@@ -80,9 +90,34 @@ export class OllamaProcess {
     this.logTail = [];
     this.starting = null;
     this.lastError = null;
+    this.sandboxWanted = sandbox;
+    this.sandboxExec = sandboxExec;
+    this.profile = profile;
+    this.platform = platform;
+    this.sandboxed = false; // the running managed Ollama is inside the sandbox
+    this.sandboxBroken = false; // tried once and it did not work: do not try again in this process
+    this.external = false; // an Ollama that Harness did not start answered
   }
 
   get managed() { return !!this.child; }
+
+  _useSandbox() {
+    if (this.sandboxBroken || !this.sandboxWanted()) return false;
+    if (this.platform !== 'darwin' && !process.env.HARNESS_SANDBOX_EXEC) return false;
+    return isExecutable(this.sandboxExec) && fs.existsSync(this.profile);
+  }
+
+  /**
+   * After the user allowed or blocked internet access: restart a managed Ollama with / without the sandbox when
+   * that changes anything (a running pull or chat on it is cut off — this happens only on that user action).
+   */
+  async applySandbox() {
+    if (!this.child || this.starting) return { restarted: false };
+    if (this.sandboxed === this._useSandbox()) return { restarted: false };
+    await this.stop();
+    const r = await this.start();
+    return { restarted: true, ...r };
+  }
 
   /**
    * Whether the memory protections Harness applies to an Ollama it starts itself are in effect.
@@ -124,7 +159,8 @@ export class OllamaProcess {
   async _start(timeoutMs) {
     const provider = this.getProvider();
     const st = await provider.status();
-    if (st.ok) return { started: false, alreadyRunning: true, managed: this.managed, version: st.version };
+    if (st.ok) { this.external = !this.managed; return { started: false, alreadyRunning: true, managed: this.managed, version: st.version }; }
+    this.external = false;
     const s = this.getSettings();
     const bin = findOllamaBinary(s.ollama?.binaryPath);
     if (!bin) {
@@ -132,14 +168,28 @@ export class OllamaProcess {
       return { started: false, error: this.lastError, code: 'not_installed' };
     }
     this.env = managedOllamaEnv(s, { baseUrl: provider.baseUrl, totalMem: this.totalMem });
-    log.info(`Starting ${bin} serve`, this.env);
+    const sandboxed = this._useSandbox();
+    const r = await this._spawn(bin, provider, timeoutMs, sandboxed);
+    if (!r.started && sandboxed) {
+      // Silent fallback: the OS layer is a bonus; chat must work. Reported as osEnforced: false.
+      log.info(`Ollama did not start under the offline-lock sandbox (${r.code}); starting it without (the in-app blocker still applies).`);
+      this.sandboxBroken = true;
+      return this._spawn(bin, provider, timeoutMs, false);
+    }
+    return r;
+  }
+
+  async _spawn(bin, provider, timeoutMs, sandboxed) {
+    log.info(`Starting ${bin} serve${sandboxed ? ' (offline-lock sandbox)' : ''}`, this.env);
     let child;
     try {
-      child = spawn(bin, ['serve'], { env: { ...process.env, ...this.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+      const [cmd, args] = sandboxed ? [this.sandboxExec, ['-f', this.profile, bin, 'serve']] : [bin, ['serve']];
+      child = spawn(cmd, args, { env: { ...process.env, ...this.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: false });
     } catch (e) {
       this.lastError = `Could not start ${bin}: ${e.message}`;
       return { started: false, error: this.lastError, code: 'spawn_failed' };
     }
+    this.sandboxed = sandboxed;
     // Attach the error listener before anything else: a spawn ENOENT/EACCES must never become an uncaught error.
     let spawnError = null;
     child.on('error', (e) => { spawnError = `Could not start ${bin}: ${e.code || e.message}`; this.lastError = spawnError; if (this.child === child) this.child = null; });
@@ -165,8 +215,8 @@ export class OllamaProcess {
       const s2 = await provider.status();
       if (s2.ok) {
         this.lastError = null;
-        this.bus?.publish('ollama.status', { managed: true, running: true, version: s2.version, pid: child.pid });
-        return { started: true, managed: true, pid: child.pid, version: s2.version, env: this.env };
+        this.bus?.publish('ollama.status', { managed: true, running: true, version: s2.version, pid: child.pid, sandboxed });
+        return { started: true, managed: true, pid: child.pid, version: s2.version, env: this.env, sandboxed };
       }
     }
     if (spawnError) return { started: false, error: spawnError, code: 'spawn_failed' };
@@ -179,6 +229,7 @@ export class OllamaProcess {
     const child = this.child;
     if (!child) return { stopped: false, managed: false };
     this.child = null;
+    this.sandboxed = false;
     if (child.exitCode === null && child.signalCode === null) {
       const exitedP = new Promise((r) => child.once('exit', () => r(true)));
       child.kill('SIGTERM');

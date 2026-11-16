@@ -22,6 +22,8 @@ const COMMANDS = Object.freeze({
   'export-chat': { label: 'Export Chat…', accelerator: 'CommandOrControl+Shift+E' },
   'import-chat': { label: 'Import Chat…', accelerator: 'CommandOrControl+O' },
   'show-shortcuts': { label: 'Keyboard Shortcuts', accelerator: 'CommandOrControl+/' },
+  // ⌃⌘L, next to macOS's own ⌃⌘Q "Lock Screen". The page handles it (POST /api/security/lock).
+  lock: { label: 'Lock Harness', mac: 'Control+Command+L', other: 'Control+Shift+L' },
 });
 
 function acceleratorFor(action, isMac) {
@@ -57,6 +59,7 @@ function buildAppMenuTemplate({ isMac, appName = 'Harness', send, showDataFolder
         { role: 'about' },
         sep,
         cmd('open-settings'),
+        cmd('lock'),
         sep,
         { role: 'services' },
         sep,
@@ -77,7 +80,7 @@ function buildAppMenuTemplate({ isMac, appName = 'Harness', send, showDataFolder
       cmd('export-chat'),
       sep,
       { id: 'show-data-folder', label: fileFolderLabel, click: () => showDataFolder() },
-      ...(isMac ? [sep, { role: 'close' }] : [sep, cmd('open-settings'), sep, { role: 'quit' }]),
+      ...(isMac ? [sep, { role: 'close' }] : [sep, cmd('open-settings'), cmd('lock'), sep, { role: 'quit' }]),
     ],
   });
   template.push({
@@ -145,7 +148,7 @@ function buildAppMenuTemplate({ isMac, appName = 'Harness', send, showDataFolder
 
 /** Dock menu (macOS): right-click the Dock icon. */
 function buildDockMenuTemplate({ send }) {
-  return [{ label: 'New Chat', click: () => send('new-chat') }];
+  return [{ label: 'New Chat', click: () => send('new-chat') }, { label: 'Lock Harness', click: () => send('lock') }];
 }
 
 /**

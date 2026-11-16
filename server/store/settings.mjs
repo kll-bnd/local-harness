@@ -62,7 +62,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     },
     custom: [],
   },
-  security: { allowedOrigins: [] },
+  security: { allowedOrigins: [], idleLockMinutes: 15 },
   ui: { theme: 'system' },
 });
 
@@ -145,6 +145,8 @@ export const SETTINGS_SCHEMA = obj({
     custom: arrayOf(imageProviderEntry, { max: 50 }),
   }),
   security: obj({
+    // Password mode: lock after this many minutes without a request from the UI (0 = never). docs/API.md §10.3
+    idleLockMinutes: num(0, 1440, { int: true, nullable: false }),
     // Extra browser origins allowed to call the API (e.g. a UI dev server); the app's own origin is always allowed.
     allowedOrigins: arrayOf(custom((v, p) => {
       if (typeof v !== 'string') return `${p} must be an origin string`;

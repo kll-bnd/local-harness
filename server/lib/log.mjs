@@ -6,10 +6,14 @@ export function setLogLevel(level) {
   if (level in LEVELS) current = LEVELS[level];
 }
 
+let allToStderr = false;
+/** Bridge mode: stdout carries frames only, so every log line goes to stderr. */
+export function logToStderr(on = true) { allToStderr = on; }
+
 function out(level, args) {
   if (LEVELS[level] < current) return;
   const ts = new Date().toISOString();
-  const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+  const fn = allToStderr || level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
   fn(`[harness ${ts}] ${level.toUpperCase()}`, ...args);
 }
 

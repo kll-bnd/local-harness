@@ -1,22 +1,28 @@
 ;; Harness offline lock: an OS-enforced "nothing leaves this Mac" profile for macOS sandbox-exec.
 ;;
-;;   HARNESS_SANDBOXED=1 /usr/bin/sandbox-exec -f server/security/offline-lock.sb <command> [args…]
+;;   /usr/bin/sandbox-exec -f server/security/offline-lock.sb <command> [args…]
 ;;
 ;; Everything a normal process may do stays allowed EXCEPT network traffic with anything that is not
 ;; this computer. Child processes inherit the sandbox, so wrapping `ollama serve` also confines the
 ;; model runner it starts. In SBPL the last matching rule wins.
-;; What was verified on a real Mac is recorded in docs/BRIDGE.md ("Offline lock").
+;;
+;; Measured on macOS 26.7 (GitHub's Apple Silicon runner, see docs/BRIDGE.md "Offline lock"): with this
+;; profile a TCP connection to a public address fails with EPERM (IPv4 and IPv6), a UDP DNS query to the
+;; configured name server is refused, getaddrinfo() of a public name fails (ENOTFOUND), while loopback
+;; (127.0.0.1 and ::1), local servers and Unix-domain sockets keep working, and a real Ollama still loads
+;; its model on the GPU and answers on 127.0.0.1.
+;; Limits, also measured: the sandbox decides when a socket is bound or listens, not per accepted
+;; connection, so a confined program that listens on all interfaces (0.0.0.0) can be reached from the
+;; local network. Harness starts Ollama on 127.0.0.1 only, where the kernel itself refuses other peers.
 (version 1)
 (allow default)
 
 ;; No IP traffic at all …
 (deny network*)
-;; … except with this machine. `remote ip "localhost:*"` matches a loopback peer (127.0.0.1, ::1).
-;; (`local ip "localhost:*"` must not be used: it matches the machine's own addresses, which lets
-;; outbound connections to the internet through.)
+;; … except connections to this machine. `remote ip "localhost:*"` matches a loopback peer.
 (allow network-outbound (remote ip "localhost:*"))
-(allow network-inbound (remote ip "localhost:*"))
-;; Binding a port sends nothing; who may connect to it is decided by the inbound rule above.
+;; Listening (Ollama's API and its model runner on 127.0.0.1).
+(allow network-inbound (local ip "localhost:*"))
 (allow network-bind (local ip "*:*"))
 ;; Local (Unix-domain) sockets.
 (allow network* (remote unix-socket))

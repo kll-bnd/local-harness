@@ -5,6 +5,10 @@ runs. It starts the backend **in-process** (`startServer()` from `server/index.m
 one locked-down window, adds the native macOS bits (menu bar, Dock, title bar, global shortcut) and
 stops the backend cleanly on quit. The UI is the web UI in `public/`, unchanged.
 
+**0.2:** the Electron app remains supported, but it is the alternative now: the native app (`native/`,
+`docs/BRIDGE.md`) runs the backend with no localhost server and uses less memory. The Electron app keeps the
+listener (`127.0.0.1`) and follows the 0.2 contract for it: [0.2: sessions, locking, the blocker](#02-sessions-locking-the-blocker).
+
 ```
 electron/
   main.cjs            wiring only (Electron APIs); all decisions live in lib/
@@ -15,7 +19,7 @@ electron/
   lib/menu.cjs        application, Dock and context menu templates
   lib/window-state.cjs  window size/position persistence
   lib/activity.cjs    App Nap guard
-  lib/instance.cjs    "is Harness already running for this data dir?" (reads <data>/harness.lock, then probes ports)
+  lib/instance.cjs    "is Harness already running for this data dir?" (<data>/harness.lock + GET /api/health only)
   lib/backend.cjs     start the in-process backend, or attach to the instance that owns the data dir
   lib/logfile.cjs     console → <data>/logs/harness.log
   test/               unit tests (npm test) and the end-to-end smoke test (npm run test:e2e)
@@ -59,9 +63,10 @@ keeps the two identical on macOS, Linux and Windows.
 
 Never two writers: the app takes Electron's single-instance lock for the data dir (a second launch just
 focuses the window). Before starting its own backend it looks for a Harness that serves **the same data
-dir** (e.g. started with `npm start` or `Harness.command`): first via the backend's lock file
-`<data>/harness.lock` (it names the URL, so an instance on a fallback port is found too), then by probing
-ports 4747–4757. If it finds one, the window uses that server and leaves it running on quit. If another
+dir** (e.g. started with `npm start` or `Harness.command`) through the backend's lock file
+`<data>/harness.lock` (it names the port, so an instance on a fallback port is found too) and `GET /api/health`
+on that port — both need no session and contain no user data; nothing else is probed (a Harness on a nearby
+port may serve another folder). If it finds one, the window uses that server and leaves it running on quit. If another
 launcher wins the race between that check and `startServer()`, the backend's own lock rejects with
 `err.code === 'HARNESS_ALREADY_RUNNING'` and `err.url`; the app then attaches to `err.url` in exactly the
 same way (waiting up to 10 s if the other instance has not published its URL yet). `Harness.command`
@@ -113,6 +118,7 @@ process, which also checks that the call comes from the app window on the server
 | `focus-composer` | Chat → Focus Message Box | ⌘L |
 | `stop-generation` | Chat → Stop Generating | ⌘. |
 | `show-shortcuts` | Help → Keyboard Shortcuts | ⌘/ |
+| `lock` (0.2) | Harness → Lock Harness (also Dock menu) | ⌃⌘L |
 
 Menu accelerators fire before the page sees the key, so the page should not also bind these keys
 when `html.desktop` is set. Everything else is the standard role-based macOS menu: About, Services,
@@ -143,6 +149,30 @@ View with ⌥⌘J (⌥⌘I is the Inspector). File and Help also have "Show Data
   `--bg` in line to avoid a flash.
 * **Downloads** (`/api/chats/:id/export`, `/api/export`, image downloads) use Chromium's normal download
   handling (a Save dialog).
+
+## 0.2: sessions, locking, the blocker
+
+* **The window's session** (docs/API.md §10.5). With its in-process backend the app calls
+  `startServer().auth.createSession()` and sets the `harness_session` cookie for its own origin **without an
+  expiry**, so Chromium keeps it in memory only. In password mode that call throws while Harness is locked:
+  the page then shows Harness's own lock or setup screen, and the unlock there sets the cookie. The app also
+  strips `Max-Age`/`Expires` from the backend's `Set-Cookie: harness_session=…` (`webRequest.onHeadersReceived`),
+  so no session cookie lands in Chromium's on-disk cookie store. Attached to a backend in another process,
+  the app opens a one-time launch URL from `<data>/api-token` (keychain/off modes only) or lets the page's lock
+  screen do it.
+* **Locking.** The 15th menu action, `lock` (⌃⌘L; Ctrl+Shift+L elsewhere), is sent to the page like the
+  others; the UI calls `POST /api/security/lock`. When the Mac **sleeps** (`powerMonitor` `suspend`) or the
+  **screen locks** (`lock-screen`, macOS/Windows), the app locks the in-process backend itself (a short-lived
+  session from `auth.createSession()` → `POST /api/security/lock`; locking drops every session) and tells the
+  page (`lock`), which covers an attached backend too. The App Nap blocker is released once the backend is idle.
+* **The internet blocker** is the backend's (docs/API.md §10.6). The Electron app does not sandbox itself or
+  its in-process backend (that would need a restart to allow downloads); the backend runs the Ollama it starts
+  under `sandbox-exec` (`offlineLock.osScope: "ollama"`). The app's own network filter (only the local origin)
+  is unchanged.
+* **Theme** is applied after unlocking (settings are encrypted while locked). The backend's `app` and event bus
+  exist only while unlocked and are recreated on every unlock; the app re-attaches through `server.core`'s
+  `state`/`locked` events, which are not yet part of the documented `startServer()` contract.
+* `electron/lib/instance.cjs` no longer calls `/api/system` (it needs a session in 0.2).
 
 ## Lifecycle and Mac niceties
 
@@ -211,7 +241,15 @@ Config: the `build` key in `package.json`. Highlights:
 
 ## Verification status
 
-**Verified on a real Mac in CI** (`.github/workflows/macos.yml`, GitHub's Apple Silicon runner: "Apple M1
+**0.2 (this pass): verified on Linux only** (Electron 44 under Xvfb). Unit tests for the 15-action menu
+contract, Lock Harness ⌃⌘L, instance detection by lock file + health, start-or-attach; `npm run test:e2e` adds
+checks that run once the backend serves `/api/security`: setup with a throw-away password and a recovery key
+in the documented shape, the window's own session (`/api/auth/status` from the page), the session cookie
+being memory-only, data routes refused without a session, the `lock` menu action reaching the page, and an
+emitted `lock-screen` locking the backend (data routes → 423) and releasing the App Nap blocker. **Not yet
+run on a Mac:** all of the above, real sleep/screen-lock events, and the sandboxed Ollama.
+
+**0.1, verified on a real Mac in CI** (`.github/workflows/macos.yml`, GitHub's Apple Silicon runner: "Apple M1
 (Virtual)", 7 GB RAM, macOS 26):
 
 * `npm ci` + `npm run dist` produce `dist/mac-arm64/Harness.app` and a ~129 MB `.dmg` on macOS arm64.

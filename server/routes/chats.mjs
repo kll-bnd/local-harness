@@ -7,6 +7,7 @@ import { activePath, pathTo, deepestLeaf, setActiveLeaf, deleteSubtree, turnUser
 import { activeSummary } from '../context/compaction.mjs';
 import { exportMarkdown, exportJson, importPayload } from '../chat/export.mjs';
 import { buildBackup, restoreBackup } from '../chat/backup.mjs';
+import { openBackup, encryptBackup } from '../security/backup-crypto.mjs';
 import { regenerateImage } from './images.mjs';
 import { generateTitle } from '../chat/titles.mjs';
 import { newId } from '../lib/ids.mjs';
@@ -174,7 +175,7 @@ export function registerChatRoutes(r, app) {
   });
 
   r.post('/api/chats/import', async ({ req }) => {
-    const body = await readJson(req, { limit: 512 * 1024 * 1024 });
+    const body = await openBackup(await readJson(req, { limit: 512 * 1024 * 1024 }), req);
     if (body?.format === 'harness.backup') {
       // A full backup imported here restores its chats with their files; memories/presets/settings are left out
       // (use POST /api/restore for those) and listed in `ignored` so nothing is skipped silently.
@@ -188,8 +189,10 @@ export function registerChatRoutes(r, app) {
     return created({ chats: chats.map((c) => chatSummary(c)), ...(skipped ? { skipped: { chats: skipped } } : {}) });
   });
 
-  r.post('/api/restore', async ({ req, query }) => {
-    const body = await readJson(req, { limit: 512 * 1024 * 1024 });
+  r.post('/api/restore', async ({ req, query, core, auth }) => {
+    // Restoring over existing data lowers what the user has: password confirmation (X-Harness-Confirm), §10.4.
+    if (core) await core.requireConfirmation({ header: typeof req.headers['x-harness-confirm'] === 'string' ? req.headers['x-harness-confirm'] : null, sessionHash: auth?.sessionHash });
+    const body = await openBackup(await readJson(req, { limit: 512 * 1024 * 1024 }), req);
     const settingsMode = query.get('settings') || 'skip';
     if (!['skip', 'safe', 'full'].includes(settingsMode)) throw badRequest("settings must be 'skip', 'safe' or 'full'");
     const flag = (k) => qBool(query.get(k), true);
@@ -436,9 +439,25 @@ export function registerChatRoutes(r, app) {
     return { query: q, results: searchChats(app, q, { limit: qInt(query.get('limit'), 50, { min: 1, max: 500 }) }) };
   });
 
-  r.get('/api/export', async ({ res }) => {
+  // Full backups need the password when one is set (§10.4): POST with { password, passphrase }; a GET only with a
+  // confirmation token (X-Harness-Confirm).
+  r.get('/api/export', async ({ req, res, core, auth }) => {
+    if (core) await core.requireConfirmation({ header: typeof req.headers['x-harness-confirm'] === 'string' ? req.headers['x-harness-confirm'] : null, sessionHash: auth?.sessionHash });
     const body = await buildBackup(app);
     sendJson(res, 200, body, { 'content-disposition': `attachment; filename="harness-backup-${nowIso().slice(0, 10)}.json"` });
+  });
+
+  r.post('/api/export', async ({ req, res, core, auth }) => {
+    const opts = await readJson(req, { optional: true });
+    if (opts.passphrase !== undefined && opts.passphrase !== null && typeof opts.passphrase !== 'string') throw badRequest('passphrase must be a string or null');
+    if (core) await core.requireConfirmation({ password: opts.password, header: typeof req.headers['x-harness-confirm'] === 'string' ? req.headers['x-harness-confirm'] : null, sessionHash: auth?.sessionHash });
+    const backup = await buildBackup(app);
+    const day = nowIso().slice(0, 10);
+    if (opts.passphrase) {
+      const env = await encryptBackup(JSON.stringify(backup), opts.passphrase, core?.vault.kdfParams || undefined);
+      return sendJson(res, 200, env, { 'content-disposition': `attachment; filename="harness-backup-${day}.encrypted.json"` });
+    }
+    sendJson(res, 200, backup, { 'content-disposition': `attachment; filename="harness-backup-${day}.json"` });
   });
 
 }

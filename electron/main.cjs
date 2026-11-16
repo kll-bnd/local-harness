@@ -318,7 +318,7 @@ function lockDownSession(ses) {
   const warned = new Set();
   // Keep Harness's session cookie in memory only: drop Max-Age/Expires from its Set-Cookie so Chromium does not
   // write it to its on-disk cookie store (a session is useless once Harness locks, but it need not sit on disk).
-  ses.webRequest.onHeadersReceived({ urls: ['http://127.0.0.1/*', 'http://127.0.0.1:*/*'] }, (details, callback) => {
+  ses.webRequest.onHeadersReceived({ urls: ['<all_urls>'] }, (details, callback) => {
     const h = details.responseHeaders || {};
     const key = Object.keys(h).find((k) => k.toLowerCase() === 'set-cookie');
     if (!key || !security.isAppUrl(details.url, appOrigin)) return callback({});
@@ -439,14 +439,26 @@ async function onReady() {
   registerIpc();
 
   if (server) {
-    // While locked (0.2 password mode) the settings are still encrypted: the theme follows after unlocking.
-    try { applyTheme(server.app.settings?.get?.()); } catch { /* locked */ }
-    activity = createActivityGuard({ isBusy: backendBusy(server.app), blocker: powerSaveBlocker });
-    server.app.bus?.on('event', (ev) => {
-      if (ACTIVITY_EVENTS.has(ev.type) || ev.type === 'security.status' || ev.type === 'locked') activity.update();
+    // 0.2: the backend's `app` (and its event bus) exists only while Harness is unlocked and is recreated on every
+    // unlock, so re-attach on each state change. `server.core` emits 'state' / 'locked' (not part of the documented
+    // contract yet — see docs/DESKTOP.md); with a 0.1 backend there is no core and `app` is always there.
+    activity = createActivityGuard({ isBusy: () => backendBusy(server.app)(), blocker: powerSaveBlocker });
+    let bus = null;
+    const onEvent = (ev) => {
+      if (ACTIVITY_EVENTS.has(ev.type)) activity.update();
       if (ev.type === 'settings.updated') applyTheme(ev.data?.settings);
-      else if (ev.type === 'security.status' && ev.data?.state === 'unlocked') { try { applyTheme(server.app.settings?.get?.()); } catch { /* */ } }
-    });
+    };
+    const attachBus = () => {
+      const b = server.app?.bus;
+      if (!b || b === bus) return;
+      bus?.off?.('event', onEvent);
+      bus = b;
+      b.on('event', onEvent);
+      try { applyTheme(server.app.settings?.get?.()); } catch { /* settings not readable yet */ }
+    };
+    attachBus();
+    server.core?.on?.('state', (st) => { if (st?.state === 'unlocked') attachBus(); activity.update(); });
+    server.core?.on?.('locked', () => { bus = null; activity.update(); });
   }
   nativeTheme.on('updated', () => { if (win && !win.isDestroyed()) win.setBackgroundColor(backgroundColor()); });
   // Lock when the Mac sleeps or its screen locks (Electron's powerMonitor; 'lock-screen' exists on macOS and Windows).

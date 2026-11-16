@@ -3,6 +3,7 @@ import { createStore, Emitter } from './lib/store.js';
 import * as api from './api.js';
 import { debounce } from './lib/dom.js';
 import { registerModelNames } from './lib/format.js';
+import { getUi, setUi, flushUiState } from './ui-state.js';
 
 export const store = createStore({
   connection: 'connecting', // connecting | online | offline
@@ -19,12 +20,15 @@ export const store = createStore({
   imageJobs: {}, // jobId → ImageJob-ish live state
   recommended: null,
   memoryCount: null,
+  uiPrefs: getUi('prefs', {}) || {}, // UI preferences (theme, layout, …), kept in the UI-state store
+  security: null, // GET /api/security (state, mode, recoveryKey, idleLockMinutes, session, offlineLock)
+  network: null, // offlineLock status (GET /api/network, network.status events)
 });
 
 /** Bus for app-level events that are not state (e.g. "focus composer"). */
 export const bus = new Emitter();
 
-export const uiPrefs = () => store.get('settings')?.ui || {};
+export const uiPrefs = () => store.get('uiPrefs') || {};
 
 // ------------------------------------------------------------------------------------------------ loaders
 export async function loadSettings() {
@@ -88,33 +92,18 @@ export async function patchSettings(partial) {
   return settings;
 }
 
-/** settings.ui is free-form; merge a few keys without clobbering the rest. Layout toggles are debounced;
- *  appearance changes are sent at once. Requests use keepalive so a reload or quit doesn't drop them. */
-let pendingUi = {};
+/**
+ * UI preferences live in the UI-state store (docs/API.md 10.4), never in browser storage. Layout toggles are
+ * batched; appearance changes are sent at once. Only the theme is mirrored in localStorage, to paint the first
+ * frame in the right colours.
+ */
 const IMMEDIATE_UI = new Set(['theme', 'textSize', 'proseFont', 'sendKey']);
-function sendUi() {
-  const patch = pendingUi;
-  pendingUi = {};
-  if (!Object.keys(patch).length) return;
-  api.settings.patch({ ui: { ...(store.get('settings')?.ui || {}), ...patch } }, { keepalive: true }).then(({ settings }) => {
-    // Keep any local changes made while the request was in flight.
-    store.set('settings', { ...settings, ui: { ...settings.ui, ...pendingUi } });
-  }).catch(() => {});
-}
-const flushUi = debounce(sendUi, 350);
 export function setUiPref(key, value) {
-  const s = store.get('settings');
-  if (!s) return;
-  pendingUi[key] = value;
-  store.set('settings', { ...s, ui: { ...(s.ui || {}), [key]: value } });
-  try { localStorage.setItem(`harness.ui.${key}`, JSON.stringify(value)); } catch { /* storage unavailable */ }
-  if (IMMEDIATE_UI.has(key)) { flushUi.cancel(); sendUi(); } else flushUi();
+  const prefs = { ...uiPrefs(), [key]: value };
+  store.set('uiPrefs', prefs);
+  setUi('prefs', prefs, { immediate: IMMEDIATE_UI.has(key) });
 }
-export function flushUiPrefs() { flushUi.cancel(); sendUi(); }
-
-export function localPref(key, fallback) {
-  try { const v = localStorage.getItem(`harness.ui.${key}`); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }
-}
+export function flushUiPrefs({ keepalive = true } = {}) { return flushUiState({ keepalive }); }
 
 // ------------------------------------------------------------------------------------------------ derived
 export function chatModels() {

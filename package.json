@@ -1,7 +1,7 @@
 {
   "name": "harness",
   "productName": "Harness",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Harness: a local app for chatting with open-source LLMs (Ollama, llama.cpp, LM Studio, MLX) with long context, auto-summarization, long-term memory, tools and local image generation.",
   "private": true,
   "type": "module",
@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "node server/index.mjs",
-    "test": "node --test --test-concurrency=4 \"test/*.test.mjs\" \"electron/test/*.test.mjs\"",
+    "test": "node --test --test-concurrency=4 \"test/*.test.mjs\" \"electron/test/*.test.mjs\" \"scripts/test/*.test.mjs\"",
     "dev:fake": "node scripts/dev-fake.mjs",
     "doctor": "node scripts/doctor.mjs",
     "get-model": "node scripts/get-model.mjs",

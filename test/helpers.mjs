@@ -8,6 +8,10 @@ import { startServer } from '../server/index.mjs';
 import { deepMerge } from '../server/lib/util.mjs';
 
 process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1';
+// The 0.2 defaults (password-encrypted data, API sessions, internet blocked) are opted out of EXPLICITLY here
+// for the suites that test other things; test/security*.test.mjs pass their own options to exercise them.
+export const LEGACY_OPTS = Object.freeze({ security: { mode: 'off', apiAuth: false }, offlineLock: false });
+for (const [k, v] of Object.entries({ HARNESS_ENCRYPTION: 'off', HARNESS_API_AUTH: '0', HARNESS_OFFLINE_LOCK: '0' })) process.env[k] ??= v;
 
 export const GiB = 1024 ** 3;
 
@@ -99,12 +103,12 @@ export async function setup({ settings = {}, system, fakeOptions = {}, dataDir, 
     ollama: { autoStart: false },
   };
   await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify(deepMerge(base, settings)));
-  let srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'error', system });
+  let srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'error', system, ...LEGACY_OPTS });
   const ctx = {
     fake, probe: memoryProbe, srv, app: srv.app, url: srv.url, dataDir, c: client(srv.url),
     async restart() {
       await srv.close();
-      srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'error', system });
+      srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'error', system, ...LEGACY_OPTS });
       Object.assign(ctx, { srv, app: srv.app, url: srv.url, c: client(srv.url) });
       return ctx;
     },

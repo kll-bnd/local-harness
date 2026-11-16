@@ -43,7 +43,7 @@ export async function startFakeSecurity({ state = 'locked', mode = 'password', p
     if (f.state === 'needs_setup' || f.state === 'locked' || f.state === 'migrating') return err(res, 423, f.state === 'migrating' ? 'locked' : f.state);
     if (!sessionOf(req)) return err(res, 401, 'auth_required', { reason: 'missing', unlock: f.mode === 'password' });
     if (p === 'POST /api/security/lock') { f.state = 'locked'; f.sessions.clear(); return json(res, 200, { state: 'locked' }); }
-    if (p === 'GET /api/network') return json(res, 200, { offlineLock: f.offlineLock });
+    if (p === 'GET /api/network') return json(res, 200, f.offlineLock);
     if (p === 'POST /api/network/allow') {
       f.allowCalls.push({ minutes: body.minutes, hasPassword: 'password' in body });
       if (!('password' in body)) return err(res, 403, 'confirmation_required');

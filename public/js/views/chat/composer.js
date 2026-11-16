@@ -9,6 +9,7 @@ import { openPopover, openMenu, toast } from '../../ui/overlays.js';
 import { showError } from '../../errors.js';
 import { runAction, keyLabel } from '../../actions.js';
 import { miniMeter } from './context-meter.js';
+import { getUi, setUi } from '../../ui-state.js';
 
 const SLASH = [
   { cmd: '/image', alias: ['/draw'], args: '<prompt>', desc: 'Generate an image in this chat', needsArg: true },
@@ -21,9 +22,10 @@ const SLASH = [
   { cmd: '/help', desc: 'Keyboard shortcuts and commands' },
 ];
 
-const draftKey = (id) => `harness.draft.${id || 'new'}`;
-const loadDraft = (id) => { try { return localStorage.getItem(draftKey(id)) || ''; } catch { return ''; } };
-const saveDraft = (id, v) => { try { if (v) localStorage.setItem(draftKey(id), v); else localStorage.removeItem(draftKey(id)); } catch { /* ignore */ } };
+// Drafts live in the encrypted UI-state store on the server (never in browser storage).
+const draftKey = (id) => `draft:${id || 'new'}`;
+const loadDraft = (id) => { const v = getUi(draftKey(id), ''); return typeof v === 'string' ? v : ''; };
+const saveDraft = (id, v) => setUi(draftKey(id), v || null);
 
 export class Composer {
   /** host: { getModel(): ChatModel|null, ensureChat(): Promise<ChatModel>, send({content, attachments}), generateImage(prompt), stop() } */

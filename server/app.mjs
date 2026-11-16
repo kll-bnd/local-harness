@@ -1,8 +1,6 @@
 // Application wiring: stores, providers, engines. One `app` object is shared by all routes.
 import os from 'node:os';
 import path from 'node:path';
-import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { ensureDir, flushWrites } from './lib/fsx.mjs';
 import { EventBus } from './lib/bus.mjs';
 import { SettingsStore } from './store/settings.mjs';
@@ -27,6 +25,7 @@ import { ImageService } from './image/service.mjs';
 import { Gallery } from './image/gallery.mjs';
 import { RamLease } from './image/ram-lease.mjs';
 import { log } from './lib/log.mjs';
+import { UiStateStore } from './store/ui-state.mjs';
 
 export { ROOT_DIR, VERSION } from './version.mjs';
 import { ROOT_DIR, VERSION } from './version.mjs';
@@ -102,6 +101,8 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.images = new ImageService(app);
   app.background = new BackgroundQueue(app);
   app.ram = new RamLease(app);
+  app.uiState = await new UiStateStore(dataDir).load();
+  app.pulls = new Set();
 
   /**
    * Close the stores. `lock: true` (Harness is locking): abort what runs (partial replies kept), unload the models
@@ -111,6 +112,7 @@ export async function createApp({ dataDir, system: sysOverrides = {}, autodetect
   app.close = async ({ lock = false, stopOllama = !lock } = {}) => {
     app.closing = true;
     app.background.stop();
+    for (const p of app.pulls) p.abort();
     for (const g of app.engine.active.values()) g.controller.abort();
     for (const j of app.images.jobs?.values?.() || []) if (!['done', 'error', 'aborted'].includes(j.status)) j._controller?.abort();
     // give aborted turns a moment to store their partial replies

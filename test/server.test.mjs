@@ -1,5 +1,6 @@
 // HTTP server: security, routing, chats, SSE streaming, reasoning, branching, tool loop, abort, persistence.
 import { test, describe, before, after } from 'node:test';
+import { VERSION } from '../server/version.mjs';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { setup, newChat, send, byType, text, waitFor } from './helpers.mjs';
@@ -25,7 +26,7 @@ describe('server basics & security', () => {
   test('binds 127.0.0.1 and serves health + static UI', async () => {
     assert.match(h.url, /^http:\/\/127\.0\.0\.1:\d+$/);
     const r = await h.c.get('/api/health');
-    assert.deepEqual(r.data, { ok: true, name: 'harness', version: '0.1.0' });
+    assert.deepEqual(r.data, { ok: true, name: 'harness', version: VERSION, state: 'unlocked' });
     const ui = await fetch(h.url + '/');
     assert.equal(ui.status, 200);
     assert.match(await ui.text(), /<title>Harness<\/title>/);

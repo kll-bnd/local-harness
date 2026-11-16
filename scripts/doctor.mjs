@@ -248,12 +248,19 @@ if (!ollama.installed && !ollamaUp) {
 // the temporary backend cannot know who started Ollama: the running Harness's externalOllama flag answers it.
 let prot = ollama.protections;
 if (running && !session) {
-  prot = offline ? { inEffect: ollamaUp && !offline.externalOllama, external: !!offline.externalOllama, message: offline.externalOllama ? 'The Ollama in use was not started by Harness, so its memory protections and the macOS sandbox do not apply.' : ollamaUp ? 'Ollama was started by the running Harness, with its memory protections.' : 'The running Harness starts Ollama itself when needed.' } : null;
+  const unlockedNow = (runningSec?.state || running.state) === 'unlocked';
+  if (!offline) prot = null;
+  else if (offline.externalOllama) prot = { inEffect: false, external: true, message: 'The Ollama in use was not started by Harness, so its memory protections and the macOS sandbox do not apply.' };
+  else if (!ollamaUp) prot = { inEffect: false, external: false, message: 'The running Harness starts Ollama itself when needed.' };
+  // A locked Harness may not have looked at Ollama yet (seen on the 0.2 backend: externalOllama false while locked).
+  else if (!unlockedNow) prot = { inEffect: false, external: false, unknown: true, message: 'Whether the running Harness started this Ollama is known only while Harness is unlocked: run `npm run doctor -- --unlock`.' };
+  else prot = { inEffect: true, external: false, message: 'Ollama was started by the running Harness, with its memory protections.' };
 }
 const menuBarApp = isMac && run('pgrep', ['-x', 'Ollama']) !== null;
 const brewService = isMac && run('launchctl', ['list', 'homebrew.mxcl.ollama']) !== null;
 if (prot) {
-  if (prot.inEffect) add('ok', 'Ollama memory protections are in effect', prot.message || '');
+  if (prot.unknown) add('info', 'Ollama memory protections: unknown while Harness is locked', prot.message);
+  else if (prot.inEffect) add('ok', 'Ollama memory protections are in effect', prot.message || '');
   else if (prot.external || (ollamaUp && !ollama.managed)) {
     add(lowRam ? 'warn' : 'info', 'Ollama is running without Harness\'s memory protections', prot.message || 'This Ollama was not started by Harness.',
       'Quit the other Ollama (menu bar → Quit Ollama' + (brewService ? '; brew services stop ollama' : '') + '), then start Harness: it starts its own Ollama with flash attention, a q8_0 KV cache, one model at a time, no cloud features and a capped prompt cache.');

@@ -42,8 +42,9 @@ export class NetworkGuard extends EventEmitter {
 
   status() {
     const blocked = this.blocked;
-    const osScope = !blocked ? 'none' : this.sandboxed ? 'backend' : this.ollama.managed && this.ollama.sandboxed ? 'ollama' : 'none';
-    return { enabled: this.enabled, blocked, allowedUntil: this.allowedUntil, waitingFor: this.waitingFor, osEnforced: osScope !== 'none', osScope, externalOllama: !!this.ollama.external };
+    const o = this.ollamaInfo ? this.ollamaInfo() : this.ollama;
+    const osScope = !blocked || this.osBroken ? 'none' : this.sandboxed ? 'backend' : o.managed && o.sandboxed ? 'ollama' : 'none';
+    return { enabled: this.enabled, blocked, allowedUntil: this.allowedUntil, waitingFor: this.waitingFor, osEnforced: osScope !== 'none', osScope, externalOllama: !!o.external };
   }
 
   /** Allow internet access for `minutes` (the caller has checked the password). */
@@ -66,6 +67,7 @@ export class NetworkGuard extends EventEmitter {
   }
 
   setEnabled(enabled) {
+    this.override = undefined;
     this.launch.set({ offlineLock: !!enabled, ...(enabled ? {} : { offlineLockSuspendedUntil: null }) });
     this._arm();
     this._changed(enabled ? 'enable' : 'disable');

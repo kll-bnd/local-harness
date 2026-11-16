@@ -95,7 +95,11 @@ export class Vault {
 
   _succeed(dek) {
     if (this.meta.throttle?.failures) { this.meta.throttle = { failures: 0, lastFailureAt: null }; this.save(); }
-    if (this.dek && this.dek !== dek) wipe(this.dek);
+    // Already open: keep the buffer the file ciphers hold (same key) and drop the new copy.
+    if (this.dek) {
+      if (this.dek.equals(dek)) { if (dek !== this.dek) wipe(dek); return this.dek; }
+      wipe(this.dek);
+    }
     this.dek = dek;
     return dek;
   }
@@ -174,6 +178,29 @@ export class Vault {
     this.meta.wraps.keychain = seal(kek, this.dek, AAD('keychain'));
     this.save();
     return kek;
+  }
+
+  /**
+   * Re-keying: wrap `newDek` under the password and a NEW recovery key (returned once), drop the keychain wrap
+   * (the caller adds a new one), record `migration` (which carries the old key sealed under the new one) — all in
+   * one save, so a crash leaves either the old or the new key store, never a mix.
+   */
+  async replaceKey(newDek, password, { migration }) {
+    this._need();
+    const meta = JSON.parse(JSON.stringify(this.meta));
+    const saved = this.meta;
+    this.meta = meta;
+    try {
+      await this._wrapPassword(newDek, password);
+      const recoveryKey = this._wrapRecovery(newDek);
+      delete meta.wraps.keychain;
+      meta.keyId = keyIdOf(newDek).toString('hex');
+      meta.migration = migration;
+      this.save();
+      wipe(this.dek);
+      this.dek = newDek;
+      return recoveryKey;
+    } catch (e) { this.meta = saved; throw e; }
   }
 
   setEncrypted(flag) { this.meta.encrypted = !!flag; this.save(); }

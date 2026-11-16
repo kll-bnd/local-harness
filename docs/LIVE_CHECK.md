@@ -65,6 +65,28 @@ Exit code: **0** no FAIL, **1** at least one FAIL, **2** no backend reachable.
 Also printed: OS/chip/memory/swap, Node, Ollama version, `OLLAMA_*` visible to this process and (macOS) to
 `launchctl`, and what is listening on the default ports.
 
+## Harness 0.2: password, locking, the internet blocker, the catalogue
+
+The e2e layer runs Harness with its **real 0.2 defaults** (password mode, internet blocked). On its fresh
+temporary data dir it sets up a **throw-away password** through `POST /api/security/setup`, exactly like the
+setup screen; the password lives only in the checker's memory, and the recovery key is checked for its shape
+and discarded. Every report redacts passwords, recovery keys, session tokens/cookies and launch codes. The
+backends found on this Mac are then wired in with `PATCH /api/settings`. Downloads in the e2e layer
+(`e2e.pull_delete`) open the internet window with that password and block again right after.
+
+| check | what it proves |
+|---|---|
+| `e2e.setup`, `e2e.auth_required`, `e2e.wrong_password` | first start, the session, 401 without one, the wrong-password answer and its retry delay |
+| `e2e.blocker.default` | a fresh install blocks internet access; the backend's self-test (`POST /api/network/test`) reports blocked |
+| `e2e.blocker.catalog`, `e2e.blocker.pull`, `e2e.blocker.fetch_url` | while blocked: the online catalogue and pulls answer `403 offline_lock`; `fetch_url` is not offered (a tool model is asked to use it) |
+| `e2e.blocker.allow` | allowing needs the password (403 / 401 without / with a wrong one); with `--allow-internet` the window really opens |
+| `e2e.catalog.huggingface`, `e2e.catalog.ollama` | **only with `--allow-internet`, while the window is open**: the Hugging Face and Ollama-library adapters parse the live sites (a list page; the Nemotron repository's files; one Ollama model's tags). These are the checks most likely to break when a site changes: a FAIL names the adapter's file:line and includes the response excerpt |
+| `e2e.blocker.reblock` | blocking again takes effect at once |
+| `e2e.blocker.sandboxed_ollama` | macOS with Ollama installed: a second throw-away Harness starts its **own** Ollama on a spare port while blocked; it must run in the sandbox (`osScope: "ollama"`), a pull sent **straight to that Ollama** must fail, and the self-test's OS probe must be blocked |
+| `e2e.lock.routes`, `e2e.lock.models_unloaded`, `e2e.lock.marker_not_on_disk`, `e2e.lock.unlock_again` | after a memory, a chat title and a chat turn containing a unique marker, `POST /api/security/lock`: data routes → 423, Ollama no longer holds the chat model, **the marker is not findable in any file of the data dir** (UTF-8, UTF-16 or base64), and unlocking again makes it readable through the API |
+
+Against a backend without `/api/security` (0.1) these checks SKIP. They have not yet been run on a real Mac.
+
 ## Side effects
 
 The default run is safe and fairly quick: no pulls, no deletes, no image generation. It does load the models it
@@ -77,6 +99,8 @@ only POSTed during the checker's own jobs.
   again at the end. A model that was installed before the run is never re-pulled or deleted.
 - `--allow-images` generates a handful of tiny images (from 64×64, 1–2 steps; one 30–40-step job that is
   interrupted).
+- `--allow-internet` lets the in-process Harness open its internet window (5 minutes, password-confirmed) to
+  read a few pages of huggingface.co and ollama.com through its catalogue; it blocks again right after.
 
 ## Reports
 
@@ -90,7 +114,7 @@ Home-directory paths, user names in paths and anything that looks like a key or 
 ## CI (GitHub Actions, macOS runner)
 
 ```yaml
-- run: node scripts/live-check.mjs --allow-pull --timeout-scale 3 --json "$RUNNER_TEMP/live-check.json" --markdown "$RUNNER_TEMP/live-check.md"
+- run: node scripts/live-check.mjs --allow-pull --allow-internet --timeout-scale 3 --json "$RUNNER_TEMP/live-check.json" --markdown "$RUNNER_TEMP/live-check.md"
 - if: always()
   run: cat "$RUNNER_TEMP/live-check.md" >> "$GITHUB_STEP_SUMMARY"
 ```

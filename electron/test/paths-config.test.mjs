@@ -75,9 +75,9 @@ test('loadDesktopConfig writes defaults on first run and honours env overrides',
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('menu action list is the agreed contract', () => {
+test('menu action list is the agreed contract (14 in 0.1 + lock in 0.2)', () => {
   assert.deepEqual([...MENU_ACTIONS].sort(), [
-    'command-palette', 'export-chat', 'focus-composer', 'import-chat', 'new-chat', 'open-images', 'open-memory', 'open-models',
+    'command-palette', 'export-chat', 'focus-composer', 'import-chat', 'lock', 'new-chat', 'open-images', 'open-memory', 'open-models',
     'open-settings', 'search-chats', 'show-shortcuts', 'stop-generation', 'toggle-inspector', 'toggle-sidebar',
   ]);
 });

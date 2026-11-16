@@ -12,16 +12,20 @@ import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { log } from './log.mjs';
 import { HttpError } from './errors.mjs';
-import { isHXC, isHXL, decryptHXC, decryptHXL, hxcEncryptor, hxcDecryptor, hxlHeader, hxlRecord, encryptHXL, HEADER_C, hxcPlainSize } from '../security/crypto.mjs';
+import { isHXC, isHXL, decryptHXC, decryptHXL, hxcEncryptor, hxcDecryptor, hxlHeader, hxlRecord, encryptHXL, HEADER_C, hxcPlainSize, keyIdOf } from '../security/crypto.mjs';
 
 const queues = new Map();
 
 /** Never encrypted: needed before the data is open, or not sensitive (docs/API.md §10.4). */
 export const PLAIN_FILES = new Set(['launch.json', 'vault.json', 'harness.lock', 'measurements.json', 'api-token', '.dev-keychain']);
 const LOCKED = Symbol('locked');
-const ciphers = new Map(); // dir → { key } | LOCKED
+const ciphers = new Map(); // dir → { key, oldKeys? } | { key: null, oldKeys } (decrypting) | LOCKED
 
-/** Register the cipher for everything under `dir` (`null` = plain, `'locked'` = refuse). */
+/**
+ * Register the cipher for everything under `dir`: `{ key }` writes encrypted with `key`; `{ key: null, oldKeys }`
+ * writes plain but can still read files encrypted with `oldKeys` (decrypting); `oldKeys` also lets a re-keyed
+ * directory read files still under the previous key. `null` = plain, `'locked'` = refuse.
+ */
 export function setDirCipher(dir, cipher) {
   const d = path.resolve(dir);
   if (cipher === null || cipher === undefined) ciphers.delete(d);
@@ -29,7 +33,7 @@ export function setDirCipher(dir, cipher) {
 }
 
 export const isPlainFile = (file) => PLAIN_FILES.has(path.basename(file)) || /\.log$/.test(file);
-const isLogFile = (file) => /\.items\.jsonl$|\.vectors\.bin$/.test(file);
+export const isLogFile = (file) => /\.items\.jsonl$|\.vectors\.bin$/.test(file);
 
 function entryFor(file) {
   const f = path.resolve(file);
@@ -44,13 +48,21 @@ export function writeCipherFor(file) {
   if (isPlainFile(file)) return null;
   const e = entryFor(file);
   if (e === LOCKED) throw new HttpError(423, 'locked', 'Harness is locked.');
-  return e;
+  return e?.key ? { key: e.key } : null;
 }
 
-function readKeyFor(file) {
+/** The key that opens an encrypted file whose header is `head` (the key id sits at bytes 8–16 of both formats). */
+function readKeyFor(file, head) {
   const e = entryFor(file);
   if (e === LOCKED || !e) throw new HttpError(423, 'locked', 'Harness is locked (this file is encrypted).');
-  return e.key;
+  const keys = [e.key, ...(e.oldKeys || [])].filter(Boolean);
+  if (head && head.length >= 16) {
+    const kid = head.subarray(8, 16);
+    const k = keys.find((x) => keyIdOf(x).equals(kid));
+    if (k) return k;
+  }
+  if (!keys.length) throw new HttpError(423, 'locked', 'Harness is locked (this file is encrypted).');
+  return keys[0]; // decrypt reports wrong_key
 }
 
 export async function ensureDir(dir) {
@@ -63,8 +75,8 @@ export async function exists(p) {
 
 /** Decode raw bytes read from `file` (plain stays plain). */
 export function decodeData(file, raw) {
-  if (isHXC(raw)) return decryptHXC(readKeyFor(file), raw);
-  if (isHXL(raw)) return decryptHXL(readKeyFor(file), raw);
+  if (isHXC(raw)) return decryptHXC(readKeyFor(file, raw), raw);
+  if (isHXL(raw)) return decryptHXL(readKeyFor(file, raw), raw);
   return raw;
 }
 
@@ -89,6 +101,8 @@ export async function readJson(file, fallback = null) {
   let txt;
   try { txt = decodeData(file, raw).toString('utf8'); } catch (e) {
     if (e.status === 423) throw e;
+    // Another key's file is never "corrupt": leave it exactly as it is and fail clearly.
+    if (e.code === 'wrong_key') throw new HttpError(500, 'wrong_key', 'A data file was encrypted with a different key; nothing was changed.');
     const bak = `${file}.corrupt-${Date.now()}`;
     await fs.rename(file, bak).catch(() => {});
     log.warn(`Unreadable encrypted file ${path.basename(file)} (${e.code || 'error'}); moved aside`);
@@ -176,12 +190,11 @@ export function appendData(file, data) {
       await fs.appendFile(file, buf, { mode: 0o600 });
       return;
     }
-    if (head && isHXL(head)) {
-      if (!head.subarray(8, 16).equals(hxlHeader(cipher.key).subarray(8, 16))) throw new HttpError(500, 'wrong_key', 'Index file encrypted with another key');
+    if (head && isHXL(head) && head.subarray(8, 16).equals(hxlHeader(cipher.key).subarray(8, 16))) {
       await fs.appendFile(file, hxlRecord(cipher.key, buf));
       return;
     }
-    // missing, empty, or plain (half-migrated): (re)write as an encrypted log
+    // missing, empty, plain (half-migrated) or under the previous key (re-keying): (re)write as an encrypted log
     const prev = head && head.length ? decodeData(file, await fs.readFile(file)) : Buffer.alloc(0);
     await doWrite(file, Buffer.concat([prev, buf]), null, { cipherOverride: { key: cipher.key } });
   });
@@ -214,7 +227,7 @@ export function createDataReadStream(file) {
           fh = await fs.open(file, 'r');
           const h = Buffer.alloc(HEADER_C);
           const { bytesRead } = await fh.read(h, 0, HEADER_C, 0);
-          if (bytesRead >= 4 && isHXC(h)) { dec = hxcDecryptor(readKeyFor(file), h.subarray(0, bytesRead)); pos = HEADER_C; } else if (bytesRead >= 4 && isHXL(h)) {
+          if (bytesRead >= 4 && isHXC(h)) { dec = hxcDecryptor(readKeyFor(file, h), h.subarray(0, bytesRead)); pos = HEADER_C; } else if (bytesRead >= 4 && isHXL(h)) {
             const all = await readFileData(file);
             this.push(all);
             this.push(null);

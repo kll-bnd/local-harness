@@ -47,6 +47,8 @@ export function createStore(initial = {}) {
       em.emit(k, next, prev);
     },
     update(k, fn) { this.set(k, fn(state[k])); },
+    /** Forget every value and subscriber, without notifying anyone (Harness is locking). */
+    clear() { for (const k of Object.keys(state)) delete state[k]; em.map.clear(); },
     on: (k, fn) => em.on(k, fn),
     watch(keys, fn) {
       let queued = false;

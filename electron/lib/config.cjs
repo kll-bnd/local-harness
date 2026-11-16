@@ -7,7 +7,7 @@ const path = require('node:path');
 const MENU_ACTIONS = Object.freeze([
   'new-chat', 'open-settings', 'toggle-sidebar', 'toggle-inspector', 'search-chats', 'command-palette',
   'open-models', 'open-images', 'open-memory', 'focus-composer', 'stop-generation', 'export-chat',
-  'import-chat', 'show-shortcuts',
+  'import-chat', 'show-shortcuts', 'lock',
 ]);
 
 const DEFAULT_PORT = 4747;

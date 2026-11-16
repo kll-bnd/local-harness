@@ -11,6 +11,7 @@ import { makeTextOnlyCopy } from './model-flows.js';
 import { openDialog, confirmDialog, toast, openMenu } from '../ui/overlays.js';
 import { showError } from '../errors.js';
 import { runAction } from '../actions.js';
+import { CatalogBrowser, ModelPage, SOURCES } from './catalog.js';
 
 export class ModelsView {
   constructor(shell) {
@@ -19,21 +20,54 @@ export class ModelsView {
     this.scroller = h('div.view-scroll', this.page);
     this.el = h('div.view', this.scroller);
     this.busy = new Set();
-    store.watch(['models', 'system', 'recommended', 'pulls', 'defaultModel', 'settings'], () => this.render());
+    this.tab = 'local';
+    this.browsers = {}; // source → CatalogBrowser (kept, so going back keeps the list and filters)
+    this.modelPage = null;
+    this.tabsEl = h('div.segmented.models-tabs', { role: 'tablist', attrs: { 'aria-label': 'Models' } });
+    this.headEl = h('div.page-head.models-head');
+    this.bodyEl = h('div.models-body');
+    add(this.page, this.headEl, this.bodyEl);
+    store.watch(['models', 'system', 'recommended', 'pulls', 'defaultModel', 'settings'], () => { if (this.tab === 'local' && !this.modelId) this.render(); else this.renderHead(); });
     this.scroller.addEventListener('scroll', () => this.shell.setScrolled(this.scroller.scrollTop > 4), { passive: true });
   }
 
-  show() {
-    api.models.textOnlyCopies().then((r) => { this.copies = r.copies || []; this.render(); }).catch(() => {});
+  show(r = {}) {
+    const prevKey = `${this.tab}|${this.modelId || ''}`;
+    this.tab = r.tab || 'local';
+    this.modelId = r.id || null;
+    if (`${this.tab}|${this.modelId || ''}` !== prevKey && !(this.modelId === null && this.tab !== 'local' && this.browsers[this.tab])) this.scroller.scrollTop = 0;
+    if (this.modelId) {
+      this.modelPage ||= new ModelPage();
+      this.renderHead();
+      mount(this.bodyEl, this.modelPage.el);
+      this.modelPage.load(this.tab, this.modelId);
+      return;
+    }
+    if (this.tab !== 'local') {
+      if (!this.browsers[this.tab]) this.browsers[this.tab] = new CatalogBrowser(this.tab, { scroller: this.scroller });
+      this.renderHead();
+      mount(this.bodyEl, this.browsers[this.tab].el);
+      this.browsers[this.tab].show();
+      return;
+    }
+    api.models.textOnlyCopies().then((x) => { this.copies = x.copies || []; if (this.tab === 'local') this.render(); }).catch(() => {});
     this.render();
     loadModels({ refresh: true }).catch(() => {});
     loadSystem().catch(() => {});
     loadRecommended().catch(() => {});
   }
 
-  toolbar() { return { title: h('div.tb-title.page-title', h('span.title-text', 'Models')), actions: [h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Refresh')] }; }
+  toolbar() { return { title: h('div.tb-title.page-title', h('span.title-text', 'Models')), actions: this.tab === 'local' && !this.modelId ? [h('button.btn.btn-small.btn-ghost', { type: 'button', on: { click: () => runAction('refresh-backends') } }, icon('reload', { size: 13 }), 'Refresh')] : [] }; }
+
+  renderHead() {
+    const models = store.get('models');
+    const tab = (id, label) => h('a', { href: `#/models${id === 'local' ? '' : `/${id}`}`, role: 'tab', 'aria-selected': String(this.tab === id), dataset: { tab: id } }, label);
+    mount(this.tabsEl, tab('local', 'On this Mac'), tab('ollama', SOURCES.ollama.label), tab('huggingface', SOURCES.huggingface.label));
+    mount(this.headEl, h('h1.h1', 'Models'), this.tab === 'local' && !this.modelId && models ? h('span.muted', plural(models.length, 'model')) : null, h('span.spacer'), this.tabsEl);
+  }
 
   render() {
+    this.renderHead();
     const models = store.get('models');
     const sys = store.get('system');
     const loaded = sys?.loadedModels || [];
@@ -95,11 +129,14 @@ export class ModelsView {
     const pullBtn = h('button.btn', { type: 'button', disabled: !canPull, on: { click: () => { const v = name.value.trim(); if (v) { pullModel({ model: v }); name.value = ''; } } } }, icon('download', { size: 14 }), 'Download');
     name.addEventListener('keydown', (e) => { if (e.key === 'Enter') pullBtn.click(); });
 
-    mount(this.page, 
-      h('div.page-head', h('h1.h1', 'Models'), models ? h('span.muted', plural(models.length, 'model')) : null),
+    mount(this.bodyEl,
       loadedSec,
       downloads,
       h('section.panel-section', h('div.section-head', h('h2.h2', 'Installed')), installed),
+      h('section.panel-section.browse-cta',
+        h('div.section-head', h('h2.h2', 'Find more models'), h('span.spacer'),
+          h('a.btn.btn-small', { href: '#/models/ollama' }, SOURCES.ollama.label), h('a.btn.btn-small', { href: '#/models/huggingface' }, SOURCES.huggingface.label)),
+        h('p.field-help', 'Browse what people use most, newest first, or what fits this Mac — no need to know a name.')),
       h('section.panel-section',
         h('h2.h2', 'Download by name'),
         h('p.field-help', 'Any model from the Ollama library or a GGUF on Hugging Face (hf.co/…).'),

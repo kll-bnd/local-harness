@@ -5,6 +5,7 @@ import { store, loadModels, loadRecommended, dropModelInfo, loadSystem } from '.
 import { toast } from '../ui/overlays.js';
 import { showError } from '../errors.js';
 import { modelLabel } from '../lib/format.js';
+import { withInternet } from './network.js';
 
 const local = new Map(); // model → { controller, key }
 
@@ -33,15 +34,20 @@ export function activePulls() {
   return Object.values(store.get('pulls') || {}).filter((p) => !p.done);
 }
 
-export async function pullModel({ model, providerId, quiet = false }) {
+/**
+ * Download a model. textOnlyCopy: also make the text-only copy right after (low-RAM Macs, docs/API.md 10.8);
+ * resolves true on success. Refused with offline_lock → the "Allow internet" prompt, then it starts again.
+ */
+export async function pullModel({ model, providerId, quiet = false, textOnlyCopy = false, retried = false }) {
   if (local.has(model)) return false;
   const controller = new AbortController();
   let key = `local:${model}:${Date.now()}`;
   local.set(model, { controller, key });
   setPull(key, { model, providerId: providerId || 'ollama', status: 'Starting…', percent: null, done: false });
   let failed = null;
+  let done = null;
   try {
-    const r = await api.models.pull({ model, providerId }, (ev) => {
+    const r = await withInternet(() => api.models.pull({ model, providerId, ...(textOnlyCopy ? { textOnlyCopy: true } : {}) }, (ev) => {
       if (ev.type === 'start') {
         if (ev.warning?.message) toast({ kind: 'warn', message: 'This download is not recommended', detail: ev.warning.message, id: `pullwarn-${model}`, timeout: 12000 });
         dropPull(key);
@@ -51,24 +57,37 @@ export async function pullModel({ model, providerId, quiet = false }) {
       } else if (ev.type === 'progress') {
         setPull(key, { status: ev.status, percent: ev.percent, total: ev.total, completed: ev.completed, done: false });
       } else if (ev.type === 'done') {
+        done = ev;
         setPull(key, { status: 'success', percent: 100, done: true });
       } else if (ev.type === 'error') {
         failed = ev;
         setPull(key, { status: ev.code === 'aborted' ? 'aborted' : 'error', error: ev.message, done: true });
       }
-    }, { signal: controller.signal });
+    }, { signal: controller.signal }));
     if (r.aborted) {
       setPull(key, { status: 'aborted', done: true });
       toast({ message: `Download of ${modelLabel(model)} cancelled`, id: `pull-${model}` });
+      return false;
+    } else if (failed?.code === 'offline_lock' && !retried) {
+      // Refused by the offline lock after it started: same prompt, then once more.
+      dropPull(key);
+      local.delete(model);
+      const { requestInternet } = await import('./network.js');
+      if (await requestInternet(failed.details || {})) return await pullModel({ model, providerId, quiet, textOnlyCopy, retried: true });
       return false;
     } else if (failed) {
       toast({ kind: 'error', message: `Couldn't download ${modelLabel(model)}`, detail: failed.message, id: `pull-${model}` });
       return false;
     }
-    if (!quiet) toast({ kind: 'success', message: `${modelLabel(model)} is ready`, id: `pull-${model}` });
+    if (done?.textOnlyCopyError) {
+      toast({ kind: 'warn', message: `${modelLabel(model)} downloaded, but the text-only copy failed`, detail: done.textOnlyCopyError.message || String(done.textOnlyCopyError), id: `pull-${model}`, timeout: 12000 });
+    } else if (!quiet) {
+      const copy = done?.textOnlyCopy?.model;
+      toast({ kind: 'success', message: copy ? `${modelLabel(copy)} is ready` : `${modelLabel(model)} is ready`, detail: copy ? 'Downloaded and set up as a text-only copy, which needs less memory on this Mac.' : null, id: `pull-${model}` });
+    }
     dropModelInfo();
     await Promise.allSettled([loadModels({ refresh: true }), loadRecommended(), loadSystem()]);
-    return true;
+    return done?.textOnlyCopy ? { textOnlyCopy: done.textOnlyCopy } : true;
   } catch (e) {
     setPull(key, { status: 'error', error: e.message, done: true });
     showError(e, `download ${modelLabel(model)}`);

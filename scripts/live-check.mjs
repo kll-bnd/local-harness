@@ -50,6 +50,7 @@ const OPTIONS = [
   ['allow-pull', 'bool', 'allow pulling (and later deleting) --pull-model; never deletes a model it did not pull'],
   ['pull-model', 'str', 'tiny model used for pull/delete checks (default all-minilm:22m, ~46 MB)'],
   ['allow-images', 'bool', 'allow generating images (tiny sizes, 1-2 steps) on the image backends'],
+  ['allow-internet', 'bool', 'Harness 0.2: let the in-process Harness open its internet window (password-confirmed) to test the live model catalogue (huggingface.co, ollama.com); blocked again right after'],
   ['keep-alive', 'str', 'keep_alive used by the probes (default "5m")'],
   ['timeout-scale', 'num', 'multiply every timeout (slow machines: 2 or 3)'],
   ['simulate-ram-gb', 'num', 'make the in-process Harness believe the machine has this much RAM'],
@@ -117,6 +118,7 @@ export function parseOptions(argv) {
     allowPull: !!o['allow-pull'],
     pullModel: o['pull-model'] || 'all-minilm:22m',
     allowImages: !!o['allow-images'],
+    allowInternet: !!o['allow-internet'],
     keepAlive: o['keep-alive'] || '5m',
     timeoutScale: o['timeout-scale'] || 1,
     simulateRamGb: o['simulate-ram-gb'] || null,
@@ -171,9 +173,12 @@ export function redact(s) {
   t = t.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, '$1 <redacted>');
   t = t.replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}/g, '<redacted-key>').replace(/\bhf_[A-Za-z0-9]{16,}/g, '<redacted-token>').replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, '<redacted-token>');
   t = t.replace(/((?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|password|passwd|secret|authorization)"?\s*[:=]\s*"?)([^"\s,}&]{4,})/gi, '$1<redacted>');
+  // Harness 0.2: recovery keys, session cookies/tokens and launch codes never reach a report.
+  t = t.replace(/\bHRK1(?:[-\s]?[0-9A-Za-z]{4}){4,}/g, 'HRK1-<redacted>').replace(/(harness_session=)[^;\s"]+/g, '$1<redacted>').replace(/(#launch=)[^\s"&]+/g, '$1<redacted>');
+  t = t.replace(/((?:sessionToken|recoveryKey|newPassword|confirmation)"?\s*[:=]\s*"?)([^"\s,}&]{4,})/g, '$1<redacted>');
   return t;
 }
-const SECRET_KEYS = /^(api[_-]?key|apikey|authorization|password|secret|token|access[_-]?token)$/i;
+const SECRET_KEYS = /^(api[_-]?key|apikey|authorization|password|newPassword|secret|token|access[_-]?token|sessionToken|recoveryKey|cookie|confirmation)$/i;
 export function redactDeep(v, depth = 0) {
   if (depth > 40) return v;
   if (typeof v === 'string') return redact(v);
@@ -364,6 +369,12 @@ const SRC = {
   oiGen: ['server/image/openai-images.mjs', "'/v1/images/generations'", 'OpenAIImagesProvider.generate'],
   // e2e
   startServer: ['server/index.mjs', 'export async function startServer', 'startServer'],
+  // Harness 0.2 security (docs/API.md §10)
+  secAuth: ['server/security/auth.mjs', 'check(req)', 'Auth.check (sessions, api-token)'],
+  secVault: ['server/security/vault.mjs', 'export class Vault', 'Vault (wrapped data key, unlock throttle)'],
+  secCrypto: ['server/security/crypto.mjs', "export const MAGIC_C = Buffer.from('HXC1')", 'HXC1 encrypted file format'],
+  egress: ['server/security/egress.mjs', 'export function assertEgress', 'assertEgress (the single outbound choke point)'],
+  netGuard: ['server/security/network.mjs', 'export class NetworkGuard', 'NetworkGuard (allow window, self-test)'],
   routeProviders: ['server/routes/models.mjs', "r.get('/api/providers'", 'GET /api/providers'],
   routeModels: ['server/routes/models.mjs', "r.get('/api/models',", 'GET /api/models'],
   routeContext: ['server/routes/models.mjs', "'/api/models/context'", 'GET /api/models/context'],
@@ -538,6 +549,22 @@ def('e2e.embeddings', 'e2e', 'With an embedding model, memory search runs in hyb
 def('e2e.openai_chat.{sid}', 'e2e', 'A chat turn through an OpenAI-compatible provider streams tokens and real usage; its plan uses the server context', ['engineRun', 'planServer']);
 def('e2e.pull_delete', 'e2e', 'POST /api/models/pull streams progress→done and DELETE /api/models removes the model', ['routePull', 'routeDelete']);
 def('e2e.image_direct.{kind}', 'e2e', 'POST /api/images/generate streams image_job → image_status… → image → image_done → done and stores a real image', ['imgRun']);
+def('e2e.setup', 'e2e', 'Harness 0.2 first start: needs_setup → POST /api/security/setup returns a recovery key (once) and a session', ['secVault', 'secAuth']);
+def('e2e.auth_required', 'e2e', 'Without a session the data routes answer 401 auth_required; /api/health and /api/security still answer', ['secAuth']);
+def('e2e.wrong_password', 'e2e', 'A wrong password → 401 wrong_password with details.retryAfterMs; the right one gives a new session', ['secVault']);
+def('e2e.blocker.default', 'e2e', 'Internet access is blocked by default and the backend self-test (POST /api/network/test) reports blocked', ['netGuard', 'egress']);
+def('e2e.blocker.catalog', 'e2e', 'While blocked, the online model catalogue answers 403 offline_lock (model_catalog, with the allow hint); source=local works', ['egress']);
+def('e2e.blocker.pull', 'e2e', 'While blocked, POST /api/models/pull answers 403 offline_lock (model_download) as JSON before any SSE', ['egress']);
+def('e2e.blocker.fetch_url', 'e2e', 'While blocked, fetch_url is not offered to the model, and a call anyway gets an error result', ['egress', 'toolsFor']);
+def('e2e.blocker.allow', 'e2e', 'Allowing internet needs the password (403 confirmation_required without, 401 when wrong) and opens a window until allowedUntil', ['netGuard']);
+def('e2e.catalog.huggingface', 'e2e', 'While allowed (--allow-internet): the Hugging Face adapter parses the live site — a list page and the Nemotron repository with its GGUF files', []);
+def('e2e.catalog.ollama', 'e2e', 'While allowed (--allow-internet): the Ollama-library adapter parses ollama.com — the list and one model\'s tags', []);
+def('e2e.blocker.reblock', 'e2e', 'POST /api/network/block blocks again at once: the online catalogue answers offline_lock again', ['netGuard', 'egress']);
+def('e2e.blocker.sandboxed_ollama', 'e2e', 'macOS: an Ollama that Harness starts while blocked runs in the sandbox — a pull sent straight to it fails and the self-test\'s OS probe is blocked', ['netGuard']);
+def('e2e.lock.routes', 'e2e', 'After POST /api/security/lock the data routes answer 423 locked (chats, memories, settings, ui-state, events); health and security answer', ['secAuth']);
+def('e2e.lock.models_unloaded', 'e2e', 'Locking unloads the models Harness loaded: Ollama /api/ps no longer lists the chat model', ['unload']);
+def('e2e.lock.marker_not_on_disk', 'e2e', 'After a chat and a memory with a unique marker, the marker is not findable in any file of the data directory (encrypted at rest)', ['secCrypto']);
+def('e2e.lock.unlock_again', 'e2e', 'Unlocking with the password opens the same data again: the marker memory is readable through the API', ['secVault', 'secCrypto']);
 def('e2e.image_tool', 'e2e', 'The generate_image tool inside a chat produces an image, with unload → generate → reload of the chat model', ['imageTool', 'imgRun', 'decideUnload', 'imageUnload', 'reloadStatus']);
 
 function catalogFor(id) {
@@ -702,9 +729,16 @@ function headersOf(res) {
 }
 
 /** One HTTP request; never throws. → { ok, status, headers, text, json, buf, ms, error, timeout } */
-async function http(base, p, { method = 'GET', body, headers = {}, timeoutMs = 10000, signal, apiKey, binary = false } = {}) {
+/**
+ * Session for the in-process Harness (0.2, docs/API.md §10.5): requests to `base` carry these headers unless they
+ * pass `noAuth: true`. Set by the e2e group after setup/unlock; never printed (redact() also masks it).
+ */
+let harnessAuth = null; // { base, headers }
+const authFor = (url, noAuth) => (!noAuth && harnessAuth && (url === harnessAuth.base || url.startsWith(`${harnessAuth.base}/`)) ? harnessAuth.headers : {});
+
+async function http(base, p, { method = 'GET', body, headers = {}, timeoutMs = 10000, signal, apiKey, binary = false, noAuth = false } = {}) {
   const t0 = nowMs();
-  const h = { ...headers };
+  const h = { ...authFor(base, noAuth), ...headers };
   const payload = encodeBody(body, h);
   if (apiKey) h.authorization = `Bearer ${apiKey}`;
   const sig = anySignal([signal, ACTIVE.signal], timeoutMs);
@@ -717,7 +751,7 @@ async function http(base, p, { method = 'GET', body, headers = {}, timeoutMs = 1
     let json;
     if (text) { try { json = JSON.parse(text); } catch { json = undefined; } }
     const status = res.statusCode;
-    return { ok: status >= 200 && status < 300, status, headers: headersOf(res), text, json, buf: binary ? buf : null, ms: nowMs() - t0 };
+    return { ok: status >= 200 && status < 300, status, headers: headersOf(res), setCookie: res.headers['set-cookie'] || null, text, json, buf: binary ? buf : null, ms: nowMs() - t0 };
   } catch (e) {
     return { ok: false, status: 0, error: errText(e), timeout: e?.name === 'TimeoutError', ms: nowMs() - t0 };
   }
@@ -734,7 +768,7 @@ const httpSummary = (r) => (r.status ? `${hs(r)} ${excerpt(r.text ?? '', 300)}` 
 async function streamLines(url, { method = 'POST', body, headers = {}, timeoutMs = 120000, signal, onLine, apiKey } = {}) {
   const t0 = nowMs();
   const out = { status: 0, ok: false, contentType: null, lines: [], firstByteMs: null, totalMs: null, error: null, aborted: false, bodyText: null };
-  const h = { ...headers };
+  const h = { ...authFor(url, false), ...headers };
   const payload = encodeBody(body, h);
   if (apiKey) h.authorization = `Bearer ${apiKey}`;
   const sig = anySignal([signal, ACTIVE.signal], timeoutMs);
@@ -2655,7 +2689,17 @@ async function e2eGroup(run, B) {
   let dataDir = null;
   let srv = null;
   let base = null;
+  const sec = { setup: null };
   const api = (method, p, body, timeoutMs = 60000) => http(base, p, { method, body, timeoutMs: T(timeoutMs) });
+  /** 0.2: open the internet window for one step (password-confirmed); returns whether this call opened it. */
+  const allowInternet = async (minutes = 10) => {
+    const n = await api('GET', '/api/network');
+    const o = n.json?.offlineLock || n.json;
+    if (!n.ok || !o?.blocked) return false;
+    const r = await api('POST', '/api/network/allow', { minutes, password: sec.setup?.password });
+    return r.ok;
+  };
+  const blockInternet = () => api('POST', '/api/network/block', {});
   const newChat = async (chatSettings) => {
     const r = await api('POST', '/api/chats', { settings: chatSettings });
     if (r.status !== 201) throw new Error(`POST /api/chats → ${hs(r)}: ${excerpt(r.json ?? r.text, 200)}`);
@@ -2666,18 +2710,23 @@ async function e2eGroup(run, B) {
   const turnFail = (t) => (t.error ? `${t.error.code || 'error'}: ${excerpt(t.error.message, 300)}` : !t.last('done') ? `stream ended without done (${evTypes(t)})` : null);
 
   await run.check('e2e.server', async () => {
-    need(chatRef || imgs.length, 'no chat model and no image backend to drive', 'a reachable backend with a usable model');
+    need(chatRef || imgs.length || B.ollama, 'no chat model and no image backend to drive', 'a reachable backend with a usable model');
     dataDir = await fsp.mkdtemp(path.join(run.opts.dataDir || os.tmpdir(), 'harness-livecheck-'));
-    await fsp.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify(settings, null, 2));
     process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1';
     const { startServer } = await import(pathToFileURL(path.join(ROOT, 'server/index.mjs')).href);
     const system = run.opts.simulateRamGb ? { totalMem: Math.round(run.opts.simulateRamGb * GiB) } : undefined;
+    // The real defaults (password mode, internet blocked): a throw-away password set up through the API, as a
+    // user would in the setup screen. It lives in this process's memory only and is never printed.
     srv = await startServer({ port: 0, dataDir, autodetect: true, logLevel: run.opts.verbose ? 'warn' : 'silent', system });
     base = srv.url;
+    sec.setup = await e2eSetup(run, base);
+    if (sec.setup.error) return FAIL(sec.setup.error, { info: sec.setup.info });
+    const ps = await api('PATCH', '/api/settings', settings);
+    if (!ps.ok) return FAIL(`PATCH /api/settings (wiring the detected backends) → ${httpSummary(ps)}`, { info: sec.setup.info });
     const h = await api('GET', '/api/health');
     const sys = await api('GET', '/api/system');
     const m = sys.json?.machine;
-    const info = [`data dir ${dataDir}`, m ? `Harness sees ${fmtBytes(m.totalMemBytes)} RAM (tier ${m.ramTier}), safe budget ${fmtBytes(m.memoryBudget?.budgetBytes)}, ${m.platform}/${m.arch} ${m.chip}` : `GET /api/system → ${sys.status}`];
+    const info = [`data dir ${dataDir}`, ...(sec.setup.info || []), m ? `Harness sees ${fmtBytes(m.totalMemBytes)} RAM (tier ${m.ramTier}), safe budget ${fmtBytes(m.memoryBudget?.budgetBytes)}, ${m.platform}/${m.arch} ${m.chip}` : `GET /api/system → ${sys.status}`];
     if (!h.ok) return FAIL(`GET /api/health → ${httpSummary(h)}`, { info });
     return PASS(`listening on ${base}${chatRef ? `, default model ${chatRef.providerId}/${chatRef.model}` : ''}`, { info });
   }, { timeoutMs: 60000 });
@@ -2913,7 +2962,9 @@ async function e2eGroup(run, B) {
       const PM = run.opts.pullModel;
       const before = O?.installedBefore.size ? O.installedBefore : new Set(((await http(B.ollama.url, '/api/tags', { timeoutMs: T(15000) })).json?.models || []).map((m) => m.model || m.name));
       const userOwned = [...before].some((m) => sameModel(m, PM));
-      const t = await harnessSse(base, '/api/models/pull', { model: PM, providerId: 'ollama' }, { timeoutMs: T(1800000) });
+      const opened = await allowInternet(30); // 0.2: downloads need the internet window
+      let t;
+      try { t = await harnessSse(base, '/api/models/pull', { model: PM, providerId: 'ollama' }, { timeoutMs: T(1800000) }); } finally { if (opened) await blockInternet(); }
       const prog = t.by('progress');
       sample('harness POST /api/models/pull (SSE)', { sequence: evTypes(t), first: prog.slice(0, 3), last: prog.slice(-2), done: t.last('done'), error: t.error });
       if (t.error || !t.last('done')) return FAIL(`pull failed: ${t.error?.message || evTypes(t)}`);
@@ -2981,10 +3032,423 @@ async function e2eGroup(run, B) {
       if (psAtGenerating?.listed) return WARN(`${TM} was still in /api/ps when the diffusion job started`, { info, fix: 'ImageService._waitUnloaded gave up (or is missing): see ollama.unload.chat for how long unloading takes here.' });
       return PASS('tool → unload → generate → image → reload → answer', { info });
     }, { timeoutMs: 1600000 });
+
+    await e2eSecurityChecks(run, B, { base, api, dataDir, sec, chatRef, toolModel: TM, newChat, turn, params, allowInternet, blockInternet });
   } finally {
+    harnessAuth = null;
     if (srv) await srv.close().catch(() => {});
     if (dataDir && !run.opts.keepData) await fsp.rm(dataDir, { recursive: true, force: true }).catch(() => {});
     else if (dataDir) run.notes.push(`kept Harness data dir ${dataDir}`);
+  }
+}
+
+// =============================================================================================== Harness 0.2 security
+/**
+ * First start of the in-process Harness: with 0.2 defaults it is in `needs_setup`. Choose a throw-away password
+ * (kept in memory only), set it up through the API like the setup screen does, and use the returned session for
+ * every later request to `base`. A backend without /api/security (0.1) needs nothing.
+ * → { password, info, recoveryKeyOk, initial, error }
+ */
+async function e2eSetup(run, base) {
+  const T = (ms) => run.T(ms);
+  const out = { password: null, info: [], recoveryKeyOk: null, initial: null, error: null };
+  const s0 = await http(base, '/api/security', { timeoutMs: T(10000), noAuth: true });
+  if (!s0.ok || !s0.json?.state) { out.info.push('backend without /api/security (pre-0.2): no setup needed'); return out; }
+  out.initial = { state: s0.json.state, mode: s0.json.mode, offlineLock: s0.json.offlineLock, transport: s0.json.transport };
+  out.info.push(`security at start: state ${s0.json.state}, mode ${s0.json.mode}, internet ${s0.json.offlineLock?.blocked ? 'blocked' : 'not blocked'} (osScope ${s0.json.offlineLock?.osScope})`);
+  if (s0.json.state !== 'needs_setup') { out.error = `a fresh data dir should be in needs_setup, got ${s0.json.state}`; return out; }
+  const password = crypto.randomBytes(18).toString('base64url');
+  const r = await http(base, '/api/security/setup', { method: 'POST', body: { password }, timeoutMs: T(180000), noAuth: true });
+  if (!r.ok) { out.error = `POST /api/security/setup → ${httpSummary(r)}`; return out; }
+  out.password = password;
+  // Shape only: 'HRK1-' + 13 groups of 4 Crockford base32 characters. Never stored or printed.
+  out.recoveryKeyOk = /^HRK1(-[0-9A-HJKMNP-TV-Z]{4}){13}$/i.test(String(r.json?.recoveryKey || ''));
+  out.setupState = r.json?.state;
+  const token = r.json?.sessionToken;
+  const cookie = [].concat(r.setCookie || []).map((c) => String(c).split(';')[0]).find((c) => c.startsWith('harness_session='));
+  out.sessionVia = token ? 'sessionToken' : cookie ? 'cookie' : null;
+  harnessAuth = { base, headers: token ? { authorization: `Bearer ${token}` } : cookie ? { cookie } : {} };
+  for (let i = 0; i < 300; i++) {
+    const s = await http(base, '/api/security', { timeoutMs: T(10000) });
+    if (s.json?.state === 'unlocked') break;
+    if (s.json?.migration?.error) { out.error = `setup migration failed: ${s.json.migration.error}`; return out; }
+    await sleep(500);
+  }
+  out.info.push(`set up a throw-away password; session via ${out.sessionVia || 'nothing (!)'}; recovery key ${out.recoveryKeyOk ? 'has the documented shape' : 'MISSING or malformed'}`);
+  return out;
+}
+
+/** A free TCP port on 127.0.0.1. */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => { const { port } = srv.address(); srv.close(() => resolve(port)); });
+  });
+}
+
+/** Where a piece of server code lives, found by content (adapters are named by what they fetch). */
+function findSource(re) {
+  const hits = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.mjs')) {
+        const lines = fs.readFileSync(p, 'utf8').split('\n');
+        const i = lines.findIndex((l) => re.test(l));
+        if (i >= 0) hits.push(`${path.relative(ROOT, p)}:${i + 1}`);
+      }
+    }
+  };
+  try { walk(path.join(ROOT, 'server')); } catch { /* */ }
+  return hits;
+}
+
+/** Every file under dir whose bytes contain one of the needles. */
+function filesContaining(dir, needles) {
+  const found = [];
+  const walk = (d) => {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) {
+        let buf;
+        try { buf = fs.readFileSync(p); } catch { continue; }
+        for (const n of needles) if (buf.includes(n)) { found.push({ file: path.relative(dir, p), as: n.label }); break; }
+      }
+    }
+  };
+  walk(dir);
+  return found;
+}
+
+async function e2eSecurityChecks(run, B, ctx) {
+  const T = (ms) => run.T(ms);
+  const { base, api, dataDir, sec, chatRef, toolModel, newChat, turn, params } = ctx;
+  const v02 = !!sec.setup?.initial;
+  const needV02 = () => need(v02, 'the backend has no /api/security (pre-0.2)', 'Harness 0.2');
+  const raw = (method, p, body) => http(base, p, { method, body, timeoutMs: T(30000), noAuth: true });
+
+  await run.check('e2e.setup', async () => {
+    needV02();
+    const s = sec.setup;
+    const info = [...s.info, `setup answered state ${s.setupState}`];
+    if (!s.recoveryKeyOk) return FAIL('setup did not return a recovery key in the documented shape (HRK1- + 13 groups of 4)', { info });
+    if (!s.sessionVia) return FAIL('setup returned neither a sessionToken nor a harness_session cookie', { info, fix: 'docs/API.md §10.3/10.5: setup gives the caller a session.' });
+    const r = await api('GET', '/api/auth/status');
+    if (!r.json?.authenticated) return FAIL(`the setup session is not authenticated: GET /api/auth/status → ${httpSummary(r)}`, { info });
+    return PASS(`unlocked with a session (${s.sessionVia})`, { info });
+  });
+
+  await run.check('e2e.auth_required', async () => {
+    needV02();
+    const h = await raw('GET', '/api/health');
+    const sq = await raw('GET', '/api/security');
+    const d = await raw('GET', '/api/chats');
+    const info = [`GET /api/health → ${hs(h)} state ${h.json?.state}`, `GET /api/security → ${hs(sq)} session.authenticated ${sq.json?.session?.authenticated}`, `GET /api/chats without a session → ${httpSummary(d)}`];
+    if (!h.ok || !sq.ok) return FAIL('health/security must answer without a session', { info });
+    if (d.status !== 401 || d.json?.error?.code !== 'auth_required') return FAIL(`data route without a session → ${hs(d)} ${d.json?.error?.code || ''}, expected 401 auth_required`, { info });
+    if (sq.json?.session?.authenticated !== false) return FAIL('GET /api/security without a session reports authenticated', { info });
+    return PASS('401 auth_required without a session', { info });
+  });
+
+  await run.check('e2e.wrong_password', async () => {
+    needV02();
+    const w = await raw('POST', '/api/security/unlock', { password: `${sec.setup.password}-wrong` });
+    const info = [`wrong password → ${httpSummary(w)}`];
+    if (w.status !== 401 || w.json?.error?.code !== 'wrong_password') return FAIL(`expected 401 wrong_password, got ${hs(w)} ${w.json?.error?.code || ''}`, { info });
+    if (typeof w.json?.error?.details?.retryAfterMs !== 'number') return FAIL('401 wrong_password without details.retryAfterMs', { info });
+    const ok = await raw('POST', '/api/security/unlock', { password: sec.setup.password });
+    info.push(`right password → ${hs(ok)}, sessionToken ${ok.json?.sessionToken ? 'present' : 'absent'}, cookie ${ok.setCookie ? 'set' : 'not set'}`);
+    if (!ok.ok) return FAIL('the right password was refused after one wrong attempt', { info });
+    if (!ok.json?.sessionToken) return WARN('unlock gives no sessionToken in the body (CLI tools then fall back to the cookie)', { info, fix: 'docs/API.md §10.5 says CLI tools use the returned sessionToken.' });
+    return PASS(`retryAfterMs ${w.json.error.details.retryAfterMs} after one failure; unlock returns a sessionToken`, { info });
+  });
+
+  let netInfo = null;
+  await run.check('e2e.blocker.default', async ({ sample }) => {
+    needV02();
+    const n = await api('GET', '/api/network');
+    const t = await api('POST', '/api/network/test', {}, 60000);
+    sample('harness POST /api/network/test', t.json);
+    netInfo = n.json?.offlineLock || (n.ok ? n.json : null); // GET /api/network answers the offlineLock object itself
+    const results = t.json?.results || [];
+    const info = [`offlineLock: ${JSON.stringify(netInfo)}`, ...results.map((r) => `self-test ${r.layer} ${r.target}: ${r.result}${r.detail ? ` — ${excerpt(r.detail, 120)}` : ''}`)];
+    if (!netInfo?.enabled || !netInfo?.blocked) return FAIL('a fresh install must block internet access', { info });
+    if (!t.ok || t.json?.blocked !== true) return FAIL(`self-test → ${httpSummary(t)}`, { info });
+    if (results.some((r) => r.result === 'reachable')) return FAIL('the self-test reached a public address while blocked', { info });
+    return PASS(`blocked; ${results.length} self-test probe(s), osScope ${netInfo.osScope}, osEnforced ${netInfo.osEnforced}`, { info });
+  });
+
+  const offline = (r, what) => r.status === 403 && r.json?.error?.code === 'offline_lock' && (!what || r.json?.error?.details?.what === what);
+  const noRoute = (r) => r.status === 404 && r.json?.error?.code === 'not_found';
+  let catalogRoute = true;
+  await run.check('e2e.blocker.catalog', async () => {
+    needV02();
+    const probe = await api('GET', '/api/catalog?source=local');
+    catalogRoute = !noRoute(probe);
+    need(catalogRoute, 'this backend has no /api/catalog route yet', 'the 0.2 model catalogue (docs/API.md §10.8)');
+    const hf = await api('GET', '/api/catalog?source=huggingface&limit=3');
+    const ol = await api('GET', '/api/catalog?source=ollama&limit=3');
+    const lo = await api('GET', '/api/catalog?source=local');
+    const info = [`huggingface → ${httpSummary(hf)}`, `ollama → ${httpSummary(ol)}`, `local → ${hs(lo)}, ${(lo.json?.items || []).length} item(s)`];
+    if (!offline(hf, 'model_catalog') || !offline(ol, 'model_catalog')) return FAIL('the online catalogue is not refused with 403 offline_lock (what: model_catalog) while blocked', { info });
+    const allow = hf.json.error.details?.allow;
+    if (!allow || allow.path !== '/api/network/allow' || allow.needsPassword !== true) return FAIL('offline_lock without the details.allow hint', { info });
+    if (!lo.ok) return FAIL('source=local must work while blocked', { info });
+    return PASS('refused with the allow hint; local works', { info });
+  });
+
+  await run.check('e2e.blocker.pull', async () => {
+    needV02();
+    const r = await api('POST', '/api/models/pull', { model: run.opts.pullModel, providerId: 'ollama' });
+    const info = [`POST /api/models/pull ${run.opts.pullModel} → ${httpSummary(r)} (content-type ${r.headers?.['content-type']})`];
+    if (!offline(r, 'model_download')) return FAIL('pull is not refused with 403 offline_lock (what: model_download) while blocked', { info });
+    return PASS('403 offline_lock before any SSE', { info });
+  });
+
+  await run.check('e2e.blocker.fetch_url', async () => {
+    needV02();
+    need(toolModel, 'no tool-capable model', 'a model with "tools"');
+    const p = await api('PATCH', '/api/settings', { tools: { builtin: { fetch_url: true } } });
+    if (!p.ok) return FAIL(`could not enable the fetch_url setting: ${httpSummary(p)}`);
+    try {
+      const id = await newChat({ model: { providerId: 'ollama', model: toolModel }, params: { ...params, num_predict: 200 }, reasoning: { think: 'off' } });
+      const t = await turn(id, 'Use the fetch_url tool to read https://example.com and tell me its title.', { timeoutMs: 600000 });
+      const calls = t.by('tool_call').filter((c) => c.toolCall?.name === 'fetch_url');
+      const res = t.by('tool_result').filter((r) => r.name === 'fetch_url');
+      const info = [`events: ${evTypes(t)}`, `fetch_url calls: ${calls.length}, results: ${res.map((r) => (r.isError ? `error: ${excerpt(r.content, 100)}` : `OK: ${excerpt(r.content, 100)}`)).join(' | ') || 'none'}`, `answer: ${excerpt(t.text, 120)}`];
+      if (res.some((r) => !r.isError)) return FAIL('fetch_url returned page content while internet access is blocked', { info });
+      if (calls.length) return WARN('the model called fetch_url (it should not be offered while blocked); the call got an error result', { info });
+      return PASS('not called (not offered while blocked)', { info });
+    } finally {
+      await api('PATCH', '/api/settings', { tools: { builtin: { fetch_url: false } } });
+    }
+  }, { timeoutMs: 700000 });
+
+  let allowed = false;
+  await run.check('e2e.blocker.allow', async () => {
+    needV02();
+    const none = await api('POST', '/api/network/allow', { minutes: 5 });
+    const wrong = await api('POST', '/api/network/allow', { minutes: 5, password: `${sec.setup.password}-x` });
+    const info = [`without password → ${httpSummary(none)}`, `wrong password → ${httpSummary(wrong)}`];
+    if (none.status !== 403 || none.json?.error?.code !== 'confirmation_required') return FAIL('allowing internet without the password must answer 403 confirmation_required', { info });
+    if (wrong.status !== 401 || wrong.json?.error?.code !== 'wrong_password') return FAIL('allowing internet with a wrong password must answer 401 wrong_password', { info });
+    if (!run.opts.allowInternet) return SKIP('the password gate works; opening the window itself is off by default', '--allow-internet');
+    const t0 = Date.now();
+    const ok = await api('POST', '/api/network/allow', { minutes: 5, password: sec.setup.password });
+    const o = ok.json?.offlineLock || ok.json;
+    info.push(`with the password → ${hs(ok)}: ${JSON.stringify(o)}`);
+    if (!ok.ok || o?.blocked !== false) return FAIL('the window did not open', { info });
+    allowed = true;
+    const until = Date.parse(o.allowedUntil);
+    if (!(until > t0 + 4 * 60000 && until < Date.now() + 5 * 60000 + 5000)) return FAIL(`allowedUntil ${o.allowedUntil} is not ~5 minutes ahead`, { info });
+    return PASS(`open until ${o.allowedUntil}`, { info });
+  });
+
+  const adapterHint = (re, name) => {
+    const at = findSource(re);
+    return `${name} adapter: ${at.length ? at.join(', ') : 'not found under server/'} — the site may have changed; compare the excerpt with what the adapter parses.`;
+  };
+  await run.check('e2e.catalog.huggingface', async ({ sample }) => {
+    needV02();
+    need(catalogRoute, 'this backend has no /api/catalog route yet', 'the 0.2 model catalogue');
+    need(allowed, 'the internet window is not open', 'e2e.blocker.allow with --allow-internet');
+    const fix = adapterHint(/huggingface\.co\/api/, 'Hugging Face');
+    const l = await api('GET', '/api/catalog?source=huggingface&sort=trending&limit=5', undefined, 60000);
+    sample('harness GET /api/catalog?source=huggingface', l.json);
+    const items = l.json?.items || [];
+    const info = [`list → ${hs(l)}, ${items.length} item(s): ${items.map((i) => `${i.id} (${i.kind}, ${i.parameters ?? '?'} params, fit ${i.fit?.fits ?? '?'})`).join('; ')}`];
+    if (!l.ok || !items.length) return FAIL(`the list did not parse: ${httpSummary(l)}`, { info, actual: excerpt(l.text, 600), fix });
+    const bad = items.filter((i) => !i.id || !i.publisher || !['chat', 'vision', 'embedding'].includes(i.kind) || i.source !== 'huggingface');
+    if (bad.length) return FAIL(`${bad.length} item(s) without id/publisher/kind`, { info, actual: excerpt(bad, 600), fix });
+    const id = 'unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF';
+    const d = await api('GET', `/api/catalog/model?source=huggingface&id=${encodeURIComponent(id)}`, undefined, 90000);
+    sample('harness GET /api/catalog/model (huggingface)', d.json);
+    const files = d.json?.files || [];
+    const q3 = files.find((f) => f.tag === 'UD-Q3_K_XL');
+    info.push(`detail ${id} → ${hs(d)}: ${files.length} file(s) [${files.map((f) => f.tag).join(', ')}], projector ${d.json?.hasProjector}, recommendedTag ${d.json?.recommendedTag}`);
+    if (!d.ok || !files.length) return FAIL(`the repository detail did not parse: ${httpSummary(d)}`, { info, actual: excerpt(d.text, 600), fix });
+    if (!q3 || !(q3.sizeBytes > 3e9) || q3.model !== `hf.co/${id}:UD-Q3_K_XL`) return FAIL('the UD-Q3_K_XL file is missing or mis-sized', { info, actual: excerpt(q3 || files.slice(0, 3), 600), fix });
+    if (files.some((f) => /mmproj|imatrix/i.test(f.tag || ''))) return FAIL('projector/imatrix files are offered as models', { info, fix });
+    return PASS(`${items.length} listed; ${files.length} files in ${id}, UD-Q3_K_XL ${fmtBytes(q3.sizeBytes)} (pullable ${q3.pullable})`, { info });
+  }, { timeoutMs: 180000 });
+
+  await run.check('e2e.catalog.ollama', async ({ sample }) => {
+    needV02();
+    need(catalogRoute, 'this backend has no /api/catalog route yet', 'the 0.2 model catalogue');
+    need(allowed, 'the internet window is not open', 'e2e.blocker.allow with --allow-internet');
+    const fix = adapterHint(/ollama\.com\/(library|search)/, 'Ollama library');
+    const l = await api('GET', '/api/catalog?source=ollama&sort=trending&limit=24', undefined, 60000);
+    sample('harness GET /api/catalog?source=ollama', l.json);
+    const items = l.json?.items || [];
+    const info = [`list → ${hs(l)}, ${items.length} item(s): ${items.slice(0, 8).map((i) => `${i.id} [${(i.capabilities || []).join(',')}]`).join('; ')}`];
+    if (!l.ok || items.length < 5) return FAIL(`the library list did not parse: ${httpSummary(l)}`, { info, actual: excerpt(l.text, 600), fix });
+    const pick = items.find((i) => /^qwen3$|^llama3\.2$|^gemma3$/.test(i.id)) || items[0];
+    const d = await api('GET', `/api/catalog/model?source=ollama&id=${encodeURIComponent(pick.id)}`, undefined, 90000);
+    sample('harness GET /api/catalog/model (ollama)', d.json);
+    const files = d.json?.files || [];
+    info.push(`detail ${pick.id} → ${hs(d)}: ${files.length} tag(s) [${files.slice(0, 8).map((f) => `${f.tag} ${f.sizeBytes ? fmtBytes(f.sizeBytes) : '?'}`).join(', ')}]`);
+    if (!d.ok || !files.length) return FAIL(`the model page did not parse: ${httpSummary(d)}`, { info, actual: excerpt(d.text, 600), fix });
+    if (!files.every((f) => f.model === `${pick.id}:${f.tag}`)) return FAIL('tags are not addressed as <name>:<tag>', { info, actual: excerpt(files.slice(0, 3), 400), fix });
+    if (!files.some((f) => f.sizeBytes > 1e8)) return FAIL('no tag has a size', { info, actual: excerpt(files.slice(0, 3), 400), fix });
+    return PASS(`${items.length} listed; ${pick.id}: ${files.length} tags`, { info });
+  }, { timeoutMs: 180000 });
+
+  await run.check('e2e.blocker.reblock', async () => {
+    needV02();
+    const b = await api('POST', '/api/network/block', {});
+    const bo = b.json?.offlineLock || b.json;
+    const info = [`block → ${hs(b)} ${JSON.stringify(bo)}`];
+    if (!b.ok || bo?.blocked !== true) return FAIL('POST /api/network/block did not block', { info });
+    if (catalogRoute) {
+      const hf = await api('GET', '/api/catalog?source=huggingface&limit=1');
+      info.push(`catalogue → ${httpSummary(hf)}`);
+      if (!offline(hf, 'model_catalog')) return FAIL('the catalogue still answers after blocking again', { info });
+    } else {
+      const p = await api('POST', '/api/models/pull', { model: run.opts.pullModel, providerId: 'ollama' });
+      info.push(`pull → ${httpSummary(p)} (no catalogue route yet)`);
+      if (!offline(p, 'model_download')) return FAIL('downloads still pass after blocking again', { info });
+    }
+    return PASS(allowed ? 'blocked again after the window' : 'blocked (the window was not opened in this run)', { info });
+  });
+
+  await run.check('e2e.blocker.sandboxed_ollama', async () => {
+    needV02();
+    need(process.platform === 'darwin', 'the OS sandbox (sandbox-exec) exists only on macOS', 'macOS');
+    need(fs.existsSync('/usr/bin/sandbox-exec'), 'sandbox-exec is missing', '/usr/bin/sandbox-exec');
+    const { findOllamaBinary } = await import(pathToFileURL(path.join(ROOT, 'server/providers/ollama-process.mjs')).href);
+    need(findOllamaBinary(), 'no ollama binary', 'Ollama installed (brew install ollama)');
+    return sandboxedOllamaCheck(run);
+  }, { timeoutMs: 300000 });
+
+  // ---- locking: marker → lock → nothing on disk, routes 423, models unloaded → unlock again
+  const marker = `HXMARK${crypto.randomBytes(9).toString('hex').toUpperCase()}`;
+  let wrote = [];
+  if (v02) {
+    const m = await api('POST', '/api/memories', { content: `The user's project codename is ${marker}.`, category: 'project', dedupe: false });
+    if (m.ok) wrote.push('memory');
+    const c = await api('POST', '/api/chats', { title: `Plans for ${marker}` });
+    if (c.status === 201) wrote.push('chat title');
+    if (chatRef && c.status === 201) {
+      const t = await turn(c.json.chat.id, `Remember this codename for later: ${marker}. Reply with one word.`, { timeoutMs: 600000 });
+      if (t.last('done')) wrote.push('chat message + reply');
+    }
+  }
+  let lockOk = false;
+  await run.check('e2e.lock.routes', async () => {
+    needV02();
+    const l = await api('POST', '/api/security/lock', {}, 120000);
+    lockOk = l.ok;
+    const info = [`POST /api/security/lock → ${httpSummary(l)}`];
+    if (!l.ok) return FAIL('lock failed', { info });
+    const bad = [];
+    for (const p of ['/api/chats', '/api/memories', '/api/settings', '/api/ui-state', '/api/events', '/api/system']) {
+      const r = await api('GET', p, undefined, 10000);
+      info.push(`GET ${p} → ${hs(r)} ${r.json?.error?.code || ''}`);
+      if (r.status !== 423) bad.push(p);
+    }
+    const h = await raw('GET', '/api/health');
+    const sq = await raw('GET', '/api/security');
+    info.push(`health → state ${h.json?.state}; security → state ${sq.json?.state}`);
+    if (bad.length) return FAIL(`not 423 while locked: ${bad.join(', ')}`, { info });
+    if (h.json?.state !== 'locked' || sq.json?.state !== 'locked') return FAIL('health/security do not report locked', { info });
+    return PASS('every data route answers 423', { info });
+  }, { timeoutMs: 180000 });
+
+  await run.check('e2e.lock.models_unloaded', async () => {
+    needV02();
+    need(lockOk, 'not locked', 'e2e.lock.routes');
+    need(B.ollama && chatRef?.providerId === 'ollama', 'no Ollama chat model was used', 'an Ollama chat model');
+    let listed = true;
+    let models = [];
+    for (let i = 0; i < 20 && listed; i++) {
+      models = (await http(B.ollama.url, '/api/ps', { timeoutMs: T(10000) })).json?.models || [];
+      listed = models.some((m) => sameModel(m.model || m.name, chatRef.model));
+      if (listed) await sleep(500);
+    }
+    const info = [`/api/ps after locking: [${models.map((m) => m.model || m.name).join(', ')}]`];
+    if (listed) return FAIL(`${chatRef.model} is still loaded in Ollama after locking`, { info });
+    return PASS(`${chatRef.model} is not loaded`, { info });
+  }, { timeoutMs: 60000 });
+
+  await run.check('e2e.lock.marker_not_on_disk', async () => {
+    needV02();
+    need(lockOk, 'not locked', 'e2e.lock.routes');
+    need(wrote.length, 'could not write the marker (memory/chat routes failed)', 'working memory and chat routes');
+    const b = Buffer.from(marker, 'utf8');
+    const needles = [Object.assign(b, { label: 'utf8' }), Object.assign(Buffer.from(marker, 'utf16le'), { label: 'utf16le' }), Object.assign(Buffer.from(b.toString('base64').slice(0, 16)), { label: 'base64' })];
+    const hits = filesContaining(dataDir, needles);
+    const files = [];
+    const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else files.push(p); } };
+    walk(dataDir);
+    const info = [`marker written as: ${wrote.join(', ')}`, `${files.length} file(s) scanned in the data dir`, ...hits.map((h) => `FOUND in ${h.file} (${h.as})`)];
+    if (hits.length) return FAIL(`the marker is readable in ${hits.length} file(s) at rest`, { info });
+    return PASS(`not found in ${files.length} files`, { info });
+  });
+
+  await run.check('e2e.lock.unlock_again', async () => {
+    needV02();
+    need(lockOk, 'not locked', 'e2e.lock.routes');
+    const u = await raw('POST', '/api/security/unlock', { password: sec.setup.password });
+    if (!u.ok) return FAIL(`unlock → ${httpSummary(u)}`);
+    const token = u.json?.sessionToken;
+    const cookie = [].concat(u.setCookie || []).map((c) => String(c).split(';')[0]).find((c) => c.startsWith('harness_session='));
+    harnessAuth = { base, headers: token ? { authorization: `Bearer ${token}` } : cookie ? { cookie } : {} };
+    const m = await api('GET', `/api/memories?q=${encodeURIComponent(marker)}`);
+    const found = (m.json?.memories || []).some((x) => String(x.content).includes(marker));
+    const info = [`unlock → ${hs(u)}; memory search → ${hs(m)}, ${m.json?.total ?? '?'} hit(s)`];
+    if (!found && wrote.includes('memory')) return FAIL('the marker memory is not readable after unlocking again', { info });
+    return PASS('the data opens again with the password', { info });
+  });
+}
+
+/** A second throw-away Harness that starts its own Ollama on a spare port while internet access is blocked. */
+async function sandboxedOllamaCheck(run) {
+  const T = (ms) => run.T(ms);
+  const port = await freePort();
+  const dir = await fsp.mkdtemp(path.join(run.opts.dataDir || os.tmpdir(), 'harness-livecheck-sbx-'));
+  const prevAuth = harnessAuth;
+  const prevEnv = process.env.HARNESS_NO_OLLAMA_AUTOSTART;
+  let srv = null;
+  const info = [];
+  try {
+    delete process.env.HARNESS_NO_OLLAMA_AUTOSTART;
+    const { startServer } = await import(pathToFileURL(path.join(ROOT, 'server/index.mjs')).href);
+    srv = await startServer({ port: 0, dataDir: dir, autodetect: false, logLevel: 'silent' });
+    const setup = await e2eSetup(run, srv.url);
+    if (setup.error) return FAIL(setup.error, { info: setup.info });
+    const api = (method, p, body, ms = 60000) => http(srv.url, p, { method, body, timeoutMs: T(ms) });
+    const ps = await api('PATCH', '/api/settings', { providers: { autodetect: false, builtin: { ollama: { enabled: true, baseUrl: `http://127.0.0.1:${port}` } } }, ollama: { autoStart: true, stopOnExit: true } });
+    if (!ps.ok) return FAIL(`PATCH /api/settings → ${httpSummary(ps)}`);
+    const st = await api('POST', '/api/providers/ollama/start', {}, 120000);
+    info.push(`POST /api/providers/ollama/start → ${httpSummary(st)}`);
+    if (!st.ok) return FAIL('Harness could not start its own Ollama', { info });
+    const sq = await api('GET', '/api/security');
+    const o = sq.json?.offlineLock;
+    info.push(`offlineLock: ${JSON.stringify(o)}`);
+    const direct = await http(`http://127.0.0.1:${port}`, '/api/pull', { method: 'POST', body: { model: run.opts.pullModel, stream: false }, timeoutMs: T(120000), noAuth: true });
+    info.push(`direct pull of ${run.opts.pullModel} at 127.0.0.1:${port} → ${httpSummary(direct)}`);
+    const test = await api('POST', '/api/network/test', {}, 60000);
+    const os = (test.json?.results || []).filter((r) => r.layer === 'os');
+    info.push(...(test.json?.results || []).map((r) => `self-test ${r.layer} ${r.target}: ${r.result}`));
+    const pulled = direct.ok && !direct.json?.error && /success/i.test(direct.json?.status || '');
+    if (pulled) {
+      await http(`http://127.0.0.1:${port}`, '/api/delete', { method: 'DELETE', body: { model: run.opts.pullModel }, timeoutMs: T(30000), noAuth: true });
+      return FAIL('a pull sent straight to the Ollama Harness started while blocked reached the registry', { info, fix: 'server/security/offline-lock.sb or the sandbox-exec wrapping of ollama serve (see osEnforced).' });
+    }
+    if (!o?.osEnforced || o.osScope !== 'ollama') return WARN(`Ollama runs without the OS sandbox (osEnforced ${o?.osEnforced}, osScope ${o?.osScope}); the direct pull failed anyway`, { info, fix: 'Harness falls back to an unsandboxed Ollama when sandbox-exec fails; see its log.' });
+    if (os.some((r) => r.result === 'reachable')) return FAIL('the self-test\'s OS probe reached the internet', { info });
+    if (!os.length || os.every((r) => r.result === 'skipped')) return WARN('the OS probe did not run although osEnforced is true', { info });
+    return PASS('sandboxed: the direct pull failed and the OS probe was blocked', { info });
+  } finally {
+    if (srv) await srv.close().catch(() => {});
+    harnessAuth = prevAuth;
+    if (prevEnv === undefined) delete process.env.HARNESS_NO_OLLAMA_AUTOSTART; else process.env.HARNESS_NO_OLLAMA_AUTOSTART = prevEnv;
+    if (!run.opts.keepData) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 

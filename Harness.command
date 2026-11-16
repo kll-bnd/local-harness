@@ -2,6 +2,7 @@
 # Double-click this file in Finder to run Harness in your web browser (no desktop app needed).
 # Terminal opens, Harness starts and your browser opens it. Close the Terminal window or press
 # Ctrl+C to stop Harness. If Harness is already running, this just opens it.
+# Your password is typed in the browser window (Harness's own lock or first-start screen), never here.
 #
 # First time: macOS may say it cannot verify the file. Right-click it → Open, or run it once from
 # Terminal:  ./Harness.command

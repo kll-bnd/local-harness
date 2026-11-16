@@ -187,7 +187,7 @@ case "$STATE" in
   unknown)
     warn "Could not ask Harness about its state (see: npm run doctor)." ;;
   *)
-    ok "A Harness password is set (state: $STATE)." ;;
+    ok "A Harness password is set." ;;
 esac
 
 # ------------------------------------------------------------------------------------------------

@@ -1,12 +1,10 @@
 // Runs before first paint (classic script, no module) so the window never flashes the wrong theme.
-// The authoritative values live in settings.ui on the server; these localStorage mirrors are only hints.
+// The only value Harness keeps in browser storage is the theme (not user content); everything else, including the
+// authoritative theme, comes from the UI-state store after unlocking. Without it the system setting applies.
 (function () {
   var root = document.documentElement;
-  function read(k) { try { var v = localStorage.getItem('harness.ui.' + k); return v == null ? null : JSON.parse(v); } catch (e) { return null; } }
-  var theme = read('theme');
+  var theme = null;
+  try { theme = JSON.parse(localStorage.getItem('harness.ui.theme') || 'null'); } catch (e) { theme = null; }
   if (theme === 'light' || theme === 'dark') root.setAttribute('data-theme', theme);
-  var size = read('textSize');
-  if (size === 'small' || size === 'large') root.setAttribute('data-text-size', size);
-  if (read('proseFont') === 'serif') root.setAttribute('data-prose', 'serif');
   if (/Mac/.test(navigator.platform || '')) root.classList.add('platform-mac');
 })();

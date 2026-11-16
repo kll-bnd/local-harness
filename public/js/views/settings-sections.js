@@ -1,5 +1,6 @@
 export const SETTINGS_SECTIONS = [
   { id: 'general', label: 'General', icon: 'settings' },
+  { id: 'privacy', label: 'Privacy & security', icon: 'lock' },
   { id: 'model', label: 'Model & context', icon: 'layers' },
   { id: 'summarizer', label: 'Summarizer', icon: 'summary' },
   { id: 'memory', label: 'Memory & documents', icon: 'memory' },

@@ -2,6 +2,7 @@
 import { toast } from './ui/overlays.js';
 import { runAction } from './actions.js';
 import { store, ollamaStatus } from './state.js';
+import { isLockingDown, isLockError } from './lockdown.js';
 
 /** → { title, detail, action?: {label, run} } */
 export function explainError(err, context = '') {
@@ -79,6 +80,30 @@ export function explainError(err, context = '') {
       return { title: "Can't reach Harness", detail: 'The app may have restarted. Reconnecting…' };
     case 'forbidden':
       return { title: 'Request blocked', detail: msg };
+    case 'offline_lock':
+      return {
+        title: 'Internet access is blocked',
+        detail: 'Harness keeps everything on this Mac until you allow it.',
+        action: { label: err.details?.allow?.label || 'Allow internet for 15 minutes', run: () => import('./views/network.js').then((m) => m.requestInternet(err.details || {})) },
+      };
+    case 'confirmation_required':
+      return { title: 'Your password is needed for this', detail: msg };
+    case 'wrong_password':
+      return { title: "That's not your Harness password", detail: null };
+    case 'unlock_throttled':
+      return { title: 'Too many tries', detail: `Try again in ${Math.ceil((err.details?.retryAfterMs || 0) / 1000)} s.` };
+    case 'weak_password':
+      return { title: 'Use at least 8 characters', detail: null };
+    case 'encrypted_backup':
+      return { title: 'This backup is encrypted', detail: 'Type the passphrase it was saved with.' };
+    case 'wrong_passphrase':
+      return { title: "That passphrase doesn't open this backup", detail: null };
+    case 'catalog_not_found':
+      return { title: "That model isn't listed", detail: 'It may be private or removed.' };
+    case 'catalog_unavailable':
+      return { title: "The catalogue can't be reached right now", detail: `${err.details?.source === 'ollama' ? 'ollama.com' : err.details?.source === 'huggingface' ? 'Hugging Face' : 'The site'} did not answer as expected. Installed models are not affected.` };
+    case 'unsupported_sort':
+      return { title: "This list can't be sorted that way", detail: msg };
     case 'bad_request':
       return { title: context ? `Couldn't ${context}` : 'That didn\'t work', detail: msg };
     case 'not_found':
@@ -92,7 +117,7 @@ export function explainError(err, context = '') {
 
 /** Show an error toast with its suggested action. */
 export function showError(err, context = '') {
-  if (err?.name === 'AbortError') return;
+  if (err?.name === 'AbortError' || err?.quiet || isLockingDown() || isLockError(err)) return;
   console.warn('[harness]', context, err);
   if ((err?.code === 'network' || err?.code === 'stream_interrupted') && store.get('connection') !== 'online') return; // the banner covers it
   const x = explainError(err, context);

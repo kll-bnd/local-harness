@@ -11,6 +11,7 @@ import { navigate } from '../router.js';
 import { toast, confirmDialog, openDialog } from '../ui/overlays.js';
 import { showError, explainError } from '../errors.js';
 import { runAction } from '../actions.js';
+import { privacySection, backupDialog, restoreBackup } from './privacy.js';
 
 const get = (o, path) => path.split('.').reduce((x, k) => (x == null ? x : x[k]), o);
 const patchFor = (path, value) => {
@@ -159,7 +160,7 @@ export class SettingsView {
     this.scroller = h('div.view-scroll', h('div.settings-page', this.nav, this.content));
     this.el = h('div.view.settings-view', this.scroller);
     this.render = debounce(() => this.renderNow(), 40);
-    this.offs = [store.watch(['settings', 'presets', 'system', 'models'], () => { if (!this.editing) this.render(); })];
+    this.offs = [store.watch(['settings', 'presets', 'system', 'models', 'security', 'network'], () => { if (!this.editing) this.render(); })];
     this.scroller.addEventListener('scroll', () => this.shell.setScrolled(this.scroller.scrollTop > 4), { passive: true });
   }
 
@@ -179,7 +180,8 @@ export class SettingsView {
     const sec = SETTINGS_SECTIONS.find((x) => x.id === this.section);
     const body = h('div.settings-section');
     add(body, h('h1.h1', sec.label));
-    if (this.section === 'presets') add(body, this.presetsSection());
+    if (this.section === 'privacy') add(body, privacySection(this));
+    else if (this.section === 'presets') add(body, this.presetsSection());
     else if (this.section === 'data') add(body, this.dataSection());
     else if (this.section === 'about') add(body, this.aboutSection());
     else {
@@ -199,7 +201,7 @@ export class SettingsView {
 
   async resetAll() {
     if (!await confirmDialog({ title: 'Reset all settings?', message: 'Every setting goes back to its default. Chats, memories, presets and images are not affected.', confirmLabel: 'Reset', danger: true })) return;
-    try { const ui = uiPrefs(); await api.settings.reset(); await patchSettings({ ui }); await loadSettings(); toast({ kind: 'success', message: 'Settings reset' }); } catch (e) { showError(e, 'reset settings'); }
+    try { await api.settings.reset(); await loadSettings(); toast({ kind: 'success', message: 'Settings reset' }); } catch (e) { showError(e, 'reset settings'); }
   }
 
   // ------------------------------------------------------------------------------------------ fields
@@ -543,10 +545,10 @@ export class SettingsView {
     return h('div.stack-lg',
       h('section.form-block',
         h('h3.h3', 'Backup'),
-        h('p.field-help', 'One JSON file with every chat (all branches and summaries), memories, presets, settings, attachments and generated images. Restoring adds to what you have; nothing is overwritten.'),
+        h('p.field-help', 'One file with every chat (all branches and summaries), memories, presets, settings, attachments and generated images — encrypted with a passphrase if you choose one. Restoring adds to what you have; nothing is overwritten.'),
         h('div.row-wrap',
-          h('button.btn', { type: 'button', on: { click: () => download(api.backupUrl(), `harness-backup-${new Date().toISOString().slice(0, 10)}.json`) } }, icon('download', { size: 14 }), 'Download backup'),
-          h('button.btn', { type: 'button', on: { click: () => this.restore() } }, icon('upload', { size: 14 }), 'Restore from backup…'))),
+          h('button.btn', { type: 'button', on: { click: () => backupDialog() } }, icon('download', { size: 14 }), 'Download backup…'),
+          h('button.btn', { type: 'button', on: { click: () => restoreBackup() } }, icon('upload', { size: 14 }), 'Restore from backup…'))),
       h('section.form-block',
         h('h3.h3', 'Import chats'),
         h('p.field-help', 'Harness chat exports (.json), Harness backups, or OpenAI-style {messages:[{role, content}]} files. Imported chats get new ids, so nothing is overwritten.'),
@@ -565,52 +567,6 @@ export class SettingsView {
           } } }, 'Delete all memories…'))));
   }
 
-  async restore() {
-    const [file] = await pickFiles({ accept: '.json,application/json', multiple: false });
-    if (!file) return;
-    let payload;
-    try { payload = JSON.parse(await file.text()); } catch { toast({ kind: 'error', message: `${file.name} isn't valid JSON` }); return; }
-    if (payload.format !== 'harness.backup') {
-      // A single chat export or an OpenAI-style transcript: plain import.
-      try { const r = await api.chats.import(payload); await loadChats(); toast({ kind: 'success', message: `Imported ${r.chats.length} chat${r.chats.length === 1 ? '' : 's'}` }); } catch (e) { showError(e, 'import the file'); }
-      return;
-    }
-    const n = (k) => (Array.isArray(payload[k]) ? payload[k].length : 0);
-    const part = (key, label, count) => {
-      const cb = h('input', { type: 'checkbox', checked: count > 0, disabled: !count, dataset: { part: key } });
-      return h('label.row.restore-part', cb, h('span.grow', label), h('span.faint.num', String(count)));
-    };
-    const settingsSel = h('select.select', { attrs: { 'aria-label': 'Settings' } },
-      h('option', { value: 'skip' }, 'Keep my current settings'),
-      h('option', { value: 'safe' }, 'Restore settings, but keep this Mac’s paths and servers'),
-      h('option', { value: 'full' }, 'Restore all settings exactly'));
-    const body = h('div.stack',
-      h('p.field-help', `Backup from ${fmtFull(payload.exportedAt)}${payload.app?.version ? ` (Harness ${payload.app.version})` : ''}. Everything is added next to what you have — nothing is overwritten, and restored items get new ids.`),
-      part('chats', 'Chats (all branches and summaries)', n('chats')),
-      part('memories', 'Memories (duplicates are skipped)', n('memories')),
-      part('presets', 'Presets', n('presets')),
-      part('attachments', 'Attachments', n('attachments')),
-      part('images', 'Generated images', n('images')),
-      h('label.field-label', 'Settings'), settingsSel);
-    openDialog({
-      title: 'Restore from backup',
-      body,
-      actions: [{ label: 'Cancel' }, { label: 'Restore', kind: 'primary', run: async () => {
-        const parts = Object.fromEntries([...body.querySelectorAll('input[data-part]')].map((cb) => [cb.dataset.part, cb.checked]));
-        const t = toast({ message: 'Restoring…', timeout: 0, id: 'restore' });
-        try {
-          const r = await api.restore(payload, { ...parts, settings: settingsSel.value });
-          t.dismiss(true);
-          await Promise.allSettled([loadChats(), loadSettings(), loadPresets()]);
-          const got = r.restored || {};
-          const bits = ['chats', 'memories', 'presets', 'attachments', 'images'].filter((k) => got[k]).map((k) => `${got[k]} ${k}`);
-          toast({ kind: 'success', message: 'Backup restored', detail: `${bits.join(', ') || 'Nothing new'}${got.settings && got.settings !== 'skipped' ? ` · settings ${got.settings}` : ''}${(r.warnings || []).length ? `\n${r.warnings.slice(0, 3).map((w) => w.message || w).join('\n')}` : ''}`, timeout: 7000 });
-          return true;
-        } catch (e) { t.dismiss(true); showError(e, 'restore the backup'); return false; }
-      } }],
-    });
-  }
-
   aboutSection() {
     const sys = store.get('system');
     const desktop = window.harnessDesktop;
@@ -618,7 +574,7 @@ export class SettingsView {
     return h('div.stack-lg',
       h('dl.kv.about-kv',
         h('dt', 'Harness'), h('dd', `${sys?.app?.version || '—'}${desktop?.appVersion ? ` · app ${desktop.appVersion}` : ''}`),
-        h('dt', 'Server'), h('dd', `${sys?.app?.url || location.origin} · Node ${sys?.app?.node || ''}`),
+        h('dt', 'Server'), h('dd', `${sys?.app?.transport === 'bridge' ? 'Inside the app (no network listener)' : sys?.app?.url || 'Local'} · Node ${sys?.app?.node || ''}`),
         h('dt', 'Machine'), h('dd', m ? `${m.chip} · ${m.cpus} cores · ${fmtBytes(m.totalMemBytes)} RAM (${m.ramTier} tier)` : '—'),
         h('dt', 'Memory budget'), h('dd', m?.memoryBudget ? `${fmtBytes(m.memoryBudget.budgetBytes)} for models (${Math.round(m.memoryBudget.fraction * 100)} % of RAM)` : '—'),
         h('dt', 'Platform'), h('dd', m ? `${m.platform} ${m.arch} ${m.release}` : '—')),

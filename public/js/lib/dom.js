@@ -190,6 +190,24 @@ export function focusWhenReady(el, { caretAtEnd = true } = {}) {
   });
 }
 
+/**
+ * Mark a window drag region for every shell: Electron reads the CSS `app-region`, the native WKWebView app reads
+ * `data-app-region` (elements with class `titlebar` are drag regions there by default). Interactive controls
+ * inside are kept clickable with `data-app-region="no-drag"`, also when they are added later.
+ */
+const NO_DRAG = 'button, input, select, textarea, a, [role="button"], [role="tab"], [contenteditable], .no-drag';
+export function dragRegion(el) {
+  el.dataset.appRegion = 'drag';
+  const mark = (root) => {
+    if (root.nodeType !== 1) return;
+    if (root.matches(NO_DRAG)) root.dataset.appRegion = 'no-drag';
+    for (const c of root.querySelectorAll(NO_DRAG)) if (c.dataset.appRegion !== 'no-drag') c.dataset.appRegion = 'no-drag';
+  };
+  mark(el);
+  new MutationObserver((list) => { for (const m of list) for (const n of m.addedNodes) mark(n); }).observe(el, { childList: true, subtree: true });
+  return el;
+}
+
 /** Autosize a textarea to its content (bounded by CSS max-height). */
 export function autosize(ta) {
   ta.style.height = 'auto';

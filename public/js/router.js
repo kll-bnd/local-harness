@@ -1,4 +1,4 @@
-// Hash router: #/chat/<id>, #/new, #/images, #/models, #/memory, #/settings/<section>, #/setup.
+// Hash router: #/chat/<id>, #/new, #/images, #/models[/<source>[/<id>]], #/memory, #/settings/<section>, #/setup.
 import { store } from './state.js';
 
 export function parseRoute(hash = location.hash) {
@@ -7,7 +7,12 @@ export function parseRoute(hash = location.hash) {
   switch (p[0]) {
     case 'chat': return p[1] ? { view: 'chat', chatId: p[1], query } : { view: 'chat', chatId: null, query };
     case 'images': return { view: 'images', query };
-    case 'models': return { view: 'models', query };
+    case 'models': {
+      // #/models (on this Mac) · #/models/ollama|huggingface (browse) · #/models/<source>/<id…> (a model's page)
+      const tab = ['ollama', 'huggingface', 'local'].includes(p[1]) ? p[1] : 'local';
+      const id = p.length > 2 ? p.slice(2).join('/') : null;
+      return { view: 'models', tab, id, query };
+    }
     case 'memory': return { view: 'memory', query };
     case 'settings': return { view: 'settings', section: p[1] || 'general', query };
     case 'setup': return { view: 'setup', query };

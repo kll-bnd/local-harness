@@ -2,6 +2,7 @@
 import { HttpError, badRequest, notFound } from '../lib/errors.mjs';
 import { openSse, readJson } from '../http/http.mjs';
 import { newId } from '../lib/ids.mjs';
+import { OfflineLockError } from '../security/egress.mjs';
 import { RECOMMENDED_MODELS, RECOMMENDED_EMBEDDING, profileFor, textOnlyName, avoidedTag } from '../providers/catalog.mjs';
 import { createTextOnlyCopy } from '../providers/text-only.mjs';
 import { loadFailureError } from '../providers/load-failure.mjs';
@@ -198,18 +199,27 @@ export function registerModelRoutes(r, app) {
   r.post('/api/models/pull', async ({ req, res }) => {
     const body = await readJson(req);
     const model = requireString(body.model, 'model', { max: 300 });
+    if (body.textOnlyCopy !== undefined && typeof body.textOnlyCopy !== 'boolean') throw badRequest('textOnlyCopy must be a boolean');
     const provider = app.registry.require(body.providerId || 'ollama');
     if (!provider.capabilities.pull) throw new HttpError(400, 'unsupported', `${provider.name} does not support pulling models`);
+    // A download always reaches the internet (Ollama fetches from its registry or hf.co), even though the call
+    // to Ollama itself stays on this Mac.
+    if (app.network?.blocked) throw new OfflineLockError('model_download', /^(hf\.co|huggingface\.co)\//i.test(model) ? 'hf.co' : 'registry.ollama.ai');
     const st = await app.registry.status(provider, { refresh: true });
     if (!st.ok) throw new HttpError(503, 'connection_failed', `${provider.name} is not running`);
     const sse = openSse(req, res);
+    const endDownload = app.network?.beginDownload() || (() => {});
+    const ac = new AbortController();
+    sse.signal.addEventListener('abort', () => ac.abort());
+    const pull = { abort: () => ac.abort() };
+    app.pulls.add(pull);
     const pullId = newId('pull');
     const avoid = avoidedTag(model);
     sse.send('start', { pullId, providerId: provider.id, model, ...(avoid ? { warning: { code: 'not_recommended', message: `${model}: ${avoid.reason}` } } : {}) });
     app.bus.publish('model.pull', { pullId, providerId: provider.id, model, status: 'started' });
     let last = 0;
     try {
-      for await (const p of provider.pull({ model, signal: sse.signal })) {
+      for await (const p of provider.pull({ model, signal: ac.signal })) {
         const percent = p.total ? Math.round((p.completed / p.total) * 1000) / 10 : null;
         sse.send('progress', { pullId, ...p, percent });
         if (Date.now() - last > 500) { last = Date.now(); app.bus.publish('model.pull', { pullId, providerId: provider.id, model, ...p, percent }); }
@@ -217,12 +227,22 @@ export function registerModelRoutes(r, app) {
       app.registry.dropInfo(provider.id, model);
       app.registry.invalidate();
       app.bus.publish('model.pull', { pullId, providerId: provider.id, model, status: 'success' });
-      sse.send('done', { pullId, providerId: provider.id, model, status: 'success' });
+      const extra = {};
+      if (body.textOnlyCopy) {
+        try {
+          const copy = await createTextOnlyCopy(app, provider, model);
+          extra.textOnlyCopy = { model: copy.model, providerId: copy.providerId, created: !!copy.created, sizeBytes: copy.sizeBytes ?? null };
+          app.registry.invalidate();
+        } catch (e) { extra.textOnlyCopyError = { code: e.code || 'text_only_failed', message: e.message }; }
+      }
+      sse.send('done', { pullId, providerId: provider.id, model, status: 'success', ...extra });
     } catch (e) {
-      const aborted = sse.signal.aborted;
+      const aborted = ac.signal.aborted;
       app.bus.publish('model.pull', { pullId, providerId: provider.id, model, status: aborted ? 'aborted' : 'error', error: e.message });
       sse.send('error', { pullId, code: aborted ? 'aborted' : e.code || 'pull_failed', message: e.message });
     } finally {
+      app.pulls.delete(pull);
+      endDownload();
       sse.end();
     }
   });

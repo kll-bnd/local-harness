@@ -99,6 +99,7 @@ export class Auth {
 
   /** Locking drops every session (and pending codes and confirmations). */
   dropAll() { this.sessions.clear(); this.codes.clear(); this.confirmations.clear(); }
+  dropConfirmations() { this.confirmations.clear(); }
 
   // ---------------------------------------------------------------------------------------- launch codes
   mintLaunchCode() {

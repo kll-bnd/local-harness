@@ -62,8 +62,8 @@ jobs:
         run: |
           set -o pipefail
           # The spec reporter repeats every failing test with its error at the end of the output.
-          node --test --test-concurrency=4 --test-reporter=spec "test/*.test.mjs" "electron/test/*.test.mjs" 2>&1 | tail -n 170
-      - name: Server boots with no node_modules
+          node --test --test-concurrency=4 --test-reporter=spec "test/*.test.mjs" "electron/test/*.test.mjs" "scripts/test/*.test.mjs" 2>&1 | tail -n 170
+      - name: Server boots with no node_modules (0.2 defaults - needs_setup, data routes refused)
         run: |
           set -euo pipefail
           test ! -d node_modules
@@ -76,11 +76,14 @@ jobs:
           done
           curl -fsS http://127.0.0.1:4747/api/health
           echo
-          curl -fsS http://127.0.0.1:4747/api/system | jq -c '.machine'
+          curl -fsS http://127.0.0.1:4747/api/security | jq -c '{state, mode, offlineLock}'
+          curl -sS -o /dev/null -w 'GET /api/system without setup: HTTP %{http_code} (expected 423)\n' http://127.0.0.1:4747/api/system
           curl -fsS -o /dev/null -w 'index.html: HTTP %{http_code}\n' http://127.0.0.1:4747/
+          stat -f 'data dir mode %Lp (expected 700)' "$HARNESS_DATA_DIR"
+          node scripts/doctor.mjs 2>&1 | grep -E 'Harness .*running|Data protection|Internet blocker|self-test' || true
           kill "$pid"
           wait "$pid" 2>/dev/null || true
-          cat "$RUNNER_TEMP/server.log"
+          tail -n 15 "$RUNNER_TEMP/server.log"
 
   desktop:
     name: Desktop app on macOS (Electron)
@@ -95,11 +98,15 @@ jobs:
       - name: Install developer dependencies
         run: npm ci
       - name: Desktop end-to-end, from source
-        run: npm run test:e2e
+        run: |
+          set -o pipefail
+          npm run test:e2e 2>&1 | grep -vE '^ok ' | tail -n 40
       - name: Build Harness.app and the disk image
         run: npm run dist
       - name: Desktop end-to-end, packaged app
-        run: HARNESS_E2E_APP="$PWD/dist/mac-arm64/Harness.app/Contents/MacOS/Harness" npm run test:e2e
+        run: |
+          set -o pipefail
+          HARNESS_E2E_APP="$PWD/dist/mac-arm64/Harness.app/Contents/MacOS/Harness" npm run test:e2e 2>&1 | grep -vE '^ok ' | tail -n 40
       - name: UI tests in WebKit (Safari engine)
         continue-on-error: true
         run: |
@@ -149,8 +156,12 @@ jobs:
           ollama pull gemma3:270m > /dev/null 2>&1
           ollama pull all-minilm > /dev/null 2>&1
       - name: Live check
+        # --allow-internet: the in-process Harness (0.2 defaults: password + internet blocked) opens its internet
+        # window with its throw-away password to test the live catalogue adapters, then blocks again.
+        # e2e.blocker.sandboxed_ollama starts a second Harness that starts its own Ollama (on a spare port) under
+        # the macOS sandbox and sends a pull straight to it.
         run: |
-          node scripts/live-check.mjs --only "${{ inputs.live_groups || 'env,ollama,e2e' }}" --allow-pull --timeout-scale 4 --quiet --no-color \
+          node scripts/live-check.mjs --only "${{ inputs.live_groups || 'env,ollama,e2e' }}" --allow-pull --allow-internet --timeout-scale 4 --quiet --no-color \
             --json /tmp/harness-live.json --markdown /tmp/harness-live.md || echo "live-check exit code $?"
           node scripts/ci/summarize-live-check.mjs /tmp/harness-live.json "${{ inputs.live_samples }}"
 
@@ -170,10 +181,22 @@ jobs:
         run: brew install ollama > /dev/null
       - name: Doctor on a fresh Mac
         run: node scripts/doctor.mjs 2>&1 | tail -n 45 || true
-      - name: Get the model the way the setup script does (Harness starts Ollama, pulls, makes the text-only copy)
+      - name: Choose a Harness password (as the owner would in the setup screen; it stays in a 0600 file)
+        run: |
+          set -euo pipefail
+          umask 077
+          node -e 'process.stdout.write(require("crypto").randomBytes(18).toString("base64url"))' > "$RUNNER_TEMP/harness-pw"
+          node server/index.mjs --port 4747 > "$RUNNER_TEMP/setup-server.log" 2>&1 &
+          pid=$!
+          for _ in $(seq 1 100); do curl -fsS http://127.0.0.1:4747/api/health > /dev/null 2>&1 && break; sleep 0.2; done
+          # The password goes in on stdin and the recovery key is checked for shape and discarded - neither is printed.
+          node -e 'let s="";process.stdin.on("data",(d)=>{s+=d}).on("end",async()=>{const r=await fetch("http://127.0.0.1:4747/api/security/setup",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:s.trim()})});const j=await r.json().catch(()=>({}));console.log(`setup: HTTP ${r.status}, state ${j.state}, recovery key ${/^HRK1-/.test(j.recoveryKey||"")?"returned (discarded)":"MISSING"}`);process.exit(r.ok?0:1)})' < "$RUNNER_TEMP/harness-pw"
+          kill "$pid"; wait "$pid" 2>/dev/null || true
+          node scripts/doctor.mjs --state
+      - name: Get the model the way the setup script does (password on stdin; allow internet for the download only)
         run: |
           set -o pipefail
-          node scripts/get-model.mjs --yes --model "$TAG" 2>&1 | tr '\r' '\n' | grep -v '^$' | tail -n 30
+          node scripts/get-model.mjs --yes --password-stdin --model "$TAG" < "$RUNNER_TEMP/harness-pw" 2>&1 | tr '\r' '\n' | grep -v '^$' | grep -vE '^  (pulling|verifying|writing)' | tail -n 30
           sleep 3
           if pgrep -x ollama > /dev/null; then echo "NOTE: an ollama process is still running after get-model exited"; else echo "ollama is stopped again, as expected"; fi
           tail -n 15 "$HOME/Library/Application Support/Harness/logs/harness.log" 2>/dev/null || true
@@ -186,7 +209,17 @@ jobs:
             sleep 0.3
           done
           curl -fsS "$O/api/tags" | jq -c '.models[] | {name, size}'
+      - name: Internet blocked again, data locked at rest
+        run: |
+          node scripts/doctor.mjs 2>&1 | grep -E 'Harness .*running|Harness is not running|Data protection|Internet blocker|self-test' || true
+          # The data dir holds no readable chat text: grep for a word every settings file used to contain.
+          if grep -rIl 'providers' "$HOME/Library/Application Support/Harness" 2>/dev/null | grep -vE '/(logs|Electron)/|launch.json|vault.json|harness.lock|measurements.json' | head -n 5; then echo "NOTE: plain-text files above"; else echo "no plain-text data files found"; fi
       - name: The user's scenario, end to end
+        # nemotron-e2e.mjs drives its own temporary Harness over plain HTTP: use the documented development opt-out
+        # for that process (docs/API.md 10.10); the 0.2 defaults are covered by the steps above and the live job.
+        env:
+          HARNESS_ENCRYPTION: "off"
+          HARNESS_API_AUTH: "0"
         run: node scripts/ci/nemotron-e2e.mjs
 
   hub:

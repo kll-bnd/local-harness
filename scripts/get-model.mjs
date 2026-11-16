@@ -132,7 +132,7 @@ const avoid = (m.avoid || []).find((a) => a.model === tag);
 if (avoid) { console.error(`Not downloading ${tag}: ${avoid.reason}`); await done(1); }
 const textOnly = m.suggestTextOnly && v?.textOnly?.model ? v.textOnly : null;
 
-console.log(`\n${m.name}: ${tag}${v?.approxSizeBytes ? ` (download ~${fmtGB(v.approxSizeBytes)})` : ''}`);
+console.log(`\n${v ? `${m.name}: ` : ""}${tag}${v?.approxSizeBytes ? ` (download ~${fmtGB(v.approxSizeBytes)})` : ''}`);
 if (m.lowRamNote) console.log(`  ${m.lowRamNote}`);
 else if (v?.estimate?.explanation) console.log(`  ${v.estimate.explanation}`);
 if (!modelArg && m.largestRealisticVariant && m.largestRealisticVariant !== tag) console.log(`  For the largest realistic file instead: npm run get-model -- --model ${m.largestRealisticVariant}`);
@@ -180,8 +180,8 @@ await done(0);
 /** Make sure the download may reach the internet: ask, then allow for `minutes` with the password. */
 async function allowInternet() {
   const net = await api('GET', '/api/network');
-  const o = net.data?.offlineLock;
-  if (!net.ok || !o) return true; // a Harness without the blocker
+  const o = net.data?.offlineLock || net.data; // GET /api/network answers the offlineLock object itself (§10.6)
+  if (!net.ok || !o || typeof o.blocked !== 'boolean') return true; // a Harness without the blocker
   if (!o.blocked) { console.log(`Internet access in Harness: ${describeOfflineLock(o)}`); return true; }
   console.log(`\nInternet access is blocked in Harness (the default: chat never needs it). The download needs it, so
 Harness can allow it for ${minutes} minutes — it blocks again by itself when that time is up (a download still

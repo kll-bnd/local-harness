@@ -166,12 +166,13 @@ const mkData = (name) => fs.mkdtempSync(path.join(base, `e2e-${name}-`));
 {
   const S = 'server-error';
   const dataDir = mkData('server-error');
-  fs.mkdirSync(path.join(dataDir, 'memories.json')); // a directory where the backend expects a file → EISDIR
+  fs.mkdirSync(path.join(dataDir, 'memories.json')); // 0.1: a directory where the backend expects a file → EISDIR
+  fs.writeFileSync(path.join(dataDir, 'vault.json'), JSON.stringify({ version: 99 })); // 0.2: not a key store → vault_corrupt
   const port = await freePort();
   const r = await launch({ dataDir, port, timeoutMs: 30000 });
   report(S, 'exits with code 1', r.code === 1, { code: r.code, signal: r.signal });
   const log = fs.existsSync(path.join(dataDir, 'logs', 'harness.log')) ? fs.readFileSync(path.join(dataDir, 'logs', 'harness.log'), 'utf8') : '';
-  report(S, 'error is written to the log file', /server failed to start[\s\S]*EISDIR/.test(log), log.slice(-400));
+  report(S, 'error is written to the log file', /server failed to start[\s\S]*(EISDIR|vault)/.test(log), log.slice(-400));
   report(S, 'no server left listening', !(await portOpen(port)));
 }
 

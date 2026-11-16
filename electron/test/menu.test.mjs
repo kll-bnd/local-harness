@@ -60,11 +60,20 @@ test('non-mac menu has no app menu; Settings and Quit live in File', () => {
   assert.ok(file.some((i) => i.role === 'quit'));
 });
 
-test('dock menu offers New Chat', () => {
+test('dock menu offers New Chat and Lock Harness', () => {
   const sent = [];
   const t = m.buildDockMenuTemplate({ send: (a) => sent.push(a) });
-  t[0].click();
-  assert.deepEqual(sent, ['new-chat']);
+  t.forEach((i) => i.click());
+  assert.deepEqual(sent, ['new-chat', 'lock']);
+});
+
+test('Lock Harness is ⌃⌘L in the app menu on macOS, Ctrl+Shift+L in File elsewhere', () => {
+  const mac = build(true).t;
+  const lock = mac[0].submenu.find((i) => i.id === 'action:lock');
+  assert.equal(lock.accelerator, 'Control+Command+L');
+  assert.equal(lock.label, 'Lock Harness');
+  const other = build(false).t;
+  assert.equal(other[0].submenu.find((i) => i.id === 'action:lock').accelerator, 'Control+Shift+L');
 });
 
 test('context menu: spelling, links, images, editable fields, selection', () => {

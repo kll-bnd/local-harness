@@ -7,6 +7,11 @@
 // accounts, a copied disk or a stolen backup. What it does not: any program running as this user can run
 // `security find-generic-password` too (macOS may ask the user first, depending on the item's access list).
 //
+// Prompts: an item created by the native app cannot be read by /usr/bin/security without a macOS prompt, and vice
+// versa (and an app rebuilt with a new signature gets one prompt), so each side may ask the user once. A call that
+// is denied, or that waits for a prompt nobody answers, ends with a KeychainError (`denied` / `timeout`) after at
+// most KEYCHAIN_TIMEOUT_MS instead of hanging; Harness then stays locked and the password still opens it.
+//
 // Elsewhere (development, CI): a 0600 file `.dev-keychain` in the data directory — clearly NOT protection.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -17,21 +22,40 @@ export const KEYCHAIN_ACCOUNT = 'data-key';
 export const KEYCHAIN_LABEL = 'Harness data key';
 
 const B64_32 = /^[A-Za-z0-9+/]{43}=$/;
+export const KEYCHAIN_TIMEOUT_MS = Number(process.env.HARNESS_KEYCHAIN_TIMEOUT_MS) || 60000;
 
-function runSecurity(bin, commands, { timeoutMs = 15000 } = {}) {
+/** reason: 'denied' (the user or macOS refused), 'timeout' (no answer — a prompt may be waiting), 'failed'. */
+export class KeychainError extends Error {
+  constructor(reason, message) { super(message); this.reason = reason; this.code = `keychain_${reason}`; }
+}
+
+function runSecurity(bin, commands, { timeoutMs = KEYCHAIN_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     let child;
-    try { child = spawn(bin, ['-i'], { stdio: ['pipe', 'pipe', 'pipe'] }); } catch (e) { resolve({ ok: false, out: '', err: e.message }); return; }
+    try { child = spawn(bin, ['-i'], { stdio: ['pipe', 'pipe', 'pipe'] }); } catch (e) { resolve({ ok: false, out: '', err: e.message, failed: true }); return; }
     let out = '';
     let err = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
-    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, out, err: e.message }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, out, err }); });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, out, err: e.message, failed: true }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ ok: code === 0 && !timedOut, code, out, err, timedOut }); });
     child.stdin.on('error', () => {});
     child.stdin.end(commands.join('\n') + '\n');
   });
+}
+
+// security(1) messages: -25300 errSecItemNotFound; -128 userCanceled; -25293 errSecAuthFailed;
+// -25308 errSecInteractionNotAllowed (no UI possible, e.g. a locked login keychain over SSH).
+const NOT_FOUND = /could not be found|-25300/i;
+const DENIED = /user canceled|cancelled|-128\b|-25293|-25308|interaction is not allowed|not permitted|authorization/i;
+
+function classify(r, action) {
+  if (r.timedOut) return new KeychainError('timeout', `The Keychain did not answer within ${Math.round(KEYCHAIN_TIMEOUT_MS / 1000)} s while ${action} (a macOS prompt may be waiting for an answer). Harness stays locked; the password still opens it.`);
+  if (r.failed) return new KeychainError('failed', `Could not run the Keychain tool while ${action}.`);
+  if (DENIED.test(r.err)) return new KeychainError('denied', `The Keychain refused access while ${action} (the prompt was denied or cannot be shown). Harness stays locked; the password still opens it.`);
+  return null;
 }
 
 /** The macOS login Keychain via /usr/bin/security (the binary is injectable for tests). */
@@ -39,19 +63,29 @@ export function macKeychain({ securityBin = process.env.HARNESS_SECURITY_BIN || 
   const q = (s) => `"${String(s).replace(/["\\]/g, '\\$&')}"`;
   return {
     kind: 'keychain',
+    /** The stored key, or null when there is no item. Throws KeychainError when access is denied or times out. */
     async get() {
       const r = await runSecurity(securityBin, [`find-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)} -w`]);
       const line = r.out.split(/\r?\n/).map((l) => l.trim().replace(/^security>\s*/, '')).find((l) => B64_32.test(l));
-      return line ? Buffer.from(line, 'base64') : null;
+      if (line) return Buffer.from(line, 'base64');
+      const e = classify(r, 'reading the Harness key');
+      if (e) throw e;
+      return null; // not found (or an unexpected answer): no key
     },
     async set(key) {
       const v = Buffer.from(key).toString('base64');
       const r = await runSecurity(securityBin, [`add-generic-password -U -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)} -l ${q(KEYCHAIN_LABEL)} -w ${v}`]);
-      if (!r.ok && !/^\s*$/.test(r.err) && /error|could not/i.test(r.err)) throw new Error(`Could not store the key in the Keychain: ${r.err.trim().slice(0, 200)}`);
+      const e = classify(r, 'storing the Harness key');
+      if (e) throw e;
       const back = await this.get();
-      if (!back || !back.equals(Buffer.from(key))) throw new Error('The Keychain did not return the stored key');
+      if (!back || !back.equals(Buffer.from(key))) throw new KeychainError('failed', 'The Keychain did not give back the stored key.');
     },
-    async delete() { await runSecurity(securityBin, [`delete-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)}`]); },
+    async delete() {
+      const r = await runSecurity(securityBin, [`delete-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)}`]);
+      if (NOT_FOUND.test(r.err)) return;
+      const e = classify(r, 'removing the Harness key');
+      if (e) throw e;
+    },
   };
 }
 
