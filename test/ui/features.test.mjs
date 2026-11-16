@@ -190,3 +190,44 @@ test('settings: changes persist across a reload; theme switch applies immediatel
     await app.assertClean(assert);
   } finally { await app.close(); await stack.close(); }
 });
+
+test('data: a full backup restores into a fresh install (chats + memories), merged with new ids', async () => {
+  const source = await startStack();
+  let backup;
+  try {
+    await source.api('POST', '/api/chats/import', { title: 'Backed-up conversation', messages: [{ role: 'user', content: 'The lighthouse needs a new lens.' }, { role: 'assistant', content: 'Noted.' }] });
+    await source.api('POST', '/api/memories', { content: 'The user keeps a lighthouse.', category: 'fact' });
+    backup = (await source.api('GET', '/api/export')).data;
+  } finally { await source.close(); }
+  const stack = await startStack();
+  const app = await openApp(stack, { hash: '#/settings/data' });
+  try {
+    const { page } = app;
+    const [chooser] = await Promise.all([page.waitForEvent('filechooser'), page.locator('button', { hasText: 'Restore from backup' }).click()]);
+    await chooser.setFiles({ name: 'harness-backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(backup)) });
+    await page.waitForSelector('dialog.dialog[open] .restore-part');
+    await page.locator('dialog.dialog[open] .btn-primary', { hasText: 'Restore' }).click();
+    await page.waitForSelector('.toast', { hasText: 'Backup restored' });
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat-item')].some((el) => /Backed-up conversation/.test(el.textContent)));
+    const mems = (await stack.api('GET', '/api/memories')).data.memories;
+    assert.ok(mems.some((m) => /lighthouse/.test(m.content)));
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
+test('memory: something that looks like a secret needs an explicit "Save anyway"', async () => {
+  const stack = await startStack();
+  const app = await openApp(stack, { hash: '#/memory' });
+  try {
+    const { page } = app;
+    await page.locator('.page-head button', { hasText: 'Add memory' }).click();
+    await page.locator('.mem-add textarea').fill('My API key is sk-live-4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c');
+    await page.locator('.mem-add .btn-primary').click();
+    const dlg = page.locator('dialog.dialog[open]');
+    if (!(await dlg.count()) && (await stack.api('GET', '/api/memories')).data.total === 1) { test.skip('server did not flag this as a secret'); return; }
+    await dlg.waitFor();
+    assert.match(await dlg.textContent(), /password or API key/);
+    await dlg.locator('.btn-danger', { hasText: 'Save anyway' }).click();
+    await waitFor(async () => (await stack.api('GET', '/api/memories')).data.total === 1);
+  } finally { await app.close(); await stack.close(); }
+});

@@ -115,6 +115,12 @@ export class Inspector {
       onCompact: () => compactNow(m).then(() => this.render()),
       onSwitchModel: (suggested) => {
         const ref = typeof suggested === 'string' ? { model: suggested } : { providerId: suggested.providerId, model: suggested.model };
+        if (!findModel(ref)) {
+          // Not installed yet (or only usable as a text-only copy): the guided setup handles download + copy.
+          navigate('/setup');
+          toast({ message: `Set up ${modelShort(ref.model, 40)}`, detail: 'Download it from the recommendations; on 8 GB Harness makes a text-only copy for you.', id: 'switch-setup' });
+          return;
+        }
         this.patch({ settings: { model: ref } });
         toast({ kind: 'success', message: `This chat now uses ${modelShort(ref.model, 40)}`, action: { label: 'Make default', run: () => patchSettings({ defaultModel: ref }).catch((e) => showError(e)) } });
       },

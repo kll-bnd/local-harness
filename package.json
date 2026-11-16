@@ -20,7 +20,8 @@
     "dist:linux-dir": "electron-builder --linux dir",
     "test:e2e": "node electron/test/e2e.mjs",
     "icons": "node scripts/make-icons.mjs",
-    "live-check": "node scripts/live-check.mjs"
+    "live-check": "node scripts/live-check.mjs",
+    "test:ui": "node --test --test-concurrency=2 \"test/ui/*.test.mjs\""
   },
   "license": "UNLICENSED",
   "author": "Harness",

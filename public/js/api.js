@@ -192,6 +192,8 @@ export const chats = {
 
 export const search = (q, { limit } = {}, opts = {}) => get(`/api/search${qs({ q, limit })}`, opts);
 export const backupUrl = () => '/api/export';
+/** Restore a harness.backup (merged, new ids). parts: { chats, attachments, images, memories, presets } booleans; settings: 'skip'|'safe'|'full'. */
+export const restore = (backup, { settings = 'skip', ...parts } = {}) => post(`/api/restore${qs({ settings, ...Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, v ? '1' : '0'])) })}`, backup);
 
 // ------------------------------------------------------------------------------------------------ 5.9
 export const memories = {

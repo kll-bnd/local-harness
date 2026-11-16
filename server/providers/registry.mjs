@@ -12,6 +12,18 @@ const STATUS_TTL = 3000;
 const MODELS_TTL = 4000;
 const SERVER_INFO_TTL = 3000;
 
+/**
+ * KV precision and where it comes from: the user's setting, the environment Harness gave the Ollama it started,
+ * or — for an Ollama Harness did not start, whose environment (OLLAMA_KV_CACHE_TYPE, set e.g. via launchctl for
+ * Ollama.app) it cannot see — f16 assumed, the largest, so RAM estimates err on the safe side.
+ */
+export function kvCacheTypeInfoFor(settings, managed) {
+  const t = settings?.context?.kvCacheType;
+  if (t && t !== 'auto') return { type: t, source: 'setting' };
+  if (managed) return { type: settings.ollama?.flashAttention !== false ? (settings.ollama?.kvCacheType || 'f16') : 'f16', source: 'managed' };
+  return { type: 'f16', source: 'assumed' };
+}
+
 export class ProviderRegistry {
   /** How long OpenAI-compatible model info (incl. the server's loaded context) is reused. */
   static serverInfoTtlMs = SERVER_INFO_TTL;
@@ -213,19 +225,11 @@ export class ProviderRegistry {
 
   /** Which KV cache precision the Ollama server is (probably) using. */
   kvCacheType(settings) {
-    return this.kvCacheTypeInfo(settings).type;
+    return kvCacheTypeInfoFor(settings, !!this?.ollamaProcess?.managed).type;
   }
 
-  /**
-   * KV precision and where it comes from: the user's setting, the environment Harness gave the Ollama it started,
-   * or — for an Ollama Harness did not start, whose environment it cannot see — f16 assumed (the largest, so RAM
-   * estimates err on the safe side).
-   */
   kvCacheTypeInfo(settings) {
-    const t = settings.context?.kvCacheType;
-    if (t && t !== 'auto') return { type: t, source: 'setting' };
-    if (this.ollamaProcess?.managed) return { type: settings.ollama?.flashAttention !== false ? (settings.ollama?.kvCacheType || 'f16') : 'f16', source: 'managed' };
-    return { type: 'f16', source: 'assumed' };
+    return kvCacheTypeInfoFor(settings, !!this?.ollamaProcess?.managed);
   }
 
   /**

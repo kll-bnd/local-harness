@@ -116,7 +116,7 @@ function warningList(plan, opts) {
   const ws = (plan.warnings || []).filter((w) => w.message && w.message !== plan.explanation);
   if (!ws.length) return null;
   return h('ul.warn-list', ws.map((w) => {
-    const suggested = w.suggestedModel || w.suggestion?.model || w.details?.suggestedModel || null;
+    const suggested = w.smallerModel || w.suggestedModel || w.suggestion?.model || null;
     return h('li', icon('warning', { size: 13 }), h('div.grow', h('div', w.message),
       suggested && opts.onSwitchModel ? h('button.btn.btn-small', { type: 'button', on: { click: () => opts.onSwitchModel(suggested, w) } }, `Switch to ${modelShort(typeof suggested === 'string' ? suggested : suggested.model, 32)}`) : null));
   }));

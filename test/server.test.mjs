@@ -163,7 +163,11 @@ describe('chats, streaming, reasoning, branching, tools', () => {
   });
 
   test('reasoning: Ollama thinking field and inline <think> tags stream as reasoning and are not resent', async () => {
-    const chat = await newChat(h.c);
+    // 'auto' (the default) never thinks: real Ollama turns thinking ON when `think` is omitted, so it is always sent.
+    const chat0 = await newChat(h.c);
+    await send(h.c, chat0, 'Why is the sky blue?', { model: { model: 'qwen3:4b' } });
+    assert.equal(h.fake.chatRequests().at(-1).think, false);
+    const chat = await newChat(h.c, { settings: { reasoning: { think: 'on' } } });
     const r = await send(h.c, chat, 'Why is the sky blue?', { model: { model: 'qwen3:4b' } });
     const reasoning = byType(r.events, 'reasoning').map((e) => e.delta).join('');
     assert.equal(reasoning, 'Thinking about: Why is the sky blue?');
@@ -182,7 +186,7 @@ describe('chats, streaming, reasoning, branching, tools', () => {
     const done = byType(r2.events, 'done')[0].message;
     assert.equal(done.content, 'You said: inline please');
     assert.equal(done.reasoning, 'Reasoning about: inline please');
-    assert.equal(h.fake.chatRequests().at(-1).think, undefined, 'no think flag for models without the capability');
+    assert.equal(h.fake.chatRequests().at(-1).think, false, 'think:false for models without the capability (accepted by Ollama)');
   });
 
   test('branching: regenerate, edit-and-resend, switch branch, delete subtree', async () => {

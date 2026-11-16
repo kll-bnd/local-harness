@@ -226,6 +226,7 @@ describe('image generation (16 GB machine)', () => {
 
   test('16 GB auto mode keeps a small chat model loaded when it fits', async () => {
     const chat = await newChat(h.c);
+    h.fake.loaded.clear(); // only the small model resident (the 7.9 GB official Nemotron would not leave room)
     await send(h.c, chat, 'hi', { model: { model: 'qwen3:4b' } });
     h.fake.unloads.length = 0;
     const r = await h.c.sse('/api/images/generate', { providerId: 'dt', prompt: 'x', model: 'sd_turbo.safetensors [a1b2c3]' });

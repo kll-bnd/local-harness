@@ -177,7 +177,7 @@ describe('model management, system info, events', () => {
     assert.ok(s.machine.memoryBudget.budgetBytes > 0);
     assert.equal(s.providers[0].id, 'ollama');
     assert.equal(s.providers[0].status, 'running');
-    assert.equal(s.providers[0].version, '0.12.6-fake');
+    assert.equal(s.providers[0].version, '0.40.13-fake');
     assert.ok('installed' in s.ollama && s.ollama.recommendedEnv.OLLAMA_FLASH_ATTENTION === '1');
     assert.ok(Array.isArray(s.imageProviders));
     assert.equal(s.embeddings.enabled, false);
@@ -235,9 +235,15 @@ describe('Ollama process management', () => {
       assert.equal(env.OLLAMA_KV_CACHE_TYPE, 'q8_0');
       assert.equal(env.OLLAMA_NUM_PARALLEL, '1');
       assert.equal(env.OLLAMA_MAX_LOADED_MODELS, '1');
+      assert.equal(env.OLLAMA_NO_CLOUD, '1', 'everything stays on this Mac');
+      assert.equal(env.LLAMA_ARG_CACHE_RAM, '512', 'prompt cache capped on 8 GB (runner default 8192 MiB)');
       assert.equal(env.argv[0], 'serve');
+      const sys = (await h.c.get('/api/system')).data.ollama;
+      assert.equal(sys.protections.inEffect, true);
+      assert.equal(sys.env.LLAMA_ARG_CACHE_RAM, '512', 'the environment Harness set is reported');
+      assert.match(sys.protections.message, /prompt cache capped at 512 MiB \(LLAMA_ARG_CACHE_RAM=512\).*no cloud features \(OLLAMA_NO_CLOUD=1\)|no cloud features.*prompt cache capped at 512 MiB/);
       // the app now knows the KV cache is q8_0 → larger context estimate
-      const plan = (await h.c.get('/api/models/context?model=' + encodeURIComponent('hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:Q4_K_M'))).data.contextPlan;
+      const plan = (await h.c.get('/api/models/context?model=' + encodeURIComponent('hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL'))).data.contextPlan;
       assert.equal(plan.memory.kvCacheType, 'q8_0');
       const again = await h.c.post('/api/providers/ollama/start');
       assert.equal(again.data.alreadyRunning, true);

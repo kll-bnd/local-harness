@@ -365,7 +365,7 @@ function handleEvent(model, ev) {
   }
 }
 
-const BUDGET_CODES = ['model_exceeds_budget', 'exceeds_budget', 'measured_exceeds_budget', 'cpu_offload'];
+const BUDGET_CODES = ['model_exceeds_budget', 'exceeds_budget', 'measured_exceeds_budget', 'cpu_offload', 'model_too_big', 'memory_pressure'];
 const noticedOnce = new Set();
 
 /** Remember a notable machine event for the turn being generated (shown under the answer). */
@@ -382,6 +382,8 @@ function noticeTitle(ev) {
     case 'model_exceeds_budget': return 'This model is too large for this Mac';
     case 'measured_exceeds_budget': return 'This model uses more memory than is safe';
     case 'cpu_offload': return 'Part of the model runs on the CPU (slower)';
+    case 'model_too_big': return 'This model file is too big for this Mac';
+    case 'memory_pressure': return 'macOS is swapping with this model';
     case 'exceeds_budget': return 'Context window is larger than memory allows';
     case 'context_truncated': return 'Older messages were left out to fit the context';
     case 'tools_unsupported': return "This model can't use tools";

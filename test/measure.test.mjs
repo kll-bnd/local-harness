@@ -5,11 +5,14 @@ import { computeContextPlan, fitMeasurements, kvCacheModel, overheadBytes, round
 import { formatTokensK } from '../server/lib/util.mjs';
 import { MeasurementStore } from '../server/context/measurements.mjs';
 import { profileFor } from '../server/providers/catalog.mjs';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { setup, newChat, send, byType, tmpDir, GiB } from './helpers.mjs';
 
 const MAC8 = { totalMem: 8 * GiB, platform: 'darwin', arch: 'arm64' };
 const BUDGET8 = Math.floor(8 * GiB - 3.25 * GiB);
-const nemoArch = { blockCount: 35, embeddingLength: 2048, headCount: 8, headCountKv: 2, keyLength: 256, valueLength: 256, slidingWindow: 512 };
+// Real Nemotron 3.5 Bolt E4B metadata (gemma4: 18 of 42 blocks share KV; 4 global + 20 sliding-window layers).
+const nemoArch = { blockCount: 42, embeddingLength: 2560, headCount: 8, headCountKv: 2, keyLength: 512, valueLength: 512, keyLengthSwa: 256, valueLengthSwa: 256, slidingWindow: 512, sharedKvLayers: 18 };
 const nemoProfile = profileFor('nemotron-3.5-bolt:e4b');
 const Q4 = 4.6e9;
 const at = (i) => new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
@@ -23,18 +26,19 @@ describe('fitMeasurements / computeContextPlan with measurements (unit)', () => 
     const base = plan();
     assert.equal(base.memory.basis, 'estimate');
     assert.equal(base.memory.measurement, null);
-    assert.equal(base.numCtx, 4096);
-    // Real use at 4K is 300 MB lower than estimated → more context fits.
+    assert.equal(base.limitedBy, 'memory');
+    const n0 = base.numCtx;
+    // Real use is 300 MB lower than estimated → more context fits.
     const M = base.memory.estimatedTotalBytes - 300e6;
-    const p = plan({ measurements: [{ numCtx: 4096, totalBytes: M, vramBytes: M, at: at(1) }] });
+    const p = plan({ measurements: [{ numCtx: n0, totalBytes: M, vramBytes: M, at: at(1) }] });
     assert.equal(p.memory.basis, 'measured');
     assert.equal(p.memory.measurement.method, 'offset');
     assert.equal(p.memory.measurement.samples, 1);
     assert.equal(p.memory.measurement.perTokenBytes, kvPerToken);
-    assert.equal(p.memory.measurement.fixedBytes, Math.round(M - kvPerToken * 4096));
+    assert.equal(p.memory.measurement.fixedBytes, Math.round(M - kvPerToken * n0));
     assert.ok(p.numCtx > base.numCtx, `${p.numCtx} > ${base.numCtx}`);
     assert.ok(p.memory.estimatedTotalBytes <= BUDGET8);
-    assert.match(p.explanation, /calibrated from 1 measurement of this model \(last: \d+\.\d GB at 4K\)/);
+    assert.ok(p.explanation.includes(`calibrated from 1 measurement of this model (last: `) && p.explanation.includes(` at ${formatTokensK(n0)})`), p.explanation);
     assert.match(p.explanation, /measured-corrected/);
   });
 
@@ -143,18 +147,51 @@ describe('MeasurementStore', () => {
     assert.equal(again.get('ollama', 'm:1').samples.length, 1, 'a new build starts a fresh entry');
   });
 
-  test('measure(): context_length is optional; a smaller reported context (server cap) wins', async () => {
+  test('measure(): runner RSS is the size; ps size is only the non-weights part; context_length optional; remote/non-macOS not measured', async () => {
     const st = new MeasurementStore(null);
-    const prov = (entry) => ({ kind: 'ollama', id: 'ollama', ps: async () => [entry] });
-    const s1 = await st.measure(prov({ model: 'x:latest', sizeBytes: 5e9, vramBytes: 5e9 }), 'x', { numCtx: 8192, kvCacheType: 'f16' });
+    const blob = 'ab'.repeat(32);
+    const prov = (entries, baseUrl = 'http://127.0.0.1:11434') => ({ kind: 'ollama', id: 'ollama', baseUrl, ps: async () => entries });
+    const probe = (runners, pressure = { swapUsedBytes: 0, compressedBytes: 0, level: 1 }) => ({ runners: async () => runners, pressure: async () => pressure });
+    const runner = (rss) => [{ pid: 1, rssBytes: rss, modelBlob: blob, args: `llama-server --model /m/blobs/sha256-${blob}` }];
+    // RSS of the runner serving this blob
+    const s1 = await st.measure(prov([{ model: 'x:latest', sizeBytes: 90e6, vramBytes: 90e6 }]), 'x', { numCtx: 8192, kvCacheType: 'f16', sizeBytes: 4.2e9, modelBlob: blob, probe: probe(runner(4.4e9)) });
+    assert.equal(s1.source, 'rss');
+    assert.equal(s1.totalBytes, 4.4e9);
+    assert.equal(s1.psSizeBytes, 90e6);
     assert.equal(s1.numCtx, 8192);
     assert.equal(s1.reportedContext, null);
-    const s2 = await st.measure(prov({ model: 'x:latest', sizeBytes: 5e9, vramBytes: 4e9, contextLength: 4096 }), 'x', { numCtx: 8192, kvCacheType: 'f16' });
-    assert.equal(s2.numCtx, 4096);
-    assert.equal(s2.vramBytes, 4e9);
-    const s3 = await st.measure(prov({ model: 'x:latest', sizeBytes: 5e9, contextLength: 32768 }), 'x', { numCtx: 8192, kvCacheType: 'f16' });
+    assert.equal(s1.cpuBytes, 0);
+    // no runner visible → file + ps size (size excludes the weights) …
+    const s2 = await st.measure(prov([{ model: 'x:latest', sizeBytes: 300e6, vramBytes: 200e6, contextLength: 4096 }]), 'x', { numCtx: 8192, kvCacheType: 'f16', sizeBytes: 4.2e9, probe: probe([]) });
+    assert.equal(s2.source, 'ps');
+    assert.equal(s2.totalBytes, 4.5e9);
+    assert.equal(s2.numCtx, 4096, 'a smaller reported context (server cap) wins');
+    assert.equal(s2.cpuBytes, 100e6);
+    // … unless ps size is at least the file (CPU mode / older Ollama): then it already includes the weights
+    const s3 = await st.measure(prov([{ model: 'x:latest', sizeBytes: 4.538e9, vramBytes: 0, contextLength: 32768 }]), 'x', { numCtx: 8192, kvCacheType: 'f16', sizeBytes: 4.2e9, probe: probe([]) });
+    assert.equal(s3.totalBytes, 4.538e9);
     assert.equal(s3.numCtx, 8192, 'larger reported context (e.g. parallel slots) → keep what we sent');
-    assert.equal(await st.measure(prov({ model: 'other', sizeBytes: 1 }), 'x', { numCtx: 8192 }), null);
+    assert.equal(s3.cpuBytes, 4.538e9);
+    // swap growth across a load is recorded as pressure (and only for a load)
+    const before = { swapUsedBytes: 0.35e9, compressedBytes: 0.9e9, level: 1 };
+    const after = { swapUsedBytes: 1.01e9, compressedBytes: 1.9e9, level: 1 };
+    const s4 = await st.measure(prov([{ model: 'x:latest', sizeBytes: 90e6, vramBytes: 90e6 }]), 'x', { numCtx: 16384, kvCacheType: 'q8_0', sizeBytes: 4.2e9, modelBlob: blob, probe: probe(runner(2.7e9), after), baseline: before, loaded: true });
+    assert.equal(s4.pressure.signal, true, 'level stayed 1 but swap grew 0.66 GB');
+    assert.equal(s4.pressure.swapDeltaBytes, 0.66e9);
+    const s5 = await st.measure(prov([{ model: 'x:latest', sizeBytes: 90e6, vramBytes: 90e6 }]), 'x', { numCtx: 16384, kvCacheType: 'q8_0', sizeBytes: 4.2e9, modelBlob: blob, probe: probe(runner(2.7e9), after), baseline: before, loaded: false });
+    assert.equal(s5.pressure, null);
+    // not measured: no probe (not macOS), a remote Ollama, another model
+    assert.equal(await st.measure(prov([{ model: 'x:latest', sizeBytes: 1 }]), 'x', { numCtx: 8192, sizeBytes: 4.2e9 }), null);
+    assert.equal(await st.measure(prov([{ model: 'x:latest', sizeBytes: 1 }], 'http://studio.local:11434'), 'x', { numCtx: 8192, sizeBytes: 4.2e9, probe: probe(runner(4e9)) }), null);
+    assert.equal(await st.measure(prov([{ model: 'other', sizeBytes: 1 }]), 'x', { numCtx: 8192, probe: probe([]) }), null);
+  });
+
+  test('old-format entries (ps size taken as the total) are dropped on load', async () => {
+    const dir = await tmpDir();
+    await fs.writeFile(path.join(dir, 'measurements.json'), JSON.stringify({ 'ollama/a:1': { digest: 'd', sizeBytes: 1, samples: [{ numCtx: 4096, totalBytes: 90e6 }] }, 'ollama/b:1': { v: 2, digest: 'd', sizeBytes: 1, samples: [{ numCtx: 4096, totalBytes: 4e9 }] } }));
+    const st = await new MeasurementStore(dir).load();
+    assert.equal(st.get('ollama', 'a:1'), null);
+    assert.equal(st.get('ollama', 'b:1').samples.length, 1);
   });
 });
 
@@ -263,7 +300,7 @@ describe('end-to-end on an 8 GB Mac (fake Ollama /api/ps)', () => {
       const r1 = await send(h.c, chat, 'hello');
       const n = byType(r1.events, 'notice').find((x) => x.code === 'cpu_offload');
       assert.ok(n, JSON.stringify(byType(r1.events, 'notice')));
-      assert.match(n.message, /Ollama could only place 3\.6 GB of gemma3:4b \(\d\.\d GB\) on the GPU at 16K; \d+ MB runs on the CPU/);
+      assert.match(n.message, /Ollama could not place all of gemma3:4b on the GPU at 16K: \d+ MB runs on the CPU, which is much slower\./);
       const meas = (await h.c.get(`/api/models/measurements?model=${MODEL}`)).data;
       assert.equal(meas.samples[0].reportedContext, null, 'context_length absent → num_ctx we sent');
       assert.equal(meas.samples[0].numCtx, 16384);

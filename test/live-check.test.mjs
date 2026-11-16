@@ -62,9 +62,9 @@ async function deviant(target, { rules = () => null, transform = (req, status, t
 }
 
 /**
- * While server/context/measurements.mjs records /api/ps `size` as the model's whole footprint, make the fake report
- * that (weights + per-token KV at Harness's own f16 estimate for qwen3:4b). The fake now models real Ollama 0.40,
- * whose `size` excludes the weights; that case is the "KV-only /api/ps size" deviant test below.
+ * Only while server/context/measurements.mjs records /api/ps `size` as the model's whole footprint (the old design;
+ * the `measureTotal` anchor): make the fake report that. Harness now measures the runner's RSS on macOS and uses
+ * model file + ps size otherwise, matching the fake's real-Ollama-0.40 semantics, so this is a no-op.
  */
 function pinPsToTotalFootprint(fake, model = 'qwen3:4b', perTokenBytes = 147456) {
   if (!harnessAssumes('measureTotal')) return;
@@ -116,7 +116,8 @@ describe('live-check against the repo fakes', { concurrency: true }, () => {
     assert.ok(result.checks.length >= 100, `only ${result.checks.length} checks`);
     assert.ok(!result.checks.some((c) => /check crashed/.test(c.detail) || c.id === 'env.group_crash'), 'a check crashed');
     for (const layer of ['env', 'raw', 'e2e']) assert.ok(result.summary.byLayer[layer].PASS > 0, `no PASS in layer ${layer}`);
-    for (const id of ['e2e.chat_stream', 'e2e.tool_turn', 'e2e.compaction_auto', 'e2e.measurement', 'e2e.image_tool', 'e2e.pull_delete', 'a1111.txt2img.count2', 'comfyui.history', 'ollama.tools.call', 'openai.llamacpp.tools.deltas']) {
+    // e2e.measurement needs macOS (Harness reads the runner's RSS and swap growth there; elsewhere it is estimate-only).
+    for (const id of ['e2e.chat_stream', 'e2e.tool_turn', 'e2e.compaction_auto', ...(process.platform === 'darwin' ? ['e2e.measurement'] : []), 'e2e.image_tool', 'e2e.pull_delete', 'a1111.txt2img.count2', 'comfyui.history', 'ollama.tools.call', 'openai.llamacpp.tools.deltas']) {
       assert.notEqual(byId(result, id).status, 'SKIP', `${id} skipped`);
     }
     assert.equal(byId(result, 'e2e.memory_extraction').status, 'PASS');
@@ -194,7 +195,8 @@ describe('live-check against the repo fakes', { concurrency: true }, () => {
       assert.match(s('ollama.chat.prompt_eval_cached').fix, /calibrates only when promptTokens is truthy|only calibrates/);
       assert.equal(s('ollama.ps.context_length').status, 'WARN');
       assert.match(s('ollama.ps.context_length').detail, /absent/);
-      assert.equal(s('ollama.ps.size_grows_with_num_ctx').status, 'FAIL');
+      // A flat ps size only mattered while Harness took ps size as the footprint; it now measures the runner (macOS).
+      assert.equal(s('ollama.ps.size_grows_with_num_ctx').status, harnessAssumes('measureTotal') ? 'FAIL' : 'WARN');
       assert.match(s('ollama.ps.size_grows_with_num_ctx').detail, /did not grow/);
       assert.equal(s('ollama.keep_alive.number_-1').status, 'FAIL');
       assert.match(s('ollama.keep_alive.number_-1').detail, /rejected: HTTP 400 "keep_alive must not be negative"/);
@@ -238,7 +240,8 @@ describe('live-check against the repo fakes', { concurrency: true }, () => {
         assert.match(s('ollama.ps.measurement_fit').detail, /does not include the weights .* rejects every sample/);
         assert.match(s('ollama.ps.measurement_fit').fix, /MeasurementStore\.measure/);
       } else {
-        assert.equal(s('ollama.ps.measurement_fit').status, 'WARN');
+        // Harness records model file + ps size (or the runner RSS on macOS), which fits the estimate.
+        assert.equal(s('ollama.ps.measurement_fit').status, 'PASS', s('ollama.ps.measurement_fit').detail);
       }
     } finally {
       await proxy.close();

@@ -105,8 +105,8 @@ export function plural(n, one, many = `${one}s`) {
 // so the UI shows the catalog's name where it knows the model, else a cleaned-up id, and keeps the full id for
 // hover/details. registerModelNames() is fed from GET /api/models/recommended (and model info display names).
 const knownNames = new Map(); // model id → { name, tag }
-export function registerModelNames(entries) {
-  for (const [id, v] of entries) if (id && v?.name) knownNames.set(id, v);
+export function registerModelNames(entries, { overwrite = true } = {}) {
+  for (const [id, v] of entries) if (id && v?.name && (overwrite || !knownNames.has(id))) knownNames.set(id, v);
 }
 
 function quantOf(tag) {

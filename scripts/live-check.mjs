@@ -1465,17 +1465,20 @@ async function ollamaGroup(run, B) {
     const modelBytes = tagOf(C)?.size || 0;
     const overhead = H.overheadBytes(modelBytes);
     const estModelOnly = (ctx) => modelBytes + overhead + kv.perToken * ctx + kv.fixedFor(ctx);
-    const samples = [{ numCtx: 2048, totalBytes: entry1.size, vramBytes: entry1.size_vram, at: '1' }, { numCtx: 4096, totalBytes: entry2.size, vramBytes: entry2.size_vram, at: '2' }];
+    // What Harness records when it cannot see the runner's RSS: model file + ps size (ps size excludes the weights on
+    // Ollama ≥ 0.40; when it is at least the file size it already includes them). On macOS the runner RSS is used.
+    const asHarness = (e) => (harnessAssumes('measureTotal') || !modelBytes ? e.size : e.size >= modelBytes ? e.size : modelBytes + e.size);
+    const samples = [{ numCtx: 2048, totalBytes: asHarness(entry1), vramBytes: null, at: '1' }, { numCtx: 4096, totalBytes: asHarness(entry2), vramBytes: null, at: '2' }];
     const fit = H.fitMeasurements(samples, { estModelOnly, perToken: kv.perToken, modelBytes });
-    const lines = [`estimate (${kvType}): ${fmtBytes(estModelOnly(2048))} at 2K, ${fmtBytes(estModelOnly(4096))} at 4K, ${fmtBytes(kv.perToken)}/token; measured ${fmtBytes(entry1.size)} / ${fmtBytes(entry2.size)}`];
+    const lines = [`estimate (${kvType}): ${fmtBytes(estModelOnly(2048))} at 2K, ${fmtBytes(estModelOnly(4096))} at 4K, ${fmtBytes(kv.perToken)}/token; ps size ${fmtBytes(entry1.size)} / ${fmtBytes(entry2.size)} → recorded as ${fmtBytes(samples[0].totalBytes)} / ${fmtBytes(samples[1].totalBytes)}`];
     if (fit) lines.push(`fit: usable ${fit.usable}, method ${fit.method}, rejected ${fit.rejected}, fixed ${fmtBytes(fit.fixedBytes)}, per-token ${fmtBytes(fit.perTokenBytes)}`);
     if (!fit?.usable) {
       const noWeights = modelBytes > 0 && entry1.size < modelBytes * 0.5;
-      if (!harnessAssumes('measureTotal')) return WARN('the /api/ps samples would be rejected by fitMeasurements, but Harness no longer records ps size as the footprint (anchor gone) — re-check what it measures now', { info: lines });
+      if (!harnessAssumes('measureTotal')) return FAIL('the samples Harness would record (model file + ps size) are rejected by fitMeasurements\' sanity limits (0.4–3× the estimate)', { info: lines, fix: 'The architecture estimate is far off for this model, or ps size means something else here; on macOS Harness uses the runner RSS instead — compare with e2e.measurement.' });
       if (noWeights) return FAIL(`/api/ps size (${fmtBytes(entry1.size)}) does not include the weights (model file ${fmtBytes(modelBytes)}), so fitMeasurements rejects every sample (size < ½ weights) and the plan never becomes "measured"`, { info: lines, expected: 'size = weights + KV + buffers (what MeasurementStore.measure assumes)', actual: `size ${entry1.size} / ${entry2.size} bytes at num_ctx 2048 / 4096`, fix: 'In MeasurementStore.measure use weights + ps size (or the runner process RSS) as totalBytes.' });
       return FAIL('both real samples are rejected by fitMeasurements\' sanity limits (0.4–3× the estimate) — Harness would ignore real measurements of this model', { info: lines, fix: 'The architecture estimate is far off for this model; widen the sanity band or fix kvCacheModel for this architecture.' });
     }
-    const slope = (entry2.size - entry1.size) / 2048;
+    const slope = (samples[1].totalBytes - samples[0].totalBytes) / 2048;
     if (fit.method === 'linear-clamped') return WARN(`measured slope ${slope > 0 ? `${fmtBytes(slope)}/token` : `${Math.round(slope)} B/token (not positive)`} is outside ¼–4× of the estimate ${fmtBytes(kv.perToken)}/token, so the fit is clamped`, { info: lines, fix: slope > 0 ? 'kvCacheModel misjudges this architecture (sliding window? KV precision?); see ollama.ps.kv_cache_type.' : 'See ollama.ps.size_grows_with_num_ctx.' });
     return PASS(`usable linear fit (${fit.method})`, { info: lines });
   });
@@ -2737,6 +2740,7 @@ async function e2eGroup(run, B) {
 
     await run.check('e2e.measurement', async ({ sample }) => {
       need(P === 'ollama', 'measurements exist only for Ollama', 'an Ollama chat model');
+      need(process.platform === 'darwin', 'Harness measures real memory only on macOS (runner RSS + swap growth); elsewhere sizing stays estimate-only', 'macOS');
       need(turns[0]?.last('done'), 'first turn failed', 'e2e.chat_stream to pass');
       const r = await api('GET', `/api/models/measurements?${qs(C, P)}`);
       sample('harness GET /api/models/measurements', r.json);

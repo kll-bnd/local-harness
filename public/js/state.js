@@ -147,7 +147,7 @@ export async function modelInfo(ref, { refresh = false } = {}) {
   const key = `${ref.providerId || ''}|${ref.model}`;
   if (!refresh && infoCache.has(key)) return infoCache.get(key);
   const p = api.models.info(ref).then((r) => {
-    if (r?.info?.displayName) registerModelNames([[ref.model, { name: r.info.displayName.replace(/^NVIDIA\s+/, ''), tag: undefined }]]);
+    if (r?.info?.displayName) registerModelNames([[ref.model, { name: r.info.displayName, tag: undefined }]], { overwrite: false });
     return r;
   }).catch((e) => { infoCache.delete(key); throw e; });
   infoCache.set(key, p);

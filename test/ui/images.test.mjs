@@ -27,7 +27,7 @@ test('chat image at 8 GB: unload → generate → reload is shown, image renders
     await app.shot('10-image-generating');
     await waitIdle(page, 30000);
     const seen = [...await page.evaluate(() => [...window.__seen])].join('\n');
-    assert.match(seen, /Unload nemotron/i, 'unload step shown');
+    assert.match(seen, /Unload .*nemotron/i, 'unload step shown');
     assert.match(seen, /Generate/, 'generate step shown');
     const turn = lastTurn(page);
     assert.match(await turn.locator('.turn-status').textContent(), /Unloaded nemotron-3\.5-bolt:e4b to free memory/);
