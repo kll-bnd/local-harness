@@ -78,7 +78,7 @@ jobs:
     env:
       CHAT: qwen3:0.6b
       PLAIN: gemma3:270m
-      OLLAMA_LOG: ${{ runner.temp }}/ollama.log
+      OLLAMA_LOG: /tmp/harness-ci-ollama.log
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -106,7 +106,7 @@ jobs:
     timeout-minutes: 60
     env:
       TAG: ${{ inputs.nemotron_tag || 'UD-Q3_K_XL' }}
-      OLLAMA_LOG: ${{ runner.temp }}/ollama.log
+      OLLAMA_LOG: /tmp/harness-ci-ollama.log
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
