@@ -53,9 +53,10 @@ export function freePort() {
  *                                     docs/API.md 10.10, so flows that are not about security start in the app.
  * @param {boolean} [o.offlineLock]    override the internet blocker (secure stacks default to on)
  * @param {(dir: string) => Promise} [o.prepare]  write files into the data dir before the server starts
+ * @param {string} [o.reuseDataDir]    start on an existing data dir (e.g. one an opt-out stack left as 0.1 did)
  */
-export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false, secure = false, offlineLock, prepare } = {}) {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'harness-ui-'));
+export async function startStack({ ram = 16, models, ollama = true, image = true, delayMs = 2, stepMs = 30, pullStepMs = 60, settings = {}, ollamaBinary = false, secure = false, offlineLock, prepare, reuseDataDir = null } = {}) {
+  const dataDir = reuseDataDir || await fs.mkdtemp(path.join(os.tmpdir(), 'harness-ui-'));
   const fake = ollama ? await startFakeOllama({ port: 0, delayMs, models, pullStepMs }) : null;
   const a1111 = image ? await startFakeA1111({ port: 0, stepMs, drawThings: true }) : null;
   let ollamaUrl = fake?.url || `http://127.0.0.1:${await freePort()}`;

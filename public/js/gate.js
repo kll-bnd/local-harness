@@ -252,6 +252,7 @@ function recoveryKeyScreen(res) {
       h('p.gate-text', 'If you ever forget your password, this key is the only other way to open Harness.'),
       panel.el,
       h('p.gate-warning', icon('warning', { size: 14 }), h('span', RECOVERY_WARNING)),
+      panel.confirmEl,
       mig.el,
       h('div.gate-actions', cont),
     );

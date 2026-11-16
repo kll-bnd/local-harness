@@ -5,13 +5,28 @@ import { Reply } from './common.mjs';
 import { runEgressSelfTest } from '../security/selftest.mjs';
 import { MAX_ALLOW_MINUTES } from '../security/network.mjs';
 
+const SELFTEST_INTERVAL_MS = Number(process.env.HARNESS_SELFTEST_INTERVAL_MS ?? 10000);
 const confirmHeader = (req) => (typeof req.headers['x-harness-confirm'] === 'string' ? req.headers['x-harness-confirm'] : null);
 
-/** A session for the caller: a cookie (browsers) plus the same token in the body (CLI tools, §10.5). */
-function withSession(core, auth, bridge, body, status = 200) {
+/**
+ * `"session": "token"` asks for the session as a bearer token in the body (CLI tools). Only a caller that is not a
+ * browser page may: a request with an Origin header, or with Sec-Fetch-Site other than "none", is refused — page
+ * JavaScript must never see a session (browsers get the HttpOnly cookie only). Checked before anything happens.
+ */
+function wantsToken(req, body, bridge) {
+  if (body?.session === undefined || body.session === 'cookie') return false;
+  if (body.session !== 'token') throw new HttpError(400, 'bad_request', 'session must be "cookie" or "token"');
+  if (bridge) return false;
+  const site = req.headers['sec-fetch-site'];
+  if (req.headers.origin !== undefined || (site !== undefined && site !== 'none')) throw new HttpError(403, 'token_refused', 'A browser page gets its session as a cookie only.');
+  return true;
+}
+
+/** A session for the caller: the cookie, plus the same token in the body when `wantToken` (§10.5). */
+function withSession(core, bridge, body, wantToken, status = 200) {
   if (bridge || !core.auth.enabled) return new Reply(status, body);
   const s = core.auth.createSession();
-  return new Reply(status, { ...body, sessionToken: s.token, sessionExpiresAt: s.expiresAt }, { 'set-cookie': s.cookie });
+  return new Reply(status, { ...body, ...(wantToken ? { sessionToken: s.token, sessionExpiresAt: s.expiresAt } : {}) }, { 'set-cookie': s.cookie });
 }
 
 function authInfo(core, req, auth, bridge) {
@@ -27,19 +42,24 @@ export function registerSecurityRoutes(r, core) {
 
   r.get('/api/health', () => ({ ok: true, name: 'harness', version: core.version, state: core.state }), open);
 
-  r.get('/api/security', ({ req, auth, bridge }) => core.securityStatus(authInfo(core, req, auth, bridge)), open);
+  r.get('/api/security', async ({ req, auth, bridge }) => {
+    await core.refreshOllamaPresence();
+    return core.securityStatus(authInfo(core, req, auth, bridge));
+  }, open);
 
-  r.post('/api/security/setup', async ({ req, auth, bridge }) => {
+  r.post('/api/security/setup', async ({ req, bridge }) => {
     const body = await readJson(req);
+    const token = wantsToken(req, body, bridge);
     const out = await core.setup(body.password);
-    return withSession(core, auth, bridge, out);
+    return withSession(core, bridge, out, token);
   }, open);
 
   r.post('/api/security/unlock', async ({ req, auth, bridge }) => {
     const body = await readJson(req, { optional: true });
+    const token = wantsToken(req, body, bridge);
     const out = await core.unlock({ password: body.password, recoveryKey: body.recoveryKey }, { authenticated: bridge || auth.ok });
     if (core.state === 'migrating') core.retryMigration();
-    return withSession(core, auth, bridge, out);
+    return withSession(core, bridge, out, token);
   }, open);
 
   r.post('/api/security/lock', async () => {
@@ -80,8 +100,9 @@ export function registerSecurityRoutes(r, core) {
     const body = await readJson(req, { optional: true });
     if (bridge || !core.auth.enabled) return { authenticated: true };
     if (core.mode === 'password') throw new HttpError(401, 'auth_required', 'Enter your Harness password to continue.', { reason: 'invalid', unlock: true });
+    const token = wantsToken(req, body, bridge);
     if (!core.auth.redeemLaunchCode(body.code)) throw new HttpError(401, 'auth_required', 'This launch link has expired or was already used. Open Harness from its launcher again.', { reason: 'invalid', unlock: false });
-    return withSession(core, null, bridge, { authenticated: true });
+    return withSession(core, bridge, { authenticated: true }, token);
   }, open);
 
   r.get('/api/auth/status', ({ req, bridge }) => {
@@ -105,13 +126,14 @@ export function registerSecurityRoutes(r, core) {
   const netReply = async (reason) => {
     // A managed Ollama follows the user's allow/block (with / without the sandbox) as part of this request only.
     if (reason) await core.ollamaProcess.applySandbox().catch(() => {});
+    await core.refreshOllamaPresence();
     const restartRequired = reason === 'allow' && core.restartRequiredForAllow;
     if (restartRequired) core.emitEvent({ type: 'restart-required', reason: 'offline_lock' });
     core.app?.bus.publish('network.status', { offlineLock: core.network.status() });
     return { offlineLock: core.network.status(), restartRequired };
   };
 
-  r.get('/api/network', () => core.network.status());
+  r.get('/api/network', async () => { await core.refreshOllamaPresence(); return { offlineLock: core.network.status() }; });
 
   r.post('/api/network/allow', async ({ req, auth }) => {
     const body = await readJson(req, { optional: true });
@@ -136,7 +158,17 @@ export function registerSecurityRoutes(r, core) {
     return { offlineLock: out.offlineLock, restartRequired: out.restartRequired };
   });
 
-  r.post('/api/network/test', async () => runEgressSelfTest({ network: core.network, ollama: { sandboxExec: core.ollamaProcess.sandboxExec, profile: core.ollamaProcess.profile } }));
+  // No session needed (no user data; the doctor tests a locked Harness), but one run at a time and at most one
+  // every 10 s, because by design it makes one outbound attempt when an OS sandbox claims to block it.
+  let lastTest = 0;
+  let running = null;
+  r.post('/api/network/test', async () => {
+    const wait = lastTest + SELFTEST_INTERVAL_MS - Date.now();
+    if (running || wait > 0) throw new HttpError(429, 'rate_limited', 'The self-test ran a moment ago; try again shortly.', { retryAfterMs: Math.max(wait, 1000) });
+    lastTest = Date.now();
+    running = runEgressSelfTest({ network: core.network, ollama: { sandboxExec: core.ollamaProcess.sandboxExec, profile: core.ollamaProcess.profile } });
+    try { return await running; } finally { running = null; lastTest = Date.now(); }
+  }, open);
 }
 
 /** Routes over the unlocked data that belong to §10 (UI state). */

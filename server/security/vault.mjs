@@ -16,6 +16,27 @@ export function throttleDelay(failures) {
   return failures <= 3 ? 0 : Math.min(300000, 1000 * 2 ** (failures - 4));
 }
 
+const B64 = /^[A-Za-z0-9+/]+={0,2}$/;
+const isSealed = (w) => !!w && typeof w.nonce === 'string' && B64.test(w.nonce) && typeof w.data === 'string' && B64.test(w.data);
+
+/** Schema check: a key store that cannot open anything must never be taken for one. */
+export function validVault(m) {
+  if (!m || typeof m !== 'object' || m.version !== 1 || typeof m.encrypted !== 'boolean') return false;
+  if (typeof m.keyId !== 'string' || !/^[0-9a-f]{16}$/.test(m.keyId)) return false;
+  const w = m.wraps;
+  if (!w || typeof w !== 'object') return false;
+  if (!isSealed(w.password) || !w.password.kdf || w.password.kdf.name !== 'scrypt' || !Number.isInteger(w.password.kdf.N) || typeof w.password.kdf.salt !== 'string') return false;
+  if (w.recovery !== undefined && w.recovery !== null && (!isSealed(w.recovery) || typeof w.recovery.kdf?.salt !== 'string')) return false;
+  if (w.keychain !== undefined && !isSealed(w.keychain)) return false;
+  return true;
+}
+
+function readVaultFile(file) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { return { ok: false, missing: e.code === 'ENOENT' }; }
+  try { const meta = JSON.parse(text); return validVault(meta) ? { ok: true, meta } : { ok: false, missing: false }; } catch { return { ok: false, missing: false }; }
+}
+
 export class Vault {
   constructor(dataDir, { kdf } = {}) {
     this.dataDir = dataDir;
@@ -25,10 +46,23 @@ export class Vault {
     this.dek = null;
   }
 
+  /**
+   * Read vault.json; if it is unreadable, truncated or not a valid key store, fall back to the verified copy
+   * vault.json.bak (restoring it). Both bad → throws 503 vault_corrupt. Missing (and no copy) → meta null.
+   */
   load() {
-    try { this.meta = JSON.parse(fs.readFileSync(this.file, 'utf8')); } catch { this.meta = null; }
-    if (this.meta && (this.meta.version !== 1 || !this.meta.wraps)) throw new HttpError(500, 'vault_corrupt', 'vault.json is not a Harness key store');
-    return this;
+    this.restoredFromBackup = false;
+    const main = readVaultFile(this.file);
+    if (main.ok) { this.meta = main.meta; return this; }
+    const bak = readVaultFile(this.file + '.bak');
+    if (bak.ok) {
+      this.meta = bak.meta;
+      this.restoredFromBackup = true;
+      this.save();
+      return this;
+    }
+    if (main.missing && bak.missing) { this.meta = null; return this; }
+    throw new HttpError(503, 'vault_corrupt', 'The Harness key store (vault.json) is damaged and its backup copy cannot be used. Nothing has been changed; restore vault.json from a backup of this folder.');
   }
 
   get exists() { return !!this.meta; }
@@ -37,10 +71,23 @@ export class Vault {
   get hasPassword() { return !!this.meta?.wraps?.password; }
   get keyId() { return this.meta?.keyId || null; }
 
+  /**
+   * Atomic and verified: write a temporary file, fsync, read it back and compare, rename; then the same for the
+   * copy vault.json.bak — so at every moment at least one of the two is a complete, valid key store.
+   */
   save() {
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.meta, null, 2) + '\n', { mode: 0o600 });
-    fs.renameSync(tmp, this.file);
+    const text = JSON.stringify(this.meta, null, 2) + '\n';
+    for (const target of [this.file, this.file + '.bak']) {
+      const tmp = `${target}.${process.pid}.tmp`;
+      const fd = fs.openSync(tmp, 'w', 0o600);
+      try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      if (fs.readFileSync(tmp, 'utf8') !== text || !validVault(JSON.parse(text))) {
+        fs.rmSync(tmp, { force: true });
+        throw new HttpError(500, 'vault_write_failed', 'Could not write the Harness key store safely; nothing was changed.');
+      }
+      fs.renameSync(tmp, target);
+    }
+    try { const dfd = fs.openSync(path.dirname(this.file), 'r'); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch { /* not supported everywhere */ }
   }
 
   // ----------------------------------------------------------------------------------------- creation

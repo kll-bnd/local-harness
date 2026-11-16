@@ -8,7 +8,7 @@ import { Vault } from './security/vault.mjs';
 import { NetworkGuard } from './security/network.mjs';
 import { Auth } from './security/auth.mjs';
 import { platformKeychain, KeychainError } from './security/keychain.mjs';
-import { listDataFiles, migrateDir, hasPlainData, fixPermissions } from './security/migrate.mjs';
+import { listDataFiles, migrateDir, hasPlainData, hasEncryptedData, fixPermissions } from './security/migrate.mjs';
 import { seal, unseal, wipe, keyIdOf, setKdfDefaults } from './security/crypto.mjs';
 import { setDirCipher, ensureDir, flushWrites } from './lib/fsx.mjs';
 import { HttpError } from './lib/errors.mjs';
@@ -95,7 +95,9 @@ export class Core extends EventEmitter {
     await ensureDir(this.dataDir);
     await fixPermissions(this.dataDir).catch(() => {});
     this.launch.load();
-    this.vault.load();
+    let vaultError = null;
+    try { this.vault.load(); } catch (e) { vaultError = e; }
+    if (this.vault.restoredFromBackup) log.warn('vault.json was damaged; restored it from its verified copy vault.json.bak.');
     this.network = new NetworkGuard({ launch: this.launch, enabledOverride: this._lockOverride });
     this.network.ollamaInfo = () => ({ managed: this.ollamaProcess.managed, sandboxed: !!this.ollamaProcess.sandboxed, external: !!this.ollamaProcess.external });
     this.network.on('change', (ev) => this._onNetworkChange(ev));
@@ -110,6 +112,17 @@ export class Core extends EventEmitter {
     this.migration = this.vault.meta?.migration || null;
     this.auth.syncTokenFile();
     this._startIdleTimer();
+    // A damaged key store, or encrypted files without one, is a hard error: never offer a fresh setup over them
+    // (a new key store would orphan every encrypted file).
+    if (vaultError || (!this.vault.exists && (await hasEncryptedData(this.dataDir)))) {
+      this.state = 'error';
+      this.error = vaultError
+        ? { code: 'vault_corrupt', message: vaultError.message }
+        : { code: 'vault_missing', message: 'This data folder holds encrypted files but no key store (vault.json). Nothing has been changed; restore vault.json from a backup of this folder.' };
+      log.error(`Cannot open the data: ${this.error.code}`);
+      setDirCipher(this.dataDir, 'locked');
+      return this;
+    }
     if (!this.vault.exists) {
       if (mode === 'off') { await this._open(); return this; }
       this.plainDataFound = await hasPlainData(this.dataDir);
@@ -135,6 +148,7 @@ export class Core extends EventEmitter {
   /** For routes that need the data: the app, or 423. */
   requireApp() {
     if (this.state === 'unlocked' && this.app) return this.app;
+    if (this.state === 'error') throw new HttpError(503, this.error.code, this.error.message);
     if (this.state === 'needs_setup') throw new HttpError(423, 'needs_setup', 'Choose a Harness password first.');
     throw new HttpError(423, 'locked', this.state === 'migrating' ? 'Harness is converting its data; this takes a moment.' : 'Harness is locked. Enter your password to open it.');
   }
@@ -143,6 +157,7 @@ export class Core extends EventEmitter {
     const rk = this.vault.meta?.wraps?.recovery;
     return {
       state: this.state,
+      ...(this.state === 'error' ? { error: this.error } : {}),
       mode: this.mode,
       plainDataFound: this.state === 'needs_setup' ? this.plainDataFound : false,
       migration: this.migration ? { op: this.migration.op, done: this.migration.done, total: this.migration.total, startedAt: this.migration.startedAt, error: this.migration.error || null } : null,
@@ -185,6 +200,7 @@ export class Core extends EventEmitter {
       this.lastActivity = Date.now();
       this.keychainError = null;
       this._emitState();
+      this.emit('unlocked', {});
       this.emitEvent({ type: 'unlocked' });
       this.app.bus.publish('network.status', { offlineLock: this.network.status() });
       return this.app;
@@ -208,6 +224,20 @@ export class Core extends EventEmitter {
     return this.app?.settings.get().security?.allowedOrigins || this._ollamaCache.allowedOrigins || [];
   }
 
+  /**
+   * Whether an Ollama that Harness did not start is answering (offlineLock.externalOllama) — in every state; it
+   * needs no user data. Probed at most every 5 s.
+   */
+  async refreshOllamaPresence() {
+    const p = this.ollamaProcess;
+    if (p.managed) { p.external = false; return; }
+    if (this._presence && Date.now() - this._presence.at < 5000) return this._presence.promise;
+    const provider = this.app?.registry.ollama() || this._lockedOllamaProvider();
+    const promise = Promise.resolve(provider.status()).then((st) => { if (!p.managed) p.external = !!st?.ok; }, () => {});
+    this._presence = { at: Date.now(), promise };
+    return promise;
+  }
+
   /** While locked there is no registry: a minimal Ollama provider for start/stop/restart of a managed Ollama. */
   _lockedOllamaProvider() {
     const baseUrl = this._ollamaCache.baseUrl;
@@ -229,7 +259,7 @@ export class Core extends EventEmitter {
    */
   async lock(reason = 'user') {
     if (this._locking) return this._locking;
-    if (this.state === 'needs_setup' || this.state === 'locked') return;
+    if (this.state === 'needs_setup' || this.state === 'locked' || this.state === 'error') return;
     if (!this.vault.encrypted || !this.vault.exists) throw new HttpError(409, 'not_encrypted', 'Harness runs without encryption, so there is nothing to lock.');
     if (this.state === 'migrating') throw new HttpError(409, 'migrating', 'Harness is converting its data; lock it once that has finished.');
     this._locking = (async () => {
@@ -255,7 +285,11 @@ export class Core extends EventEmitter {
   // ------------------------------------------------------------------------------------------ setup / unlock
   async setup(password) {
     await this._locking;
+    if (this.state === 'error') throw new HttpError(409, this.error.code, this.error.message);
     if (this.state !== 'needs_setup') throw new HttpError(409, 'already_set_up', 'Harness already has a password.');
+    // Re-check right before creating keys: encrypted files or a key store must never be overwritten.
+    this.vault.load();
+    if (this.vault.exists || (await hasEncryptedData(this.dataDir))) throw new HttpError(409, 'already_set_up', 'This data folder already has a key store or encrypted files; setup was refused.');
     const recoveryKey = await this.vault.create(password, { encrypted: true });
     const mode = this.mode === 'off' ? 'password' : this.mode;
     this.launch.set({ encryption: mode });
@@ -278,6 +312,7 @@ export class Core extends EventEmitter {
    */
   async unlock(body = {}, ctx = {}) {
     await this._locking;
+    if (this.state === 'error') throw new HttpError(409, this.error.code, this.error.message);
     if (this.state === 'needs_setup') throw new HttpError(423, 'needs_setup', 'Choose a Harness password first.');
     const { password, recoveryKey } = body;
     const already = this.state === 'unlocked' || this.state === 'migrating';
@@ -513,7 +548,7 @@ export class Core extends EventEmitter {
         this.vault.setMigration(null);
         this.migration = null;
         if (this._oldKeys) { for (const k of this._oldKeys) wipe(k); this._oldKeys = null; }
-        this.state = 'locked';
+        // migrating → unlocked directly (no locked moment in between)
         if (op === 'decrypt') { setDirCipher(this.dataDir, null); this.vault.lock(); } else setDirCipher(this.dataDir, { key: this.vault.dek });
         await this._open();
       } catch (e) {

@@ -174,6 +174,8 @@ export function chatModel(id) {
 export function peekChatModel(id) { return models.get(id) || null; }
 export function forgetChatModel(id) { const m = models.get(id); if (m?.live) m.live.controller?.abort(); models.delete(id); }
 export function liveChats() { return [...models.values()].filter((m) => m.live); }
+/** Harness is locking: stop every stream and drop every chat held in memory. */
+export function forgetAllChatModels() { for (const m of models.values()) { try { m.live?.controller?.abort(); } catch { /* ignore */ } } models.clear(); }
 
 // ------------------------------------------------------------------------------------------------ live state
 function setLive(model, patch) {

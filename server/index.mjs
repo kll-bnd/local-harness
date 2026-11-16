@@ -219,7 +219,7 @@ export async function startServer({ port = DEFAULT_PORT, dataDir, openBrowser = 
   const auth = {
     /** A session for an in-process shell (Electron). Throws while locked in password mode. */
     createSession() {
-      if (core.state !== 'unlocked' && core.mode === 'password') throw new HttpError(423, 'locked', 'Harness is locked.');
+      if (core.state !== 'unlocked' && core.state !== 'migrating' && core.mode === 'password') throw new HttpError(423, 'locked', 'Harness is locked.');
       const s = core.auth.createSession();
       return { name: 'harness_session', value: s.token, maxAgeSec: Math.round((Date.parse(s.expiresAt) - Date.now()) / 1000), expiresAt: s.expiresAt };
     },
@@ -245,7 +245,16 @@ export async function startServer({ port = DEFAULT_PORT, dataDir, openBrowser = 
     })();
     return closing;
   };
-  return { port: actual, url, close, core, auth, get app() { return core.app; } };
+  // Lock state for an in-process shell (Electron): `security.state` now; events 'state' { state, mode },
+  // 'locked' { reason }, 'unlocked' {} via on()/off(); `security.lock(reason)` locks without an HTTP round trip.
+  const shell = {
+    get state() { return core.state; },
+    get mode() { return core.mode; },
+    lock: (reason = 'app') => core.lock(reason),
+    on: (event, fn) => { core.on(event, fn); return () => core.off(event, fn); },
+    off: (event, fn) => core.off(event, fn),
+  };
+  return { port: actual, url, close, core, auth, security: shell, on: shell.on, off: shell.off, get app() { return core.app; } };
 }
 
 // ---------------------------------------------------------------------------------------------- CLI
@@ -256,8 +265,7 @@ if (isMain) {
   const dataDir = get('--data-dir') || process.env.HARNESS_DATA_DIR || undefined;
   if (args.includes('--bridge')) {
     // Native app: frames on stdin/stdout, no listening socket (docs/BRIDGE.md).
-    const { runBridge } = await import('./bridge/server.mjs');
-    runBridge({ dataDir });
+    import('./bridge/server.mjs').then(({ runBridge }) => runBridge({ dataDir })).catch((e) => { console.error(e); process.exit(1); });
   } else {
     const port = Number(get('--port') || process.env.HARNESS_PORT || DEFAULT_PORT);
     const openBrowser = args.includes('--open') || process.env.HARNESS_OPEN === '1';

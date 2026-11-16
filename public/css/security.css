@@ -62,10 +62,11 @@
 /* ---------------------------------------------------------------- recovery key */
 .rk-panel { display: flex; flex-direction: column; gap: 10px; }
 .rk-key {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(52px, 1fr)); gap: 6px 8px; padding: 14px;
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px 4px; padding: 14px 10px;
   border-radius: var(--r-md); background: var(--bg-subtle); box-shadow: inset 0 0 0 0.5px var(--border);
-  font: 500 14px/1.3 var(--font-mono); letter-spacing: 0.04em; user-select: all; -webkit-user-select: all;
+  font: 500 14px/1.3 var(--font-mono); letter-spacing: 0.03em; user-select: all; -webkit-user-select: all;
 }
+@media (max-width: 420px) { .rk-key { grid-template-columns: repeat(4, 1fr); } }
 .rk-key:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .rk-group { text-align: center; }
 .rk-prefix { color: var(--fg-3); }

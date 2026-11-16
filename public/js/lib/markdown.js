@@ -160,6 +160,8 @@ function enhance(frag, { highlight = true, quietImages = false } = {}) {
 // Small LRU of finished renders: switching chats or re-rendering a turn never re-parses old messages.
 const cache = new Map();
 const CACHE_MAX = 400;
+/** Harness is locking: drop every rendered message. */
+export function clearMarkdownCache() { cache.clear(); }
 
 /** Big code blocks are highlighted after first paint, when the page is idle, if still on screen by then. */
 function deferHighlights(frag) {

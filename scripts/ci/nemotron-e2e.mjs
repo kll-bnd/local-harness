@@ -7,8 +7,15 @@
 //   env: OLLAMA_URL (default http://127.0.0.1:11434)  TAG (model to pull; default: the backend's choice)
 //        CLEANUP=1 (delete the text-only copy and the pulled model at the end)  BUDGET_MIN (default 25)
 //
-// Prints one compact line per fact and ends with a summary block (one line per step). Exit 0 when steps 1–8 passed.
+// Runs with the shipped 0.2 defaults: a throw-away password is set up through the API (POST /api/security/setup,
+// as the setup screen does), every request carries the session it returns, internet access is blocked until the
+// run allows it (password-confirmed) for the pull, and steps S2b/S6b/S11b prove encryption at rest, the blocker
+// and locking on the real Mac.
+//
+// Prints one compact line per fact and ends with a summary block (one line per step). Exit 0 when steps 1–8 and the
+// security steps (2b, 6b, 11b) passed.
 import http from 'node:http';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -64,13 +71,15 @@ async function step(n, name, fn, { optional = false, minLeftMs = 0 } = {}) {
 
 // ------------------------------------------------------------------------------------------------ HTTP (node:http)
 let BASE = null;
+let AUTH = {}; // { authorization: 'Bearer <session>' } once set up / unlocked
+let PASSWORD = null; // the throw-away password of this run (memory only; never printed)
 /** JSON (or raw) request; node:http so nothing gives up after 300 s without headers. */
 function api(method, p, body, { timeoutMs = 2 * MIN, raw = false, base = BASE } = {}) {
   const u = new URL(base + p);
   const t0 = Date.now();
   return new Promise((resolve) => {
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
-    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method, headers: data ? { 'content-type': 'application/json', 'content-length': data.length } : {} }, (res) => {
+    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method, headers: { ...AUTH, ...(data ? { 'content-type': 'application/json', 'content-length': data.length } : {}) } }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
@@ -111,7 +120,7 @@ function sse(method, p, body, { timeoutMs = 10 * MIN, onEvent = null } = {}) {
     let done = false;
     const finish = (extra) => { if (!done) { done = true; clearTimeout(timer); resolve({ events, ms: Date.now() - t0, ...extra }); } };
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
-    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method, headers: data ? { 'content-type': 'application/json', 'content-length': data.length } : {} }, (res) => {
+    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method, headers: { ...AUTH, ...(data ? { 'content-type': 'application/json', 'content-length': data.length } : {}) } }, (res) => {
       const ct = res.headers['content-type'] || '';
       if (!ct.includes('event-stream')) {
         const chunks = [];
@@ -192,7 +201,7 @@ const bus = [];
 let busReq = null;
 function listenBus() {
   const u = new URL(`${BASE}/api/events`);
-  busReq = http.get({ host: u.hostname, port: u.port, path: u.pathname }, (res) => {
+  busReq = http.get({ host: u.hostname, port: u.port, path: u.pathname, headers: { ...AUTH } }, (res) => {
     let buf = '';
     res.setEncoding('utf8');
     res.on('data', (c) => {
@@ -217,6 +226,57 @@ async function noteBackground(label) {
   if (bg?.running) preemptions.push({ label, task: bg.running.key, at: Date.now() });
 }
 
+// ------------------------------------------------------------------------------------------------ security (0.2)
+const SECURITY_STEPS = new Set(['2b', '6b', '11b']);
+
+/** The first-run setup a user does in the setup screen, through the API; keeps the session for every request. */
+async function securitySetup() {
+  const s0 = await api('GET', '/api/security');
+  if (s0.status !== 200) return { error: `GET /api/security → ${s0.status}` };
+  say('security at start', `state ${s0.json.state}, mode ${s0.json.mode}, transport ${s0.json.transport}, offlineLock ${j(s0.json.offlineLock, 200)}`);
+  if (s0.json.state !== 'needs_setup' || s0.json.mode !== 'password') return { error: `a fresh data dir must be in needs_setup / password mode, got ${s0.json.state} / ${s0.json.mode}` };
+  const locked = await api('GET', '/api/chats');
+  if (locked.status !== 423) return { error: `before setup GET /api/chats must answer 423, got ${locked.status}` };
+  PASSWORD = crypto.randomBytes(18).toString('base64url');
+  const t = Date.now();
+  const r = await api('POST', '/api/security/setup', { password: PASSWORD, session: 'token' }, { timeoutMs: 5 * MIN });
+  if (r.status !== 200 || !r.json?.sessionToken) return { error: `POST /api/security/setup → ${r.status} ${j(r.json?.error)}` };
+  const rkOk = /^HRK1(-[0-9A-HJKMNP-TV-Z]{4}){13}$/.test(r.json.recoveryKey || '');
+  AUTH = { authorization: `Bearer ${r.json.sessionToken}` };
+  for (let i = 0; i < 600; i++) { const s = await api('GET', '/api/security'); if (s.json?.state === 'unlocked') break; await sleep(200); }
+  const s1 = await api('GET', '/api/security');
+  if (s1.json?.state !== 'unlocked') return { error: `after setup the state is ${s1.json?.state}` };
+  return { key: `needs_setup → unlocked in ${secs(Date.now() - t)} (scrypt N=2^17 on this Mac); recovery key ${rkOk ? 'has the documented shape' : 'MALFORMED'}; session via bearer token` };
+}
+
+async function unlock() {
+  const r = await api('POST', '/api/security/unlock', { password: PASSWORD, session: 'token' }, { timeoutMs: 2 * MIN });
+  if (r.status !== 200 || !r.json?.sessionToken) return false;
+  AUTH = { authorization: `Bearer ${r.json.sessionToken}` };
+  return true;
+}
+
+/** Model names Ollama itself reports as loaded (straight from Ollama, not through Harness). */
+async function ollamaPs() {
+  const r = await api('GET', '/api/ps', undefined, { base: OLLAMA_URL, timeoutMs: 20000 });
+  return (r.json?.models || []).map((m) => m.name || m.model).filter(Boolean);
+}
+
+/** Every file under `dir` that contains `needle` (raw bytes, UTF-8 and UTF-16LE). */
+function filesContaining(dir, needle) {
+  const pats = [Buffer.from(needle, 'utf8'), Buffer.from(needle, 'utf16le')];
+  const hits = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const f = path.join(d, e.name);
+      if (e.isDirectory()) walk(f);
+      else if (e.isFile()) { const b = fs.readFileSync(f); if (pats.some((p) => b.includes(p))) hits.push(path.relative(dir, f)); }
+    }
+  };
+  walk(dir);
+  return hits;
+}
+
 // ------------------------------------------------------------------------------------------------ the run
 const S = {}; // shared state between steps
 
@@ -230,6 +290,7 @@ async function main() {
   const srv = await startServer({ port: 0, dataDir, autodetect: false, openBrowser: false, logLevel: 'warn', processGuards: true });
   BASE = srv.url;
   say('harness', `${srv.url} data ${dataDir}; Draw Things stand-in (fake A1111) ${a1111.url}`);
+  const setupStatus = await securitySetup();
   listenBus();
 
   // Settings through the API: no other local servers, quick memory extraction, short summaries for step 11.
@@ -240,7 +301,13 @@ async function main() {
   const needModel = () => { if (!S.installed) skip('no installed Nemotron model (step 3 failed)'); };
   const needChat = () => { needModel(); if (!S.chatOk) skip('the plain chat turn (step 6) did not work'); };
   const critical = [];
-  const run = async (n, name, fn, opts) => { const st = await step(n, name, fn, opts); if (n <= 8) critical.push(st); return st; };
+  const run = async (n, name, fn, opts) => { const st = await step(n, name, fn, opts); if (n <= 8 || SECURITY_STEPS.has(n)) critical.push(st); return st; };
+
+  // 0 ------------------------------------------------------------------------------------------
+  await run(0, 'Shipped defaults: password setup through the API', async () => {
+    if (setupStatus.error) fail(setupStatus.error);
+    return { key: setupStatus.key };
+  });
 
   // 1 ------------------------------------------------------------------------------------------
   await run(1, 'System info', async () => {
@@ -280,6 +347,31 @@ async function main() {
     return { key: `suggested ${S.nemo.suggestedVariant}${S.nemo.largestRealisticVariant ? ` / largest realistic ${S.nemo.largestRealisticVariant}` : ''}, text-only ${!!S.nemo.suggestTextOnly}, fits ${S.nemo.fitsThisMachine}` };
   });
 
+  // 2b -----------------------------------------------------------------------------------------
+  await run('2b', 'Internet blocked by default; allowed (password) for the pull only', async () => {
+    const n0 = await api('GET', '/api/network');
+    const st0 = n0.json?.offlineLock || n0.json;
+    say('offlineLock at start', j(st0));
+    if (!st0?.enabled || !st0?.blocked) fail('a fresh install must block internet access');
+    const test = await api('POST', '/api/network/test', {}, { timeoutMs: MIN });
+    say('self-test', j(test.json?.results?.map((r) => `${r.layer} ${r.target} ${r.result}`), 400));
+    if (test.json?.results?.some((r) => r.result === 'reachable')) say('WARNING', 'the OS layer let a probe through (osEnforced is reported false from now on)');
+    const cat = await api('GET', '/api/catalog?source=ollama&limit=3');
+    const pull = await api('POST', '/api/models/pull', { model: 'nemotron-not-pulled:none' });
+    const blockedOk = cat.status === 403 && cat.json?.error?.code === 'offline_lock' && pull.status === 403 && pull.json?.error?.code === 'offline_lock';
+    say('while blocked', `catalogue → ${cat.status} ${cat.json?.error?.code}, pull → ${pull.status} ${pull.json?.error?.code}`);
+    if (!blockedOk) fail('the catalogue and model downloads must answer 403 offline_lock while blocked');
+    const noPw = await api('POST', '/api/network/allow', { minutes: 30 });
+    if (noPw.status !== 403 || noPw.json?.error?.code !== 'confirmation_required') fail(`allowing without the password → ${noPw.status} ${noPw.json?.error?.code}`);
+    const allow = await api('POST', '/api/network/allow', { minutes: 30, password: PASSWORD });
+    if (allow.status !== 200 || allow.json?.offlineLock?.blocked !== false) fail(`POST /api/network/allow → ${allow.status} ${j(allow.json)}`);
+    const cat2 = await api('GET', '/api/catalog?source=ollama&limit=3', undefined, { timeoutMs: MIN });
+    say('allowed', `until ${allow.json.offlineLock.allowedUntil}; catalogue → ${cat2.status} (${(cat2.json?.items || []).length} items${cat2.json?.error ? `, ${cat2.json.error.code}` : ''})`);
+    if (cat2.status !== 200) fail(`the catalogue must answer inside the allow window: ${cat2.status} ${j(cat2.json?.error)}`);
+    S.allowed = true;
+    return { key: `blocked by default (osScope ${st0.osScope}); catalogue/pull refused; allowed for 30 min with the password; catalogue ${(cat2.json.items || []).length} items` };
+  });
+
   // 3 ------------------------------------------------------------------------------------------
   await run(3, 'Pull the recommended Nemotron file through Harness', async () => {
     let why;
@@ -303,6 +395,12 @@ async function main() {
     const bytes = Math.max(0, ...steps.map((p) => p.total || 0));
     return { key: `${S.tag} pulled in ${secs(r.ms)} (${steps.length} progress events, largest layer ${mb(bytes)})` };
   });
+  if (S.allowed) {
+    const b = await api('POST', '/api/network/block', {});
+    const cat3 = await api('GET', '/api/catalog?source=ollama&limit=1');
+    say('blocked again', `block → ${b.status} blocked=${b.json?.offlineLock?.blocked}; catalogue → ${cat3.status} ${cat3.json?.error?.code || ''}`);
+    if (cat3.status !== 403) results.find((x) => x.n === '2b').status = 'FAIL';
+  }
 
   // 4 ------------------------------------------------------------------------------------------
   await run(4, 'Create the text-only copy', async () => {
@@ -371,6 +469,30 @@ async function main() {
     const changed = S.plan1.numCtx !== S.plan0?.numCtx ? ` (${S.plan0?.numCtx} → ${S.plan1.numCtx})` : '';
     const st = byType(r.events, 'stats')[0];
     return { key: `${secs(r.ms)}; ${st?.completionTokens} tok @ ${st?.tokensPerSecond} tok/s, prompt ${st?.promptTokens} @ ${st?.promptTokensPerSecond} tok/s, load ${secs(st?.loadMs || 0)}; samples ${samples.length} (${samples.at(-1)?.source || 'none'}); plan basis ${S.plan1.memory?.basis}${changed}, ${S.plan1.limitedBy}` };
+  });
+
+  // 6b -----------------------------------------------------------------------------------------
+  await run('6b', 'Encrypted at rest: a marker typed into a chat is not findable in the data folder', async () => {
+    needModel();
+    const marker = `ZEBRA-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+    const chat = await newChat({ params: { num_predict: 24, temperature: 0 } }, `marker ${marker}`);
+    const r = await send(chat, `Remember the code word ${marker}. Repeat the code word once and nothing else.`, 'marker turn', 6 * MIN);
+    const done = byType(r.events, 'done')[0];
+    if (!done) fail(`marker turn did not finish: ${j(r.error || byType(r.events, 'error')[0])}`);
+    const back = (await api('GET', `/api/chats/${chat}`)).json;
+    if (!JSON.stringify(back).includes(marker)) fail('the chat read back through the API does not contain the marker (it should)');
+    await sleep(1500); // let the background writes (title, memories, index) land
+    const hits = filesContaining(dataDir, marker);
+    say('files containing the marker', hits.length ? hits.join(', ') : 'none');
+    if (hits.length) fail(`the marker is readable in plain text in: ${hits.join(', ')}`);
+    const files = [];
+    const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else files.push(f); } };
+    walk(dataDir);
+    const encrypted = files.filter((f) => { const h = Buffer.alloc(4); const fd = fs.openSync(f, 'r'); try { fs.readSync(fd, h, 0, 4, 0); } finally { fs.closeSync(fd); } return /^HX[CL]1$/.test(h.toString('latin1')); });
+    const modes = files.map((f) => fs.statSync(f).mode & 0o777).filter((m) => m !== 0o600);
+    const dirMode = fs.statSync(dataDir).mode & 0o777;
+    if (modes.length || dirMode !== 0o700) fail(`permissions: data dir ${dirMode.toString(8)}, ${modes.length} file(s) not 0600`);
+    return { key: `marker found through the API, in 0 of ${files.length} files on disk (${encrypted.length} encrypted, the rest plain by design); dir 0700, files 0600` };
   });
 
   // 7 ------------------------------------------------------------------------------------------
@@ -502,6 +624,28 @@ async function main() {
   }, { optional: true, minLeftMs: 4 * MIN });
 
   // 12 -----------------------------------------------------------------------------------------
+  // 11b ----------------------------------------------------------------------------------------
+  await run('11b', 'Lock: data answers 423, the model is unloaded; unlock again', async () => {
+    const before = await ollamaPs();
+    const lock = await api('POST', '/api/security/lock', {}, { timeoutMs: 2 * MIN });
+    if (lock.status !== 200 || lock.json?.state !== 'locked') fail(`POST /api/security/lock → ${lock.status} ${j(lock.json)}`);
+    const routes = ['/api/chats', '/api/memories', '/api/settings', '/api/ui-state', '/api/system'];
+    const answers = [];
+    for (const p of routes) answers.push(`${p} ${(await api('GET', p)).status}`);
+    say('while locked', answers.join(', '));
+    if (answers.some((a) => !/ 423$/.test(a))) fail(`every data route must answer 423 while locked: ${answers.join(', ')}`);
+    let after = await ollamaPs();
+    for (let i = 0; i < 20 && after.some((m) => m.startsWith(String(model().model).split(':')[0])); i++) { await sleep(500); after = await ollamaPs(); }
+    say('ollama ps', `before lock [${before.join(', ')}] → after [${after.join(', ')}]`);
+    const stillLoaded = after.filter((m) => before.includes(m));
+    if (stillLoaded.length) fail(`models Harness loaded are still in memory after locking: ${stillLoaded.join(', ')}`);
+    const un = await unlock();
+    if (!un) fail('unlocking with the password failed');
+    const chats = await api('GET', '/api/chats');
+    if (chats.status !== 200) fail(`after unlocking, GET /api/chats → ${chats.status}`);
+    return { key: `423 on ${routes.length} data routes while locked; unloaded [${before.join(', ') || 'nothing loaded'}]; unlocked again (${(chats.json?.chats || []).length} chats)` };
+  });
+
   await step(12, 'Cleanup (CLEANUP=1)', async () => {
     if (!CLEANUP) skip('CLEANUP not set: the copy and the pulled model stay installed');
     const out = [];
@@ -516,8 +660,8 @@ async function main() {
   await srv.close().catch(() => {});
   await a1111.close().catch(() => {});
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* */ }
-  const ok = critical.length === 8 && critical.every((s) => s === 'PASS' || s === 'WARN');
-  console.log(`\n# SUMMARY (${elapsed()} total; exit ${ok ? 0 : 1}: steps 1–8 ${ok ? 'passed' : 'did not all pass'})`);
+  const ok = critical.length === 8 + 1 + SECURITY_STEPS.size && critical.every((s) => s === 'PASS' || s === 'WARN') && results.filter((r) => SECURITY_STEPS.has(r.n)).every((r) => r.status === 'PASS' || r.status === 'WARN');
+  console.log(`\n# SUMMARY (${elapsed()} total; exit ${ok ? 0 : 1}: steps 0–8, 2b, 6b, 11b ${ok ? 'passed' : 'did not all pass'})`);
   for (const r of results) console.log(clip(`S${r.n} ${r.status.padEnd(4)} ${secs(r.ms).padStart(7)}  ${r.name}: ${r.key}`, 300));
   return ok ? 0 : 1;
 }

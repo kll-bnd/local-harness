@@ -339,6 +339,23 @@ jobs:
         run: |
           brew install ollama > /dev/null 2>&1
           KEEP=30 node native/ci/run.mjs 1500 ollama -- node native/ci/sandbox-ollama.mjs server/security/offline-lock.sb qwen3:0.6b > /dev/null
+      - name: Self-test against the real backend (password mode, Harness starts a sandboxed Ollama)
+        if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
+        continue-on-error: true
+        run: |
+          node native/test/bridge-client.mjs server/index.mjs "$RUNNER_TEMP/bridge-check" 2>&1 | sed 's/^/bridge| /' >> "$FACTS"
+          node native/test/run-selftest.mjs --app dist/native/Harness.app --label real --script native/test/selftest-real.js --launches 2 --timeout 900 --settle 5 --log-lines 20 > /dev/null
+      - name: Idle memory, native app on the real UI
+        if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
+        continue-on-error: true
+        run: node native/test/run-selftest.mjs --app dist/native/Harness.app --label idle --script native/test/selftest-idle.js --launches 1 --timeout 120 --settle 15 > /dev/null
+      - name: Electron build for comparison (size, idle memory)
+        if: ${{ hashFiles('server/bridge/server.mjs') != '' }}
+        continue-on-error: true
+        run: |
+          npm ci > /dev/null 2>&1
+          npm run dist:app > /tmp/electron-build.log 2>&1 || tail -n 5 /tmp/electron-build.log | sed 's/^/electron-build| /' >> "$FACTS"
+          node native/ci/electron-memory.mjs dist/mac-arm64/Harness.app 20 > /dev/null
       - name: Facts
         if: always()
         run: cat "$FACTS"

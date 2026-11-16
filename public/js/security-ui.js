@@ -111,9 +111,10 @@ export function recoveryKeyPanel(key, { createdAt = new Date().toISOString(), on
   const el = h('div.rk-panel',
     keyEl,
     h('div.row.rk-actions', copyBtn, saveBtn, status),
-    h('label.rk-confirm', { htmlFor: check.id }, check, h('span', 'I have stored my recovery key somewhere safe')),
   );
-  return { el, stored: () => check.checked, focus: () => keyEl.focus() };
+  // The explicit "I have stored it" step; the caller places it after the warning, next to Continue.
+  const confirmEl = h('label.rk-confirm', { htmlFor: check.id }, check, h('span', 'I have stored my recovery key somewhere safe'));
+  return { el, confirmEl, stored: () => check.checked, focus: () => keyEl.focus() };
 }
 
 export const RECOVERY_WARNING = 'This key is shown only now: Harness does not keep a copy and cannot show it again. If you lose both your password and this key, your data is gone for good — nobody can recover it.';

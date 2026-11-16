@@ -56,6 +56,7 @@ async function isLive(info, file) {
   if (info.hostname && info.hostname !== os.hostname()) return true; // shared folder used by another machine: never steal
   if (info.pid === process.pid) return false; // our own leftover (not in `held`): stale
   if (!pidAlive(info.pid)) return false;
+  if (info.transport === 'bridge') return true; // a native app's backend: no URL to probe, alive while its pid is
   if (!info.url) return ageMs < 60_000; // still starting up
   return healthOk(info.url);
 }

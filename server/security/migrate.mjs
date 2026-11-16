@@ -56,6 +56,15 @@ async function readHead(file, n = HEADER_C) {
   try { const b = Buffer.alloc(n); const { bytesRead } = await fh.read(b, 0, n, 0); return b.subarray(0, bytesRead); } finally { await fh.close(); }
 }
 
+/** True when any file under `dir` is encrypted (then the key store must exist: never offer a fresh setup). */
+export async function hasEncryptedData(dir) {
+  for (const f of await listDataFiles(dir)) {
+    const head = await readHead(f).catch(() => Buffer.alloc(0));
+    if (isHXC(head) || isHXL(head)) return true;
+  }
+  return false;
+}
+
 /** Fix permissions: directories 0700, files 0600 (best effort). */
 export async function fixPermissions(dir) {
   const walk = async (d) => {

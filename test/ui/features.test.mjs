@@ -184,7 +184,8 @@ test('settings: changes persist across a reload; theme switch applies immediatel
     await page.reload();
     await page.waitForSelector('html.ready');
     assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark');
-    await waitFor(async () => (await stack.api('GET', '/api/settings')).data.settings.ui.theme === 'dark');
+    // UI preferences live in the UI-state store (0.2), not in browser storage or settings.ui.
+    await waitFor(async () => (await stack.api('GET', '/api/ui-state')).data.state.prefs?.theme === 'dark');
     await page.locator('[data-path="ui.theme"] button', { hasText: 'System' }).click();
     await page.waitForFunction(() => !document.documentElement.dataset.theme);
     await app.assertClean(assert);

@@ -13,7 +13,8 @@ import { Shell } from './shell.js';
 import { startRouter, navigate } from './router.js';
 import { toast } from './ui/overlays.js';
 import { showError } from './errors.js';
-import { peekChatModel, forgetChatModel, mergeChatSummary, stopGeneration, compactNow, liveChats } from './chat/session.js';
+import { peekChatModel, forgetChatModel, mergeChatSummary, stopGeneration, compactNow, liveChats, forgetAllChatModels } from './chat/session.js';
+import { clearMarkdownCache } from './lib/markdown.js';
 import { openPalette } from './ui/palette.js';
 import { openShortcuts } from './views/shortcuts.js';
 import { getUi, setUi, flushUiState, migrateBrowserStorage, clearUiState } from './ui-state.js';
@@ -181,6 +182,15 @@ if (desktop) {
     desktop.onMenuAction?.((name, ...args) => runActionFrom('menu', name, ...args));
   } catch (e) { console.warn('desktop bridge', e); }
 }
+// External http(s) links (model cards, the catalogue, setup help) open in the default browser through the
+// desktop shell; in a plain browser they open in a new tab (target=_blank, rel=noopener noreferrer).
+document.addEventListener('click', (e) => {
+  if (e.defaultPrevented || !desktop?.openExternal) return;
+  const a = e.target.closest?.('a[href]');
+  if (!a || !/^https?:/i.test(a.getAttribute('href') || '')) return;
+  e.preventDefault();
+  desktop.openExternal(a.href);
+});
 let unread = 0;
 bus.on('activity', (info) => {
   if (info?.finished && document.hidden) {
@@ -373,14 +383,15 @@ document.addEventListener('visibilitychange', refreshOnReturn);
 window.addEventListener('focus', refreshOnReturn);
 
 // The idle lock counts requests. Someone reading or scrolling is not idle, so while they interact a light
-// request is sent at most once a minute (GET /api/auth/status: no data, just "still here").
+// request is sent at most once a minute (GET /api/ui-state: status routes like /api/auth/status are passive and
+// do not count as activity).
 let lastBeat = Date.now();
 const heartbeat = () => {
   if (document.hidden || isLockingDown()) return;
   const now = Date.now();
   if (now - lastBeat < 60000) return;
   lastBeat = now;
-  api.auth.status().catch(() => {});
+  api.uiState.get().catch(() => {});
 };
 for (const t of ['pointerdown', 'keydown', 'wheel', 'touchstart']) window.addEventListener(t, heartbeat, { capture: true, passive: true });
 
@@ -391,9 +402,10 @@ onLockdown(() => {
   busCtl?.abort();
   clearTimeout(reconnectTimer);
   for (const m of liveChats()) { try { m.live?.controller?.abort(); } catch { /* ignore */ } }
+  forgetAllChatModels();
+  clearMarkdownCache();
   clearUiState();
-  store.clear();
-  bus.map?.clear();
+  store.clear(['route', 'connection']);
 });
 
 // Remember the open page (not its contents) so a relaunch returns to it.

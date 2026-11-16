@@ -226,7 +226,7 @@ async function newRecoveryKey(view) {
     const dlg = openDialog({
       title: 'Your new recovery key',
       dismissible: false,
-      body: h('div.stack', panel.el, h('p.gate-warning', icon('warning', { size: 14 }), h('span', RECOVERY_WARNING))),
+      body: h('div.stack', panel.el, h('p.gate-warning', icon('warning', { size: 14 }), h('span', RECOVERY_WARNING)), panel.confirmEl),
       actions: [{ label: 'Done', kind: 'primary', disabled: true, run: () => { if (!panel.stored()) return false; resolve(); return true; } }],
     });
     done = dlg.el.querySelector('.dialog-actions .btn');
