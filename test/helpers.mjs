@@ -10,8 +10,11 @@ import { deepMerge } from '../server/lib/util.mjs';
 process.env.HARNESS_NO_OLLAMA_AUTOSTART = '1';
 // The 0.2 defaults (password-encrypted data, API sessions, internet blocked) are opted out of EXPLICITLY here
 // for the suites that test other things; test/security*.test.mjs pass their own options to exercise them.
-export const LEGACY_OPTS = Object.freeze({ security: { mode: 'off', apiAuth: false }, offlineLock: false });
-for (const [k, v] of Object.entries({ HARNESS_ENCRYPTION: 'off', HARNESS_API_AUTH: '0', HARNESS_OFFLINE_LOCK: '0' })) process.env[k] ??= v;
+// The real macOS Keychain is NEVER touched by tests: every server started from a test uses the development stand-in
+// (a .dev-keychain file in its temp data dir) — explicitly here, and the keychain module refuses the real Keychain
+// in test runs and for non-default data folders anyway.
+export const LEGACY_OPTS = Object.freeze({ security: { mode: 'off', apiAuth: false }, offlineLock: false, keychain: 'file' });
+for (const [k, v] of Object.entries({ HARNESS_ENCRYPTION: 'off', HARNESS_API_AUTH: '0', HARNESS_OFFLINE_LOCK: '0', HARNESS_KEYCHAIN: 'file' })) process.env[k] ??= v;
 
 export const GiB = 1024 ** 3;
 

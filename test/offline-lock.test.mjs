@@ -23,7 +23,7 @@ function freePort() {
 async function blockedStack({ settings = {}, fake } = {}) {
   const dataDir = await tmpDir('harness-net-');
   await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify({ ollama: { autoStart: false }, embeddings: { model: 'off' }, memory: { enabled: false }, titles: { auto: false }, ...(fake ? { providers: { builtin: { ollama: { baseUrl: fake.url } } } } : {}), ...settings }));
-  const srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'silent', processGuards: false, security: { mode: 'off', apiAuth: false }, offlineLock: true });
+  const srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'silent', processGuards: false, keychain: 'file', security: { mode: 'off', apiAuth: false }, offlineLock: true });
   const call = async (method, p, body, headers = {}) => {
     const r = await fetch(srv.url + p, { method, headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...headers }, body: body !== undefined ? JSON.stringify(body) : undefined });
     const ct = r.headers.get('content-type') || '';
@@ -206,7 +206,7 @@ exec "$@"
   test('the self-test needs no session (it carries no user data) but keeps the Host check and a rate limit', async () => {
     process.env.HARNESS_SELFTEST_INTERVAL_MS = '60000';
     const dataDir = await tmpDir();
-    const srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'silent', processGuards: false, security: { mode: 'password', apiAuth: true, kdf: { N: 1024, r: 8, p: 1 } }, offlineLock: true });
+    const srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'silent', processGuards: false, keychain: 'file', security: { mode: 'password', apiAuth: true, kdf: { N: 1024, r: 8, p: 1 } }, offlineLock: true });
     try {
       const r = await fetch(`${srv.url}/api/network/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
       assert.equal(r.status, 200, 'works while Harness is still in needs_setup / locked');

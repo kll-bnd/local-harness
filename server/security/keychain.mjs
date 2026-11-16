@@ -13,12 +13,38 @@
 // most KEYCHAIN_TIMEOUT_MS instead of hanging; Harness then stays locked and the password still opens it.
 //
 // Elsewhere (development, CI): a 0600 file `.dev-keychain` in the data directory — clearly NOT protection.
+//
+// Which store (chooseKeychain): the real Keychain only for the default data folder, and never in a test run, unless
+// HARNESS_KEYCHAIN=mac opts in; HARNESS_KEYCHAIN=file forces the development stand-in. Items are scoped to their
+// data folder: account `data-key` for the default folder (the name the native app uses), `data-key-<16 hex of
+// SHA-256 of the folder's real path>` for any other, so two installations never clobber each other's key. A refused
+// store answers every read with KeychainError('not_allowed') and never deletes anything.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 export const KEYCHAIN_SERVICE = 'local.harness';
 export const KEYCHAIN_ACCOUNT = 'data-key';
+const realpath = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+
+/** The platform's default data folder (what defaultDataDir() gives without HARNESS_DATA_DIR). */
+export function platformDataDir(platform = process.platform, home = os.homedir()) {
+  if (platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'Harness');
+  if (platform === 'win32') return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Harness');
+  return path.join(process.env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'harness');
+}
+
+export function isDefaultDataDir(dataDir, { defaultDir = platformDataDir() } = {}) {
+  return realpath(dataDir) === realpath(defaultDir);
+}
+
+/** The Keychain account for a data folder: `data-key` for the default one, a derived name for any other. */
+export function keychainAccountFor(dataDir, opts) {
+  if (isDefaultDataDir(dataDir, opts)) return KEYCHAIN_ACCOUNT;
+  return `${KEYCHAIN_ACCOUNT}-${crypto.createHash('sha256').update(realpath(dataDir)).digest('hex').slice(0, 16)}`;
+}
 export const KEYCHAIN_LABEL = 'Harness data key';
 
 const B64_32 = /^[A-Za-z0-9+/]{43}=$/;
@@ -29,7 +55,7 @@ export class KeychainError extends Error {
   constructor(reason, message) { super(message); this.reason = reason; this.code = `keychain_${reason}`; }
 }
 
-function runSecurity(bin, commands, { timeoutMs = KEYCHAIN_TIMEOUT_MS } = {}) {
+export function runSecurity(bin, commands, { timeoutMs = KEYCHAIN_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     let child;
     try { child = spawn(bin, ['-i'], { stdio: ['pipe', 'pipe', 'pipe'] }); } catch (e) { resolve({ ok: false, out: '', err: e.message, failed: true }); return; }
@@ -58,11 +84,19 @@ function classify(r, action) {
   return null;
 }
 
-/** The macOS login Keychain via /usr/bin/security (the binary is injectable for tests). */
-export function macKeychain({ securityBin = process.env.HARNESS_SECURITY_BIN || '/usr/bin/security', timeoutMs = KEYCHAIN_TIMEOUT_MS } = {}) {
+/**
+ * The macOS login Keychain via /usr/bin/security (the binary, service, account and label are injectable: tests,
+ * and the per-folder account of keychainAccountFor()).
+ */
+export function macKeychain({ securityBin = process.env.HARNESS_SECURITY_BIN || '/usr/bin/security', timeoutMs = KEYCHAIN_TIMEOUT_MS, service = KEYCHAIN_SERVICE, account = KEYCHAIN_ACCOUNT, label = KEYCHAIN_LABEL } = {}) {
   const q = (s) => `"${String(s).replace(/["\\]/g, '\\$&')}"`;
+  const KEYCHAIN_SERVICE = service;
+  const KEYCHAIN_ACCOUNT = account;
+  const KEYCHAIN_LABEL = label;
   return {
     kind: 'keychain',
+    service,
+    account,
     /** The stored key, or null when there is no item. Throws KeychainError when access is denied or times out. */
     async get() {
       const r = await runSecurity(securityBin, [`find-generic-password -s ${q(KEYCHAIN_SERVICE)} -a ${q(KEYCHAIN_ACCOUNT)} -w`], { timeoutMs });
@@ -111,6 +145,33 @@ export function appKeychain({ initialKey = null, emit }) {
   };
 }
 
+/** A store that refuses: the real Keychain is not allowed for this folder / run. Never deletes anything. */
+export function refusedKeychain(message) {
+  return {
+    kind: 'refused',
+    async get() { throw new KeychainError('not_allowed', message); },
+    async set() { throw new KeychainError('not_allowed', message); },
+    async delete() { /* never */ },
+  };
+}
+
+/**
+ * Where keychain mode keeps its key for `dataDir` (listener mode; the bridge uses appKeychain).
+ * @param {object} [o]
+ * @param {'mac'|'file'|undefined} [o.kind]  explicit choice (startServer option or HARNESS_KEYCHAIN)
+ */
+export function chooseKeychain(dataDir, { kind = process.env.HARNESS_KEYCHAIN || undefined, platform = process.platform, testRun = !!process.env.NODE_TEST_CONTEXT, defaultDir } = {}) {
+  if (kind === 'file' || kind === 'dev') return fileKeychain(dataDir);
+  if (platform !== 'darwin') return fileKeychain(dataDir); // no Keychain outside macOS (development only)
+  const opts = defaultDir ? { defaultDir } : undefined;
+  if (kind !== 'mac') {
+    if (testRun) return refusedKeychain('The macOS Keychain is never used by a test run (set HARNESS_KEYCHAIN=file for the development stand-in).');
+    if (!isDefaultDataDir(dataDir, opts)) return refusedKeychain('The macOS Keychain is used only for the default Harness data folder; set HARNESS_KEYCHAIN=mac to use it for this folder too. The password still opens Harness.');
+  }
+  return macKeychain({ account: keychainAccountFor(dataDir, opts) });
+}
+
+/** @deprecated use chooseKeychain (kept for callers of 0.2 previews). */
 export function platformKeychain(dataDir, platform = process.platform) {
-  return platform === 'darwin' ? macKeychain() : fileKeychain(dataDir);
+  return chooseKeychain(dataDir, { platform });
 }

@@ -69,18 +69,20 @@ Also printed: OS/chip/memory/swap, Node, Ollama version, `OLLAMA_*` visible to t
 
 The e2e layer runs Harness with its **real 0.2 defaults** (password mode, internet blocked). On its fresh
 temporary data dir it sets up a **throw-away password** through `POST /api/security/setup`, exactly like the
-setup screen; the password lives only in the checker's memory, and the recovery key is checked for its shape
-and discarded. Every report redacts passwords, recovery keys, session tokens/cookies and launch codes. The
+setup screen, asking for its session as a bearer token (`"session": "token"`, which Harness refuses to any request
+that looks like a browser page); the password lives only in the checker's memory, and the recovery key is checked
+for its shape and discarded. Every report redacts passwords, recovery keys, session tokens/cookies and launch codes. The
 backends found on this Mac are then wired in with `PATCH /api/settings`. Downloads in the e2e layer
 (`e2e.pull_delete`) open the internet window with that password and block again right after.
 
 | check | what it proves |
 |---|---|
-| `e2e.setup`, `e2e.auth_required`, `e2e.wrong_password` | first start, the session, 401 without one, the wrong-password answer and its retry delay |
-| `e2e.blocker.default` | a fresh install blocks internet access; the backend's self-test (`POST /api/network/test`) reports blocked |
+| `e2e.setup`, `e2e.auth_required`, `e2e.wrong_password` | first start, the session, 401 without one, no bearer token for a request with an `Origin` (403 `token_refused`) or without `"session": "token"`, the wrong-password answer and its retry delay |
+| `e2e.vault_error` | a throw-away Harness whose key store (and its `.bak` copy) is damaged, then missing: state `error` (`vault_corrupt` / `vault_missing`), setup 409, data routes 503, never `needs_setup` |
+| `e2e.blocker.default` | a fresh install blocks internet access; the backend's self-test (`POST /api/network/test`) reports blocked, and answers without a session |
 | `e2e.blocker.catalog`, `e2e.blocker.pull`, `e2e.blocker.fetch_url` | while blocked: the online catalogue and pulls answer `403 offline_lock`; `fetch_url` is not offered (a tool model is asked to use it) |
 | `e2e.blocker.allow` | allowing needs the password (403 / 401 without / with a wrong one); with `--allow-internet` the window really opens |
-| `e2e.catalog.huggingface`, `e2e.catalog.ollama` | **only with `--allow-internet`, while the window is open**: the Hugging Face and Ollama-library adapters parse the live sites (a list page; the Nemotron repository's files; one Ollama model's tags). These are the checks most likely to break when a site changes: a FAIL names the adapter's file:line and includes the response excerpt |
+| `e2e.catalog.huggingface`, `e2e.catalog.ollama` | **only with `--allow-internet`, while the window is open**, through the real `/api/catalog` routes: the Hugging Face adapter (a list page with fit badges; the Nemotron repository's files) and the Ollama adapter (`ollama.com/search`: official library models only, a second "load more" page without repeats; one model's tags). These are the checks most likely to break when a site changes: a FAIL names the adapter's file:line and includes the response excerpt |
 | `e2e.blocker.reblock` | blocking again takes effect at once |
 | `e2e.blocker.sandboxed_ollama` | macOS with Ollama installed: a second throw-away Harness starts its **own** Ollama on a spare port while blocked; it must run in the sandbox (`osScope: "ollama"`), a pull sent **straight to that Ollama** must fail, and the self-test's OS probe must be blocked |
 | `e2e.lock.routes`, `e2e.lock.models_unloaded`, `e2e.lock.marker_not_on_disk`, `e2e.lock.unlock_again` | after a memory, a chat title and a chat turn containing a unique marker, `POST /api/security/lock`: data routes → 423, Ollama no longer holds the chat model, **the marker is not findable in any file of the data dir** (UTF-8, UTF-16 or base64), and unlocking again makes it readable through the API |

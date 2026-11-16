@@ -272,7 +272,7 @@ describe('the catalogue and the internet blocker', () => {
     const fake = await startFakeOllama({ port: 0 });
     const dataDir = await tmpDir();
     fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({ providers: { builtin: { ollama: { baseUrl: fake.url } } }, ollama: { autoStart: false }, embeddings: { model: 'off' } }));
-    const srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'silent', processGuards: false, security: { mode: 'off', apiAuth: false }, offlineLock: true });
+    const srv = await startServer({ port: 0, dataDir, autodetect: false, logLevel: 'silent', processGuards: false, keychain: 'file', security: { mode: 'off', apiAuth: false }, offlineLock: true });
     const get = async (p, init) => { const r = await fetch(srv.url + p, init); return { status: r.status, data: await r.json() }; };
     try {
       assert.equal((await get('/api/catalog?source=local')).status, 200);

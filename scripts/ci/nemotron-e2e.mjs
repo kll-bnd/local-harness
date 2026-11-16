@@ -287,7 +287,7 @@ async function main() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-e2e-'));
   // stepMs 150 × 2–4 steps: a short but visible "generating" phase
   const a1111 = await startFakeA1111({ port: 0, stepMs: 150, drawThings: true });
-  const srv = await startServer({ port: 0, dataDir, autodetect: false, openBrowser: false, logLevel: 'warn', processGuards: true });
+  const srv = await startServer({ port: 0, dataDir, autodetect: false, openBrowser: false, logLevel: 'warn', processGuards: true, keychain: 'file' });
   BASE = srv.url;
   say('harness', `${srv.url} data ${dataDir}; Draw Things stand-in (fake A1111) ${a1111.url}`);
   const setupStatus = await securitySetup();

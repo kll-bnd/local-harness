@@ -433,6 +433,37 @@ test('protection mode: "Don\'t ask on this Mac" needs the password; the lock scr
   } finally { await app.close(); await stack.close(); }
 });
 
+test('no password yet (off mode): choosing "Ask for my password" sets one, shows the recovery key and encrypts', async () => {
+  const stack = await startStack({ offlineLock: false }); // the development opt-out: plain data, no password
+  await stack.api('POST', '/api/chats/import', { title: 'Plain chat', messages: [{ role: 'user', content: 'The lighthouse keeper writes in teal ink.' }] });
+  const app = await openApp(stack, { hash: '#/settings/privacy' });
+  try {
+    const { page } = app;
+    await page.waitForSelector('.privacy');
+    assert.equal(await page.locator('.privacy button', { hasText: 'Lock now' }).count(), 0, 'nothing to lock without encryption');
+    await page.locator('.mode-card[data-mode="password"]').click();
+    await page.fill('dialog input[name="password"]', PASSWORD);
+    await page.fill('dialog input[name="password2"]', PASSWORD);
+    await page.locator('dialog .dialog-actions .btn-primary', { hasText: 'Continue' }).click();
+    await page.waitForSelector('dialog.rk-dialog .rk-key');
+    await page.check('dialog.rk-dialog .rk-confirm input');
+    await page.locator('dialog.rk-dialog .dialog-actions .btn-primary').click();
+    await page.waitForSelector('.mode-card[data-mode="password"][aria-checked="true"]', { timeout: 20000 });
+    // Encrypted on disk now.
+    const hits = [];
+    const walk = async (d) => {
+      for (const e of await fs.readdir(d, { withFileTypes: true })) {
+        const p2 = path.join(d, e.name);
+        if (e.isDirectory()) await walk(p2);
+        else if ((await fs.readFile(p2)).includes('teal ink')) hits.push(e.name);
+      }
+    };
+    await walk(stack.dataDir);
+    assert.deepEqual(hits, []);
+    await app.assertClean(assert);
+  } finally { await app.close(); await stack.close(); }
+});
+
 test('a damaged key store gets a calm explanation and never a new setup', async () => {
   const stack = await startStack({ secure: true });
   await stack.setupPassword(PASSWORD);

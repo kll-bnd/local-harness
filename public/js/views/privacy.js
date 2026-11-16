@@ -105,7 +105,7 @@ export function privacySection(view) {
     sessEl,
     h('p.field-help', transport === 'bridge'
       ? 'This window talks to Harness directly inside the app; no other program can connect to it.'
-      : 'Other programs on this Mac can reach Harness’s local address but cannot use it without a session. Locking Harness signs out every window and tool.'),
+      : `Other programs on this Mac can reach Harness’s local address but cannot use it without a session. ${mode === 'password' ? 'Locking Harness signs out every window and tool.' : 'In this mode locking keeps windows signed in, since opening Harness needs no secret.'}`),
     transport !== 'bridge' ? h('div.row', h('button.btn', { type: 'button', on: { click: async () => { try { await api.auth.logout(); } catch { /* ignore */ } lockdown('signed_out'); } } }, 'Sign out this window')) : null));
 
   // ---- backups
@@ -232,8 +232,8 @@ async function changeMode(next, view) {
     if (r.rekeyRecommended) store.set('rekeyRecommended', true);
     if (r.recoveryKey) await showRecoveryKey(r.recoveryKey, { title: 'Your recovery key' });
     toast({ kind: 'success', message: r.state === 'migrating' ? 'Changing how your data is stored…' : 'Protection changed', id: 'mode' });
-    await refreshSecurity();
-    view.renderNow?.();
+    release();
+    await afterConversion(view);
   } finally { release(); }
 }
 
@@ -250,9 +250,16 @@ async function rekey(view) {
     if (!r) return;
     store.set('rekeyRecommended', false);
     if (r.recoveryKey) await showRecoveryKey(r.recoveryKey, { title: 'Your new recovery key' });
-    await refreshSecurity();
-    view.renderNow?.();
+    release();
+    await afterConversion(view);
   } finally { release(); }
+}
+
+/** After a conversion started: while it runs, show its progress (the lock-screen flow); then back here. */
+async function afterConversion(view) {
+  const s = await refreshSecurity();
+  if (s?.state === 'migrating') { lockdown('migrating'); return; }
+  view.renderNow?.();
 }
 
 function changePasswordDialog() {

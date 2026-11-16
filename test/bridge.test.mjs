@@ -18,7 +18,7 @@ import { spawn } from 'node:child_process';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PW = 'correct horse battery';
 // the shipped defaults in the child (the opt-outs test/helpers.mjs sets for other suites must not leak in)
-const ENV = { HARNESS_ENCRYPTION: '', HARNESS_API_AUTH: '', HARNESS_OFFLINE_LOCK: '', HARNESS_NO_OLLAMA_AUTOSTART: '1', HARNESS_LOG_LEVEL: 'warn' };
+const ENV = { HARNESS_ENCRYPTION: '', HARNESS_API_AUTH: '', HARNESS_OFFLINE_LOCK: '', HARNESS_KEYCHAIN: 'file', HARNESS_NO_OLLAMA_AUTOSTART: '1', HARNESS_LOG_LEVEL: 'warn' };
 
 let fake;
 let dt;

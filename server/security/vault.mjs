@@ -190,6 +190,16 @@ export class Vault {
     return this._succeed(dek);
   }
 
+  /** Does `kek` (a key read from the Keychain) open this key store's keychain wrap? No side effects. */
+  keychainKeyOpens(kek) {
+    const w = this.meta?.wraps?.keychain;
+    if (!w || !kek) return false;
+    const dek = unseal(Buffer.from(kek), w, AAD('keychain'));
+    if (!dek) return false;
+    wipe(dek);
+    return true;
+  }
+
   /** Check the password for a confirmation while unlocked (same throttle). */
   async verifyPassword(password) {
     this._throttleCheck();

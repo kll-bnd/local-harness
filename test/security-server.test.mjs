@@ -33,7 +33,7 @@ async function stack({ dataDir, mode, apiAuth, offlineLock, keychain, settings =
     system: { totalMem: 16 * GiB, memoryProbe: createFakeMemoryProbe(fake) },
     security: { kdf: FAST, ...(mode ? { mode } : { mode: 'password' }), ...(apiAuth === undefined ? { apiAuth: true } : { apiAuth }) },
     offlineLock: offlineLock === undefined ? true : offlineLock,
-    ...(keychain ? { keychain } : {}),
+    keychain: keychain || 'file', // never the real macOS Keychain from a test
   });
   const s = { srv, fake, dt, dataDir, url: srv.url, token: null };
   s.call = async (method, p, body, { headers = {}, token = s.token, raw = false } = {}) => {
@@ -418,6 +418,58 @@ describe('upgrades, modes and key-store damage', () => {
       assert.equal(st.data.error.code, 'vault_missing');
       assert.equal((await s.call('POST', '/api/security/setup', { password: PW })).status, 409);
       assert.ok(!fss.existsSync(path.join(dataDir, 'vault.json')), 'nothing was created over the encrypted files');
+    } finally { await s.close(); }
+  });
+});
+
+describe('Keychain items that are not ours', () => {
+  /** A recording stand-in store: `value` is what "the Keychain" holds; `fail` makes every read throw. */
+  const recorder = (value = null, fail = null) => {
+    const calls = [];
+    return {
+      kind: 'test', calls, value,
+      async get() { calls.push('get'); if (fail) { const { KeychainError } = await import('../server/security/keychain.mjs'); throw new KeychainError(fail, `test: ${fail}`); } return this.value ? Buffer.from(this.value) : null; },
+      async set(k) { calls.push('set'); this.value = Buffer.from(k); },
+      async delete() { calls.push('delete'); this.value = null; },
+    };
+  };
+
+  test('a foreign item is never overwritten without the password, never deleted on a failed read, and only ours is deleted', async () => {
+    const foreign = Buffer.alloc(32, 5);
+    const kc = recorder(foreign);
+    let s = await stack({ keychain: kc, prepare: (dir) => fss.writeFileSync(path.join(dir, 'launch.json'), JSON.stringify({ version: 1, encryption: 'keychain' })) });
+    const dataDir = s.dataDir;
+    try {
+      await s.setup();
+      const st = (await s.call('GET', '/api/security')).data;
+      assert.equal(st.mode, 'password', 'setup without a confirmation falls back to password mode');
+      assert.equal(st.unlock.keychainError.code, 'keychain_item_exists');
+      assert.ok(!kc.calls.includes('set') && !kc.calls.includes('delete'));
+      assert.deepEqual(kc.value, foreign, 'the foreign item is untouched');
+      // with the password typed for this action, replacing it is the user's explicit choice
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'keychain', password: PW })).status, 200);
+      assert.ok(kc.calls.includes('set'));
+      assert.notDeepEqual(kc.value, foreign);
+      // leaving keychain mode (password-confirmed) deletes the item only because it holds THIS data's key
+      assert.equal((await s.call('POST', '/api/security/mode', { mode: 'password', password: PW })).status, 200);
+      assert.equal(kc.calls.filter((c) => c === 'delete').length, 1);
+      // a foreign item at that moment would be left alone
+      await s.call('POST', '/api/security/mode', { mode: 'keychain', password: PW });
+      kc.value = Buffer.alloc(32, 6);
+      const before = kc.calls.filter((c) => c === 'delete').length;
+      await s.call('POST', '/api/security/mode', { mode: 'password', password: PW });
+      assert.equal(kc.calls.filter((c) => c === 'delete').length, before, 'not ours: not deleted');
+      await s.call('POST', '/api/security/mode', { mode: 'keychain', password: PW });
+      await s.close({ keep: true });
+      // a Keychain that cannot be read: locked, nothing deleted or written
+      const broken = recorder(null, 'denied');
+      s = await stack({ dataDir, mode: 'keychain', keychain: broken });
+      const st2 = (await s.call('GET', '/api/security')).data;
+      assert.equal(st2.state, 'locked');
+      assert.equal(st2.unlock.keychainError.code, 'keychain_unavailable');
+      assert.deepEqual(broken.calls, ['get']);
+      assert.equal((await s.unlock()).status, 200, 'the password still opens it');
+      assert.deepEqual(broken.calls, ['get']);
     } finally { await s.close(); }
   });
 });

@@ -54,7 +54,8 @@ if (!encrypted) await fs.writeFile(settingsFile, JSON.stringify(settings, null, 
 if (args.ram) process.env.HARNESS_TOTALMEM_BYTES = String(Number(args.ram) * 1024 ** 3);
 const { startServer } = await import('../server/index.mjs');
 const insecure = args.insecure === 'true';
-const srv = await startServer({ port: Number(args.port || 4747), dataDir, openBrowser: args.open === 'true', ...(insecure ? { security: { mode: 'off', apiAuth: false }, offlineLock: false } : {}) });
+// keychain mode in this dev stack keeps its key in a .dev-keychain file, never in the real Keychain
+const srv = await startServer({ port: Number(args.port || 4747), dataDir, openBrowser: args.open === 'true', keychain: process.env.HARNESS_KEYCHAIN || 'file', ...(insecure ? { security: { mode: 'off', apiAuth: false }, offlineLock: false } : {}) });
 const sec = srv.core.securityStatus();
 
 console.log(`

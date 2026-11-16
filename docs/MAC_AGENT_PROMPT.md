@@ -35,6 +35,9 @@ for the 0.2 security model) have the detail if you need it.
   `brew services stop ollama`).
 - Do not use the model tags `nemotron-3.5-bolt:e4b` (7.9 GB, does not fit), any `:latest`, or tags without
   the `UD-` prefix. Use the tag Harness names.
+- If Harness or `npm run doctor` reports a **damaged key store** (`vault_corrupt` / `vault_missing`), stop and tell
+  the owner: the fix is restoring `vault.json` from a backup of the data folder. Never set up a new password over
+  existing data, and never delete or edit files in `~/Library/Application Support/Harness`.
 - Do not change the code unless a check below fails and you have found the cause. If you do, keep the
   change small and run `npm test` before telling the owner about it.
 
@@ -73,10 +76,10 @@ for the 0.2 security model) have the detail if you need it.
    switch to it if the owner asks and memory stays healthy:
    `npm run get-model -- --model hf.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q3_K_XL`.
 
-5. **Launch it as the owner will use it.** The browser (step 3) works. The Electron app is optional
-   (downloads Electron, a few hundred MB): `npm install && npm run dist`, then
-   `ditto dist/mac-arm64/Harness.app /Applications/Harness.app && open -a Harness`. If `docs/NATIVE.md` exists,
-   the native app is the recommended way — follow that file.
+5. **Launch it as the owner will use it.** The recommended way is the **native app** (no localhost server; needs
+   the Xcode Command Line Tools, `xcode-select --install`, ask first): stop the browser session from step 3
+   (Ctrl+C in its terminal), then `scripts/build-native.sh --install && open -a Harness` (`docs/NATIVE.md`). The
+   browser (step 3) and the Electron app (`npm install && npm run dist`) also work.
 
 6. **Draw Things (image generation).** This needs the owner: install **Draw Things** from the Mac App
    Store, download a small model in it (Stable Diffusion 1.5 class is the safe choice on 8 GB; SDXL Turbo is
@@ -86,16 +89,17 @@ for the 0.2 security model) have the detail if you need it.
    ```
 
 7. **Verify the 0.2 claims.**
-   - `npm run doctor` (no password) should show: *Data protection: password*; *Internet blocker: nothing Harness
-     sends can leave this Mac* with the self-test lines; the Ollama memory protections **in effect** (while
-     Harness runs and has started Ollama). `npm run doctor -- --unlock` (the owner types the password) adds the
+   - `npm run doctor` (no password, also while Harness is locked) should show: *Data protection: password*;
+     *Internet blocker: nothing Harness sends can leave this Mac* with the self-test lines of the running Harness
+     (with the native app's Ollama running inside the macOS sandbox, the `os` lines should read `blocked`); the
+     Ollama memory protections **in effect** (while Harness runs and has started Ollama). `npm run doctor -- --unlock` (the owner types the password) adds the
      loaded model's real memory use and runs the self-test inside the running Harness.
    - The live check runs its own throw-away Harness with its own throw-away password — it never touches or
      needs the owner's data or password:
      ```bash
      npm run live-check -- --allow-images --allow-internet --markdown ~/Desktop/harness-live-check.md
      ```
-     The `e2e.lock.*` checks prove that locking closes the data, unloads the model and leaves no readable
+     `e2e.vault_error` proves a damaged key store is reported and never overwritten; the `e2e.lock.*` checks prove that locking closes the data, unloads the model and leaves no readable
      chat text on disk; `e2e.blocker.*` that downloads, the catalogue and `fetch_url` are refused while blocked
      (`e2e.blocker.sandboxed_ollama`: even a pull sent straight to the Ollama Harness started); `e2e.catalog.*`
      that the model catalogue still parses the live sites. Every failing check names the Harness file and line

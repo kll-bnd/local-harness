@@ -162,16 +162,19 @@ View with ⌥⌘J (⌥⌘I is the Inspector). File and Help also have "Show Data
   screen do it.
 * **Locking.** The 15th menu action, `lock` (⌃⌘L; Ctrl+Shift+L elsewhere), is sent to the page like the
   others; the UI calls `POST /api/security/lock`. When the Mac **sleeps** (`powerMonitor` `suspend`) or the
-  **screen locks** (`lock-screen`, macOS/Windows), the app locks the in-process backend itself (a short-lived
-  session from `auth.createSession()` → `POST /api/security/lock`; locking drops every session) and tells the
-  page (`lock`), which covers an attached backend too. The App Nap blocker is released once the backend is idle.
+  **screen locks** (`lock-screen`, macOS/Windows), the app locks the in-process backend itself with
+  `startServer().security.lock('app')` (no HTTP round trip; nothing happens when it is already locked, in state
+  `error` or in off mode) and tells the page (`lock`), which covers an attached backend too. The App Nap blocker is
+  released once the backend is idle.
 * **The internet blocker** is the backend's (docs/API.md §10.6). The Electron app does not sandbox itself or
   its in-process backend (that would need a restart to allow downloads); the backend runs the Ollama it starts
   under `sandbox-exec` (`offlineLock.osScope: "ollama"`). The app's own network filter (only the local origin)
   is unchanged.
 * **Theme** is applied after unlocking (settings are encrypted while locked). The backend's `app` and event bus
-  exist only while unlocked and are recreated on every unlock; the app re-attaches through `server.core`'s
-  `state`/`locked` events, which are not yet part of the documented `startServer()` contract.
+  exist only while unlocked and are recreated on every unlock; the app re-attaches on the documented
+  `startServer().security` events (`state`, `locked`, `unlocked`).
+* **Damaged key store** (state `error`): the app starts normally and the page shows Harness's explanation; it never
+  offers a new password there. `npm run test:e2e` covers this (`vault-error` scenario).
 * `electron/lib/instance.cjs` no longer calls `/api/system` (it needs a session in 0.2).
 
 ## Lifecycle and Mac niceties
@@ -241,12 +244,13 @@ Config: the `build` key in `package.json`. Highlights:
 
 ## Verification status
 
-**0.2 (this pass): verified on Linux only** (Electron 44 under Xvfb). Unit tests for the 15-action menu
+**0.2: verified on Linux only** (Electron 44 under Xvfb, against the finished 0.2 backend). Unit tests for the 15-action menu
 contract, Lock Harness ⌃⌘L, instance detection by lock file + health, start-or-attach; `npm run test:e2e` adds
 checks that run once the backend serves `/api/security`: setup with a throw-away password and a recovery key
 in the documented shape, the window's own session (`/api/auth/status` from the page), the session cookie
 being memory-only, data routes refused without a session, the `lock` menu action reaching the page, and an
-emitted `lock-screen` locking the backend (data routes → 423) and releasing the App Nap blocker. **Not yet
+emitted `lock-screen` locking the backend (data routes → 423) and releasing the App Nap blocker; and a damaged key
+store starting in state `error` with the key store left untouched. **Not yet
 run on a Mac:** all of the above, real sleep/screen-lock events, and the sandboxed Ollama.
 
 **0.1, verified on a real Mac in CI** (`.github/workflows/macos.yml`, GitHub's Apple Silicon runner: "Apple M1

@@ -26,7 +26,7 @@ async function stackWithBinary(script) {
     providers: { builtin: { ollama: { baseUrl: `http://127.0.0.1:${port}` } } }, defaultModel: { providerId: 'ollama', model: 'qwen3:4b' },
     ollama: { autoStart: true, binaryPath: bin, stopOnExit: true }, embeddings: { model: 'off' }, memory: { enabled: false }, titles: { auto: false },
   }));
-  const srv = await startServer({ port: 0, dataDir: dir, autodetect: false, logLevel: 'silent', processGuards: false, security: { mode: 'off', apiAuth: false }, offlineLock: false });
+  const srv = await startServer({ port: 0, dataDir: dir, autodetect: false, logLevel: 'silent', processGuards: false, keychain: 'file', security: { mode: 'off', apiAuth: false }, offlineLock: false });
   return {
     srv,
     async turn(content) {

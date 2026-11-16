@@ -7,7 +7,7 @@ import { LaunchConfig } from './security/launch.mjs';
 import { Vault } from './security/vault.mjs';
 import { NetworkGuard } from './security/network.mjs';
 import { Auth } from './security/auth.mjs';
-import { platformKeychain, KeychainError } from './security/keychain.mjs';
+import { chooseKeychain, KeychainError } from './security/keychain.mjs';
 import { listDataFiles, migrateDir, hasPlainData, hasEncryptedData, fixPermissions, repairForeignFiles } from './security/migrate.mjs';
 import { seal, unseal, wipe, keyIdOf, setKdfDefaults } from './security/crypto.mjs';
 import { setDirCipher, ensureDir, flushWrites } from './lib/fsx.mjs';
@@ -64,7 +64,8 @@ export class Core extends EventEmitter {
     this.network = null;
     this._lockOverride = lockOverride === false ? false : undefined;
     this.auth = new Auth({ dataDir: this.dataDir, enabled: apiAuth !== false && transport === 'listener', mode: () => this.mode });
-    this.keychain = keychain || platformKeychain(this.dataDir);
+    // 'file' | 'mac' | a store object (tests, the bridge's appKeychain); default: chooseKeychain's guarded choice
+    this.keychain = keychain && typeof keychain === 'object' ? keychain : chooseKeychain(this.dataDir, { kind: typeof keychain === 'string' ? keychain : undefined });
     this.app = null;
     this.state = 'locked';
     this.mode = 'password';
@@ -304,7 +305,15 @@ export class Core extends EventEmitter {
     } else {
       await this._open();
     }
-    if (mode === 'keychain') await this._addKeychainWrap().catch((e) => { this.keychainError = { code: e.code || 'keychain_failed', message: e.message }; });
+    if (mode === 'keychain') {
+      // no password confirmation here: an existing item that is not ours is left alone (then: password mode)
+      await this._addKeychainWrap().catch((e) => {
+        this.keychainError = { code: e.code || 'keychain_failed', message: e.message };
+        this.mode = 'password';
+        this.launch.set({ encryption: 'password' });
+        this.auth.syncTokenFile();
+      });
+    }
     return { state: this.state, recoveryKey, migration: this.securityStatus().migration };
   }
 
@@ -433,7 +442,7 @@ export class Core extends EventEmitter {
       this.mode = mode;
       this.auth.syncTokenFile();
       this._startMigration('encrypt', this.vault.dek);
-      if (mode === 'keychain') await this._addKeychainWrap();
+      if (mode === 'keychain') await this._addKeychainWrap({ confirmed: true });
       return { mode, state: this.state, recoveryKey };
     }
     await this.requireConfirmation({ password, header, sessionHash, needKey: true });
@@ -441,8 +450,12 @@ export class Core extends EventEmitter {
     if (mode === from && (mode !== 'off' || !this.vault.encrypted)) { this._wipeIfPlain(); return { mode, state: this.state }; }
     let rekeyRecommended = false;
     if (from === 'keychain' && mode !== 'keychain') {
+      // password-confirmed; still, only an item that holds THIS data's key is deleted
+      let ours = false;
+      try { const k = await this.keychain.get(); ours = !!k && this.vault.keychainKeyOpens(k); if (k) wipe(k); } catch (e) { log.warn(`Could not read the Keychain item: ${e.reason || e.message}`); }
       this.vault.setKeychainWrap(false);
-      await this.keychain.delete().catch((e) => log.warn(`Could not remove the Keychain item: ${e.message}`));
+      if (ours) await this.keychain.delete().catch((e) => log.warn(`Could not remove the Keychain item: ${e.reason || e.message}`));
+      else log.info('Left the Keychain item alone: it does not hold the key of this data.');
       rekeyRecommended = true;
     }
     if (mode === 'off') {
@@ -460,11 +473,11 @@ export class Core extends EventEmitter {
       this.auth.syncTokenFile();
       await this._closeForMigration();
       this._startMigration('encrypt', this.vault.dek);
-      if (mode === 'keychain') await this._addKeychainWrap();
+      if (mode === 'keychain') await this._addKeychainWrap({ confirmed: true });
       return { mode, state: this.state };
     }
     if (mode === 'keychain') {
-      await this._addKeychainWrap();
+      await this._addKeychainWrap({ confirmed: true });
     } else {
       this.launch.set({ encryption: mode });
       this.mode = mode;
@@ -473,7 +486,20 @@ export class Core extends EventEmitter {
     return { mode: this.mode, state: this.state, ...(rekeyRecommended ? { rekeyRecommended } : {}) };
   }
 
-  async _addKeychainWrap() {
+  /**
+   * Add the keychain wrap and store its key. An existing item that does not open this data is replaced only when
+   * `confirmed` (the user typed the password for this action); a store that cannot be read is never written.
+   */
+  async _addKeychainWrap({ confirmed = false } = {}) {
+    let existing = null;
+    try { existing = await this.keychain.get(); } catch (e) {
+      throw new HttpError(503, 'keychain_unavailable', e.message || 'The Keychain could not be read; nothing was changed.', { reason: e.reason || 'failed' });
+    }
+    if (existing) {
+      const ours = this.vault.keychainKeyOpens(existing);
+      wipe(existing);
+      if (!ours && !confirmed) throw new HttpError(409, 'keychain_item_exists', 'The Keychain already holds a Harness key that does not open this data; it was left alone. Choose keychain mode in the settings (with your password) to replace it.');
+    }
     const kek = this.vault.setKeychainWrap(true);
     const prevMode = this.mode;
     this.launch.set({ encryption: 'keychain' });
@@ -512,7 +538,7 @@ export class Core extends EventEmitter {
     }
     this._oldKeys = [oldDek];
     setDirCipher(this.dataDir, { key: newDek, oldKeys: this._oldKeys });
-    if (this.mode === 'keychain') await this._addKeychainWrap().catch((e) => { this.keychainError = { code: e.code, message: e.message }; });
+    if (this.mode === 'keychain') await this._addKeychainWrap({ confirmed: true }).catch((e) => { this.keychainError = { code: e.code, message: e.message }; });
     this._startMigration('reencrypt', newDek, { resume: true });
     return { state: this.state, recoveryKey, migration: this.securityStatus().migration };
   }

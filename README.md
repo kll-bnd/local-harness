@@ -11,18 +11,22 @@ a built-in **internet blocker**, on by default, that never gets in the way of ch
 catalogue** (the Ollama library and GGUF models on Hugging Face, filtered to what your Mac can run); and a
 **native Mac app** that needs no local web server (see [Ways to run Harness](#ways-to-run-harness)).
 
-Under the hood it is a small backend (plain Node.js, no dependencies) and a web UI, shown in the native app,
-the Electron app or your web browser.
+Under the hood it is a small backend (plain Node.js, no dependencies) and a web UI, shown in the native app
+(recommended), the Electron app or your web browser.
 
 > **Status (0.2.0).** Harness 0.1 was verified on a real Mac in CI (GitHub's Apple Silicon runner, "Apple M1
 > (Virtual)", 7 GB RAM, macOS 26, real Ollama 0.40.13): the backend tests, building and signing the Electron app,
 > its end-to-end test from source and packaged, the UI tests in WebKit, the live check against real Ollama, and
-> Nemotron 3.5 Bolt E4B (text-only `UD-Q3_K_XL`) chatting, calling tools, thinking on/off and JSON output.
-> **The 0.2 features — password and encryption, locking, the internet blocker and its macOS sandbox, the
-> catalogue and the native app — are built and tested on Linux against the contract, but have not yet run on
-> a real Mac** (the CI runs that check them are pending). Never verified: a person using the window on a
-> physical Mac, Gatekeeper on a physical machine, real speeds on a real M1, and Draw Things / ComfyUI /
-> llama.cpp / LM Studio, which were only tested against fakes. See [If something doesn't work](#if-something-doesnt-work).
+> Nemotron 3.5 Bolt E4B (text-only `UD-Q3_K_XL`) chatting, calling tools, thinking on/off and JSON output. For
+> 0.2, verified on that runner: the **native app** with the real backend passed its 21-step self-test (first-run
+> setup, a streamed chat, an attachment image, an export download, the chat's marker text absent from every file in
+> the data folder, allow/block internet, lock — data routes refuse and Ollama holds no model —, wrong password
+> rejected, keychain mode across launches; neither the app nor its backend held a listening socket); and the
+> blocker's macOS layer ([below](#the-internet-blocker)). The 0.2 changes to the Electron app, the command-line
+> tools and the live check are tested on Linux; their Mac runs are pending. Not verified on real hardware: a person
+> using the native window (or any window), real speeds on a real M1, Gatekeeper on a physical machine, and Draw
+> Things / ComfyUI / llama.cpp / LM Studio, which were only tested against fakes.
+> See [If something doesn't work](#if-something-doesnt-work).
 
 ---
 
@@ -73,8 +77,8 @@ plain-text note or a screenshot. If you forget the password, the recovery key le
 you lose both, nobody can open your data, not even you.** That is the point of the design, so take the
 recovery-key step seriously.
 
-After that Harness asks for the password whenever it opens, after 15 minutes without use (adjustable in
-Settings), when you choose **Lock Harness** (⌃⌘L in the apps), and — in the apps — when the Mac sleeps or
+After that Harness asks for the password whenever it opens, after 15 minutes without you (adjustable in
+Settings; reading a long answer counts as use, and a running chat, image or download keeps it open), when you choose **Lock Harness** (⌃⌘L in the apps), and — in the apps — when the Mac sleeps or
 its screen locks. Command-line tools that need your data (`npm run get-model`, `npm run doctor -- --unlock`)
 ask for it in the terminal without showing it; they never choose a password for you.
 
@@ -100,10 +104,29 @@ model in memory at a time, a prompt cache capped at 512 MB on 8 GB Macs (Ollama'
 
 ### The native app (recommended)
 
-<!-- NATIVE-APP-SECTION: placeholder, to be written from docs/NATIVE.md once the native app is reported working. -->
-> **Placeholder.** Harness 0.2 includes a native macOS app that runs the backend with **no localhost server**
-> (it talks to it over private pipes, `docs/BRIDGE.md`) and uses less memory than the Electron app. This
-> section will say how to build and open it once it is ready; until then, use the Electron app or the browser.
+A small Swift app (AppKit + WebKit; no Electron, no Chromium) that runs Harness **without a localhost server**:
+the backend runs as its child and the two talk over private pipes (`docs/BRIDGE.md`), so nothing on the Mac can
+connect to it. Node.js is bundled; Ollama is still needed for chat. On an Apple Silicon Mac with the Xcode Command
+Line Tools (`xcode-select --install`; Xcode itself is not needed):
+
+```bash
+scripts/build-native.sh --install    # builds dist/native/Harness.app (ad-hoc signed) and replaces /Applications/Harness.app
+```
+
+It uses the same data folder, password and settings as every other way of running Harness, the same menus and
+shortcuts (⌃⌘L locks; it also locks when the Mac sleeps or the screen locks), and idles at about 96 MB physical
+footprint against 108 MB for the Electron app (240 MB against 418 MB resident; 120 MB on disk against 309 MB).
+
+**Verified on GitHub's Apple Silicon runner** (macOS 26, driving the built app in a self-test mode): the build with
+the Command Line Tools only and a strict signature check; the page contract, all 15 menu actions, uploads up to
+50 MB, downloads, streaming, navigation and remote-content blocking, locking on sleep/screen lock/menu. With the
+real backend the app passed its 21-step self-test: first-run setup, a streamed chat, an attachment image, an export
+download, the chat's marker text absent from every file in the data folder, allow/block internet, lock (data routes
+refuse and Ollama holds no model), wrong password rejected, keychain mode across launches. Neither the app nor its
+backend held a listening socket. **Not verified:** a person looking at and using
+the window (title bar, icon, dark mode, panels), dragging the window by the UI's title bar, the Keychain prompt
+after a rebuild, real sleep and screen locking (the self-test posts the same notifications), the global shortcut
+on a real keyboard, Gatekeeper with a downloaded copy, and a physical 8 GB M1. Details: [docs/NATIVE.md](docs/NATIVE.md).
 
 ### The Electron app
 
@@ -173,11 +196,13 @@ Other models work too (anything Ollama can run); 2–4-billion-parameter models 
 ### Finding other models: the catalogue
 
 The **Models** screen browses three sources without typing anything: **This Mac** (installed models and
-Harness's recommendations — works offline), the **Ollama library** (models Ollama itself packages; the
-dependable source) and **Hugging Face** (GGUF repositories; the widest choice). Sort by trending, downloads,
-likes or newest; filter by kind (chat, vision, embedding), size, publisher, and **"fits this Mac"**. A model's
-page lists every file with its size and whether it fits, and recommends one; a single button downloads it
-(and, on 8 GB, makes the text-only copy). Gated Hugging Face repositories are shown but not downloadable.
+Harness's recommendations — works offline), the **Ollama library** (only Ollama's official library models, read
+from ollama.com's own search, never community uploads; the dependable source; sorted by popular or newest) and
+**Hugging Face** (GGUF repositories Ollama can chat with; the widest choice; sorted by trending, downloads, likes
+or newest, filtered by publisher and size). Both filter by kind (chat, vision, embedding) and **"fits this Mac"**;
+each entry carries a badge — comfortable, needs a smaller file, or too big — which is an estimate. A model's page
+sizes every file, says whether it fits and with what window, and recommends one; a single button downloads it (and,
+on 8 GB, makes the text-only copy). Gated Hugging Face repositories are shown but not downloadable.
 
 Browsing the online sources needs internet, so it asks you to **allow internet for 15 minutes** (your password
 confirms). Harness sends those sites no account, cookie or identifying header, keeps what it fetched in
@@ -302,7 +327,7 @@ other servers you manage those in the server itself.
 | Other programs running as you, while Harness is **unlocked** | **No.** A malicious program running as you can read your screen, log what you type, use the browser's session cookie or tamper with Harness's files. Lock Harness when you step away; the apps lock on sleep and screen lock. |
 | Other user accounts on the Mac | **Yes.** The data folder is `700`, every file `600`, and the local API answers only callers with a session (the password) — not other accounts' programs. |
 | You forget the password **and** lose the recovery key | **The data is gone.** There is no back door, by design. |
-| Harness reaching the internet | **Blocked by default** (below): Harness's own code refuses every non-local address, and the Ollama that Harness starts runs inside a macOS sandbox without network access. |
+| Harness reaching the internet | **Blocked by default** (below): Harness's own code refuses every non-local address, and the Ollama that Harness starts runs inside a macOS sandbox that blocks outbound connections and name lookups to anything but this Mac. |
 | An Ollama someone else started (menu-bar app, `brew services`), Draw Things, ComfyUI, LM Studio, your browser | **Not covered** by the blocker — they are separate programs. Harness tells you when the Ollama in use was not started by it. Draw Things may keep its own (unencrypted) copies of what it generates. |
 | Model files in `~/.ollama/models` | Not encrypted (they contain no chats). |
 | Old plain-text copies: Time Machine backups and data from before the upgrade to 0.2 | Harness cannot reach them. Turn on **FileVault** and use **encrypted backups** — they are still worth having. |
@@ -311,7 +336,12 @@ Choose in **Settings**: **password** (the default), **Keychain** (opens without 
 Mac; weaker, as above) or **off** (plain-text data; asks your password to confirm). Actions that lower the
 protection — allowing internet, turning the blocker off, a full backup, restoring, a new recovery key,
 changing the password or the mode — always ask your password again. After 3 wrong passwords Harness waits
-1 s, then twice as long after each further miss (up to 5 minutes), even across restarts.
+1 s, then twice as long after each further miss (up to 5 minutes), even across restarts. If you ever used
+Keychain mode and leave it, Harness suggests **re-keying** (a new data key, every file re-encrypted, a new
+recovery key), because the old key sat where other programs could ask for it.
+
+Locking closes the data, ends every session (password mode), stops running chats and downloads and unloads the models from
+Ollama; the Ollama that Harness started keeps running (empty), so unlocking again is quick.
 
 ### The internet blocker
 
@@ -319,9 +349,13 @@ changing the password or the mode — always ask your password again. After 3 wr
 memory, summaries, documents, tools other than `fetch_url`, and image generation with Draw Things or
 ComfyUI on this Mac all work normally while it is on. What it blocks: the online catalogue, model
 downloads, the `fetch_url` tool (not even offered to the model) and chat or image servers on other
-machines. Harness's code refuses them before even looking up the name; and the Ollama that Harness starts
-runs inside a macOS sandbox (`sandbox-exec`) that allows only connections to this Mac, so not even a
-download started directly against that Ollama gets out.
+machines. Harness's code refuses them before even looking up the name. And the Ollama that Harness starts
+runs inside a macOS sandbox profile (`sandbox-exec`) that **blocks outbound connections and name lookups to
+anything but this Mac**. Verified on a macOS 26 runner: under it every outbound TCP connection (IPv4 and IPv6)
+and UDP packet to anything but this Mac is refused, lookups of outside names fail, and a model download attempted
+directly against that Ollama fails, while loopback, the GPU and chatting keep working. Allowing internet restarts
+that Ollama outside the sandbox (a download then works); blocking puts it back. The profile does not block
+*inbound* connections; Harness binds Ollama to 127.0.0.1, so nothing outside this Mac can reach it.
 
 To download a model, **Allow internet for 15 minutes** (1–120; asks your password). A download still running
 at the end keeps the window open until it finishes; then blocking resumes on its own, or at once with
@@ -421,6 +455,7 @@ npm install && npm run dist && ditto dist/mac-arm64/Harness.app /Applications/Ha
 | "Internet access is blocked in Harness" | expected for downloads and the online catalogue: use the **Allow internet for 15 minutes** button (your password), or `npm run get-model`. Chat does not need it |
 | "Harness has no password yet" from a command-line tool | open Harness once (the app, `Harness.command` or `npm start -- --open`) and choose the password there |
 | Encrypting the 0.1 data was interrupted | open Harness and unlock; it resumes. `npm run doctor` shows the progress |
+| "The key store is damaged" (`vault_corrupt` / `vault_missing`) | `vault.json` and its automatic copy `vault.json.bak` are both unusable (or gone) while encrypted data exists. Nothing was changed. Quit Harness and restore `vault.json` from a backup of the data folder (Time Machine or your own copy). **Do not choose a new password** — it cannot open the existing data; Harness never offers that here |
 | "Ollama is not installed" / no models | `brew install ollama` (or the app from ollama.com), then `npm run get-model` or the app's setup page |
 | "The model failed to load" | the runner crashed while loading. On the test machine the Nemotron file *as downloaded* crashed this way (`llama-server process has terminated`), because its virtual GPU lacks a feature the image/audio part needs; a real M1 most likely loads it, but it costs ~1 GB more RAM anyway. Use the button in the message (or `npm run get-model`) to make the **text-only copy** and use that |
 | `npm run doctor` says the protections are not in effect | another Ollama is running (menu-bar app or `brew services`). Quit it (menu bar → Quit Ollama; `brew services stop ollama`), turn off its launch-at-login, then restart Harness |
@@ -453,10 +488,12 @@ report the difference with the live-check report. Fixing a mismatch means updati
 
 ```bash
 npm start                    # server + UI on http://127.0.0.1:4747 (no npm install needed)
-npm run dev:fake             # real server + fake Ollama, Draw Things, ComfyUI, llama.cpp — no models needed
-HARNESS_ENCRYPTION=off HARNESS_API_AUTH=0 HARNESS_OFFLINE_LOCK=0 npm start   # development opt-out (no password)
+npm run dev:fake             # real server + fake Ollama, Draw Things, ComfyUI, llama.cpp — no models needed,
+                             # with the real defaults (choose a password in the UI; internet blocked)
+npm run dev:fake -- --insecure   # …without password, API sessions or the blocker (explicit development opt-out)
 npm run dev:fake -- --ram 8  # …pretending the machine has 8 GB
-npm test                     # backend, desktop-shell and tool unit tests (node --test)
+npm test                     # unit tests — NOT on a Mac that holds real Harness data: on macOS the suite
+                             # currently touches the real Keychain (being fixed)
 npm run doctor               # environment check (--live, --json, --recommended-model, --version)
 npm run get-model            # download the recommended model (+ text-only copy on 8 GB) through Harness
 npm run live-check           # test Harness's assumptions against your real backends (docs/LIVE_CHECK.md)

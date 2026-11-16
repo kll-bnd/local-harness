@@ -15,7 +15,7 @@ import { setDirCipher, writeFileAtomic, readFileData, appendData, readJson, crea
 import { migrateDir, listDataFiles, hasPlainData, hasEncryptedData } from '../server/security/migrate.mjs';
 import { assertEgress, isLoopbackHost, registerGuard, unregisterGuard, OfflineLockError } from '../server/security/egress.mjs';
 import { encryptBackup, openBackup } from '../server/security/backup-crypto.mjs';
-import { macKeychain, KeychainError } from '../server/security/keychain.mjs';
+import { macKeychain, KeychainError, chooseKeychain, keychainAccountFor, isDefaultDataDir, KEYCHAIN_ACCOUNT } from '../server/security/keychain.mjs';
 
 const FAST = { N: 1024, r: 8, p: 1 };
 const key = () => crypto.randomBytes(32);
@@ -298,3 +298,35 @@ process.stdin.on('end', () => {
     } finally { delete process.env.FAKE_MODE; }
   });
 });
+
+describe('which Keychain store (never the real one by accident)', () => {
+  test('the real Keychain only for the default folder outside test runs, or with HARNESS_KEYCHAIN=mac; items scoped per folder', async () => {
+    const def = await tmpDir('harness-default-');
+    const other = await tmpDir('harness-other-');
+    // a temp / test / custom folder: refused unless opted in — and a refused store never deletes anything
+    const refused = chooseKeychain(other, { platform: 'darwin', testRun: false, kind: undefined, defaultDir: def });
+    assert.equal(refused.kind, 'refused');
+    await assert.rejects(refused.get(), (e) => e instanceof KeychainError && e.reason === 'not_allowed');
+    await assert.rejects(refused.set(Buffer.alloc(32)), (e) => e.reason === 'not_allowed');
+    await refused.delete();
+    // the default folder in a test run: refused too
+    assert.equal(chooseKeychain(def, { platform: 'darwin', testRun: true, kind: undefined, defaultDir: def }).kind, 'refused');
+    // the default folder outside tests: the agreed item name (the native app uses it)
+    const real = chooseKeychain(def, { platform: 'darwin', testRun: false, kind: undefined, defaultDir: def });
+    assert.equal(real.kind, 'keychain');
+    assert.equal(real.service, 'local.harness');
+    assert.equal(real.account, KEYCHAIN_ACCOUNT);
+    // explicit opt-in for another folder: a derived account, so installations never clobber each other
+    const optIn = chooseKeychain(other, { platform: 'darwin', testRun: true, kind: 'mac', defaultDir: def });
+    assert.equal(optIn.kind, 'keychain');
+    assert.match(optIn.account, /^data-key-[0-9a-f]{16}$/);
+    assert.notEqual(keychainAccountFor(other, { defaultDir: def }), keychainAccountFor(await tmpDir(), { defaultDir: def }));
+    assert.equal(isDefaultDataDir(def, { defaultDir: def }), true);
+    // the development stand-in, explicitly or outside macOS
+    assert.equal(chooseKeychain(def, { platform: 'darwin', testRun: false, kind: 'file', defaultDir: def }).kind, 'file');
+    assert.equal(chooseKeychain(other, { platform: 'linux', testRun: false, kind: undefined }).kind, 'file');
+    // this very test process: the default choice is never the real Keychain
+    assert.notEqual(chooseKeychain(other).kind, 'keychain');
+  });
+});
+
