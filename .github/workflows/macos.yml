@@ -291,6 +291,7 @@ jobs:
         run: |
           node native/ci/run.mjs 200 scheme -- /tmp/probe/SchemeProbe.app/Contents/MacOS/SchemeProbe --root "$PWD/native/probe" --out /tmp/probe/scheme.json > /dev/null
           node native/ci/summarize-probe.mjs /tmp/probe/scheme.json
+          echo "probe| downloaded files: $(ls -l /tmp/probe/dl 2>&1 | tail -n +2 | awk '{print $5, $9}' | tr '\n' ';')" | tee -a "$FACTS"
       - name: Probe - Keychain
         continue-on-error: true
         run: |
@@ -309,14 +310,17 @@ jobs:
           node native/ci/run.mjs 20 kc -- /usr/bin/security find-generic-password -s local.harness.probe -a data-key -w
           node native/ci/run.mjs 20 kc -- $K/kcA create-dp
           node native/ci/run.mjs 20 kc -- $K/kcA delete
+          node native/ci/run.mjs 20 kc-dr -- $K/kcC create .dr
+          node native/ci/run.mjs 20 kc-dr -- $K/kcC read-noui .dr
+          node native/ci/run.mjs 20 kc-dr -- $K/kcD read-noui .dr
+          node native/ci/run.mjs 20 kc-dr -- $K/kcA read-noui .dr
+          node native/ci/run.mjs 20 kc-dr -- $K/kcC delete .dr
+          echo "kc-dr| designated requirement: $(codesign -d -r- $K/kcD 2>&1 | grep designated)" | tee -a "$FACTS"
       - name: Probe - sandbox-exec and the offline-lock profile
         continue-on-error: true
         run: |
-          node native/ci/run.mjs 20 sb-parse-candidate -- /usr/bin/sandbox-exec -f server/security/offline-lock.sb /usr/bin/true
-          node native/ci/run.mjs 20 sb-parse-draft -- /usr/bin/sandbox-exec -f native/probe/offline-lock-draft.sb /usr/bin/true
           node native/ci/run.mjs 60 net -- node native/ci/net-probe.mjs plain
-          HARNESS_SANDBOXED=1 node native/ci/run.mjs 60 net -- /usr/bin/sandbox-exec -f native/probe/offline-lock-draft.sb node native/ci/net-probe.mjs draft
-          HARNESS_SANDBOXED=1 node native/ci/run.mjs 60 net -- /usr/bin/sandbox-exec -f server/security/offline-lock.sb node native/ci/net-probe.mjs candidate
+          node native/ci/run.mjs 400 sb -- node native/ci/sb-variants.mjs
       - name: Probe - a real Ollama under the offline lock
         continue-on-error: true
         run: |

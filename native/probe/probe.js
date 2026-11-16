@@ -3,6 +3,10 @@ const csp = !!document.querySelector('meta[http-equiv="Content-Security-Policy"]
 const R = {};
 const post = (m) => window.webkit.messageHandlers.probe.postMessage(m);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let cmdSeq = 0;
+const cmdWait = new Map();
+window.__probeReply = (id, v) => { const r = cmdWait.get(id); cmdWait.delete(id); if (r) r(v); };
+const cmd = (op, extra = {}) => new Promise((resolve) => { const id = ++cmdSeq; cmdWait.set(id, resolve); post({ kind: 'cmd', id, op, ...extra }); });
 const pat = (n) => { const u = new Uint8Array(n); for (let i = 0; i < n; i++) u[i] = (Math.imul(i, 31) + 7) & 255; return u; };
 const okPat = (u) => { for (let i = 0; i < u.length; i++) if (u[i] !== ((Math.imul(i, 31) + 7) & 255)) return false; return true; };
 
@@ -49,6 +53,9 @@ async function phaseCommon() {
   await test('remoteImage', () => new Promise((resolve) => { const i = new Image(); i.onload = () => resolve({ loaded: true }); i.onerror = () => resolve({ loaded: false }); i.src = 'https://www.apple.com/favicon.ico?' + Date.now(); }), 10000);
   await test('remoteFetch', async () => { try { const r = await fetch('https://www.apple.com/?' + Date.now(), { mode: 'no-cors' }); return { fetched: true, type: r.type }; } catch (e) { return { fetched: false, err: String(e.message) }; } }, 10000);
   await test('streamGet', () => readStream('/stream?n=8&ms=250'));
+  await test('streamGetAgainSameUrl', () => readStream('/stream?n=8&ms=250'), 8000);
+  await test('streamGetUnique', () => readStream(`/stream?n=4&ms=100&r=${Math.random()}`), 8000);
+  await test('streamGetNoStore', () => readStream('/stream?n=8&ms=250', { cache: 'no-store' }), 8000);
   await test('streamPost', () => readStream('/stream?n=5&ms=200', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream' }, body: '{"content":"hi"}' }));
   await test('eventSource', () => new Promise((resolve) => {
     const es = new EventSource('/events?n=3&ms=200');
@@ -89,6 +96,35 @@ async function phase1() {
   await test('downloadBlob', async () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['blobdata'])); a.download = 'b.txt'; document.body.append(a); a.click(); a.remove(); await sleep(1000); return { clicked: true }; });
   await test('windowOpen', async () => { const w = window.open('https://www.apple.com/', '_blank'); await sleep(500); return { returned: w === null ? 'null' : typeof w }; });
   await test('targetBlankHarness', async () => { const a = document.createElement('a'); a.href = '/image.png'; a.target = '_blank'; document.body.append(a); a.click(); a.remove(); await sleep(800); return { clicked: true }; });
+  await test('titlebarClick', async () => {
+    const seen = [];
+    const on = (e) => seen.push({ x: Math.round(e.clientX), y: Math.round(e.clientY), t: e.type });
+    document.addEventListener('mousedown', on, true);
+    document.addEventListener('click', on, true);
+    const r1 = await cmd('click', { x: 200, y: 12 });
+    const r2 = await cmd('click', { x: 300, y: 200 });
+    await sleep(300);
+    document.removeEventListener('mousedown', on, true);
+    document.removeEventListener('click', on, true);
+    return { native: [r1, r2], seen };
+  });
+  await test('keyEquivalent', async () => {
+    const keys = [];
+    const on = (e) => keys.push(`${e.metaKey ? 'cmd+' : ''}${e.key}`);
+    document.addEventListener('keydown', on, true);
+    const r = await cmd('key', { chars: 'k' });
+    document.removeEventListener('keydown', on, true);
+    return { native: r, pageKeydown: keys };
+  });
+  await test('secureInput', async () => {
+    const before = await cmd('secure');
+    const i = document.createElement('input'); i.type = 'password'; document.body.append(i); i.focus();
+    await sleep(300);
+    const during = await cmd('secure');
+    i.blur(); i.remove();
+    await sleep(200);
+    return { before, during, after: await cmd('secure') };
+  });
   post({ kind: 'phase1', results: R });
   try { await fetch('/done', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(R) }); } catch { /* ignore */ }
   location.href = 'probe-csp.html';

@@ -3,7 +3,7 @@
 import Foundation
 import Security
 
-let service = "local.harness.probe"
+let service = "local.harness.probe" + (CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "")
 let account = "data-key"
 let mode = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "read"
 let variant = "VARIANT_A"

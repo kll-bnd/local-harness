@@ -3,23 +3,27 @@
 ;;   HARNESS_SANDBOXED=1 /usr/bin/sandbox-exec -f server/security/offline-lock.sb <command> [args…]
 ;;
 ;; Everything a normal process may do stays allowed EXCEPT network traffic with anything that is not
-;; this computer. Child processes inherit the sandbox, so wrapping the Harness backend also confines
-;; the Ollama server and model runner it starts. In SBPL the last matching rule wins.
+;; this computer. Child processes inherit the sandbox, so wrapping `ollama serve` also confines the
+;; model runner it starts. In SBPL the last matching rule wins.
 ;; What was verified on a real Mac is recorded in docs/BRIDGE.md ("Offline lock").
 (version 1)
 (allow default)
 
 ;; No IP traffic at all …
 (deny network*)
-;; … except with this machine: loopback (127.0.0.1 and ::1) and local (Unix-domain) sockets.
-(allow network* (local ip "localhost:*"))
-(allow network* (remote ip "localhost:*"))
+;; … except with this machine. `remote ip "localhost:*"` matches a loopback peer (127.0.0.1, ::1).
+;; (`local ip "localhost:*"` must not be used: it matches the machine's own addresses, which lets
+;; outbound connections to the internet through.)
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-inbound (remote ip "localhost:*"))
+;; Binding a port sends nothing; who may connect to it is decided by the inbound rule above.
+(allow network-bind (local ip "*:*"))
+;; Local (Unix-domain) sockets.
 (allow network* (remote unix-socket))
 (allow network* (local unix-socket))
 
 ;; Name lookups: getaddrinfo() asks mDNSResponder (over this Unix socket) to send the name out over
-;; DNS on our behalf, so that socket is closed too. Harness only ever needs 127.0.0.1 / localhost,
-;; which resolve from /etc/hosts without it.
+;; DNS on our behalf, so that socket is closed too. 127.0.0.1 and localhost need no lookup.
 (deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
 (deny mach-lookup (global-name "com.apple.mDNSResponder"))
 (deny mach-lookup (global-name "com.apple.dnssd.service"))

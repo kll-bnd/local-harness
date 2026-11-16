@@ -2,6 +2,7 @@
 // Serves a test page from harness://app/, records what the handler receives, writes JSON results.
 //   SchemeProbe --root <dir with probe.html/probe.js> --out <results.json>
 import AppKit
+import Carbon
 import WebKit
 
 let args = CommandLine.arguments
@@ -145,7 +146,7 @@ final class Nav: NSObject, WKNavigationDelegate, WKUIDelegate {
         var dl = false
         if #available(macOS 11.3, *) { dl = action.shouldPerformDownload }
         policy.append("action \(u) main=\(action.targetFrame?.isMainFrame ?? false) download=\(dl) type=\(action.navigationType.rawValue)")
-        if dl { decisionHandler(.cancel); return }
+        if dl { decisionHandler(.download); return }
         if u.hasPrefix("harness://app/") || u == "about:blank" { decisionHandler(.allow) } else { decisionHandler(.cancel) }
     }
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
@@ -154,13 +155,44 @@ final class Nav: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         policy.append("createWebView \(action.request.url?.absoluteString ?? "?")")
+        if let u = action.request.url, u.scheme == "harness" {
+            webView.startDownload(using: URLRequest(url: u)) { d in d.delegate = downloads; policy.append("startDownload started") }
+        }
         return nil
+    }
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        policy.append("didBecomeDownload(action) \(navigationAction.request.url?.absoluteString ?? "?")")
+        download.delegate = downloads
+    }
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        policy.append("didBecomeDownload(response)")
+        download.delegate = downloads
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { policy.append("didFinish \(webView.url?.absoluteString ?? "?")") }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { policy.append("didFail \(error.localizedDescription)") }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { policy.append("didFailProvisional \(error.localizedDescription)") }
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { policy.append("webContentTerminated") }
 }
+
+final class Downloads: NSObject, WKDownloadDelegate {
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let dir = URL(fileURLWithPath: "/tmp/probe/dl")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(UUID().uuidString + "-" + suggestedFilename)
+        policy.append("download decide \(suggestedFilename) type=\(response.mimeType ?? "?") url=\(response.url?.absoluteString.prefix(40) ?? "?")")
+        completionHandler(dest)
+    }
+    func downloadDidFinish(_ download: WKDownload) {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: "/tmp/probe/dl")) ?? []
+        var sizes: [String] = []
+        for f in files { let a = try? FileManager.default.attributesOfItem(atPath: "/tmp/probe/dl/" + f); sizes.append("\(f.suffix(12))=\((a?[.size] as? NSNumber)?.intValue ?? -1)") }
+        policy.append("download finished: \(sizes.joined(separator: " "))")
+    }
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        policy.append("download failed: \(error.localizedDescription)")
+    }
+}
+let downloads = Downloads()
 
 final class Msg: NSObject, WKScriptMessageHandler {
     func userContentController(_ c: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -169,12 +201,50 @@ final class Msg: NSObject, WKScriptMessageHandler {
             if kind == "phase1" || kind == "phase2" {
                 native[kind] = b["results"] ?? [:]
                 if kind == "phase2" { DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { finish("done") } }
+            } else if kind == "cmd" {
+                runCommand(b, message.webView)
             } else {
                 var l = (native["notes"] as? [Any]) ?? []
                 l.append(b)
                 native["notes"] = l
             }
         }
+    }
+}
+
+var menuFired: [String] = []
+final class MenuTarget: NSObject {
+    @objc func fire(_ sender: NSMenuItem) { menuFired.append(sender.title) }
+}
+let menuTarget = MenuTarget()
+
+func runCommand(_ b: [String: Any], _ wv: WKWebView?) {
+    let id = (b["id"] as? Int) ?? 0
+    let op = (b["op"] as? String) ?? ""
+    func reply(_ v: Any) {
+        let d = (try? JSONSerialization.data(withJSONObject: ["v": v])) ?? Data("{}".utf8)
+        wv?.evaluateJavaScript("window.__probeReply(\(id), \(String(decoding: d, as: UTF8.self)).v)", completionHandler: nil)
+    }
+    let w = window!
+    switch op {
+    case "click":
+        let x = (b["x"] as? Double) ?? 200, yTop = (b["y"] as? Double) ?? 12
+        let h = w.contentView!.bounds.height
+        let p = NSPoint(x: x, y: h - yTop)
+        for t in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            if let e = NSEvent.mouseEvent(with: t, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) { w.sendEvent(e) }
+        }
+        reply(["sent": true, "key": w.isKeyWindow, "titlebarH": w.frame.height - w.contentLayoutRect.height])
+    case "key":
+        let chars = (b["chars"] as? String) ?? "k"
+        if let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: w.windowNumber, context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: 40) {
+            NSApp.sendEvent(e)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { reply(["menuFired": menuFired]) }
+    case "secure":
+        reply(["secureInput": IsSecureEventInputEnabled(), "key": w.isKeyWindow, "active": NSApp.isActive, "firstResponder": String(describing: type(of: w.firstResponder as Any))])
+    default:
+        reply("unknown")
     }
 }
 
@@ -201,7 +271,18 @@ func start(rules: WKContentRuleList?) {
     cfg.setURLSchemeHandler(handler, forURLScheme: "harness")
     cfg.userContentController.add(msg, name: "probe")
     if let r = rules { cfg.userContentController.add(r) }
-    window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 900, height: 600), styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+    window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 900, height: 600), styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView], backing: .buffered, defer: false)
+    window.titlebarAppearsTransparent = true
+    window.titleVisibility = .hidden
+    let tb = NSToolbar(identifier: "probe")
+    tb.showsBaselineSeparator = false
+    window.toolbar = tb
+    window.toolbarStyle = .unifiedCompact
+    let main = NSMenu()
+    let appItem = NSMenuItem(); main.addItem(appItem)
+    let appMenu = NSMenu(); appItem.submenu = appMenu
+    let k = NSMenuItem(title: "Palette", action: #selector(MenuTarget.fire(_:)), keyEquivalent: "k"); k.target = menuTarget; appMenu.addItem(k)
+    NSApp.mainMenu = main
     web = WKWebView(frame: window.contentView!.bounds, configuration: cfg)
     web.autoresizingMask = [.width, .height]
     web.navigationDelegate = nav
@@ -215,7 +296,8 @@ func start(rules: WKContentRuleList?) {
 let rulesJSON = """
 [{"trigger":{"url-filter":".*"},"action":{"type":"block"}},
  {"trigger":{"url-filter":"^harness://app/"},"action":{"type":"ignore-previous-rules"}},
- {"trigger":{"url-filter":"^(data|blob):"},"action":{"type":"ignore-previous-rules"}}]
+ {"trigger":{"url-filter":"^data:"},"action":{"type":"ignore-previous-rules"}},
+ {"trigger":{"url-filter":"^blob:"},"action":{"type":"ignore-previous-rules"}}]
 """
 WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "probe-block", encodedContentRuleList: rulesJSON) { list, err in
     native["ruleListCompiled"] = list != nil

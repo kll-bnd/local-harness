@@ -8,6 +8,16 @@ import os from 'node:os';
 import path from 'node:path';
 
 const label = process.argv[2] || 'plain';
+if (label === 'serve') {
+  // Listen on every interface and greet whoever connects (used by sb-variants.mjs for the inbound test).
+  const srv = net.createServer((s) => s.end('hi'));
+  srv.on('error', (e) => { console.log(`LISTEN-ERR ${e.code}`); process.exit(1); });
+  srv.listen(0, '0.0.0.0', () => console.log(`PORT ${srv.address().port}`));
+  setTimeout(() => process.exit(0), 20000);
+} else {
+  await main();
+}
+async function main() {
 const T = 6000;
 const short = (e) => (e && (e.code || e.cause?.code || e.name)) || String(e);
 
@@ -65,3 +75,4 @@ out.loopback6 = await timed(loopback('::1'));
 out.listenAny = await timed(loopback('0.0.0.0'));
 out.unixSocket = await timed(unixSock());
 console.log(`net-probe ${JSON.stringify(out)}`);
+}
